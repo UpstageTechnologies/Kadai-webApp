@@ -285,12 +285,14 @@ export default function Dashboard() {
 
   return (
     <div style={styles.appContainer}>
-      {/* Sidebar */}
-      <div style={styles.sidebar}>
+      {/* Top Navbar Header */}
+      <header style={styles.navbar}>
         <div style={styles.logoArea}>
-          <span style={{ fontSize: "28px" }}>🏪</span>
+          <span style={{ fontSize: "24px" }}>🏪</span>
           <h2 style={styles.sidebarBrand}>Kadai Pro</h2>
         </div>
+
+        {/* Navigation Links moved to Top Navbar */}
         <div style={styles.navLinks}>
           <button onClick={() => setActiveTab("dashboard")} style={{ ...styles.navBtn, backgroundColor: activeTab === "dashboard" ? "#ffedd5" : "transparent", color: activeTab === "dashboard" ? "#fc8019" : "#64748b" }}>
             🏠 Dashboard (POS)
@@ -302,32 +304,31 @@ export default function Dashboard() {
             ❤️ Wishlist ({wishlist.length})
           </button>
           <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
-            📋 Orders & Bills ({ordersList.length})
+            📋 Orders ({ordersList.length})
           </button>
         </div>
-        <button onClick={handleLogout} style={styles.logoutBtn}>Logout</button>
-      </div>
 
-      {/* Main Content */}
+        <div style={styles.searchBarContainer}>
+          <span style={styles.searchIcon}>🔍</span>
+          <input 
+            type="text"
+            placeholder="Search products..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            style={styles.searchInput}
+          />
+        </div>
+
+        <div style={styles.navRight}>
+          <button onClick={() => setActiveTab("cartPage")} style={styles.navbarCartBtn}>
+            🛒 Cart ({cartItems.reduce((a, c) => a + c.qty, 0)})
+          </button>
+          <button onClick={handleLogout} style={styles.logoutBtn}>Logout</button>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
       <div style={styles.mainContent}>
-        <header style={styles.navbar}>
-          <div style={styles.searchBarContainer}>
-            <span style={styles.searchIcon}>🔍</span>
-            <input 
-              type="text"
-              placeholder="Search products, brand, category..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={styles.searchInput}
-            />
-          </div>
-          <div style={styles.navRight}>
-            <button onClick={() => setActiveTab("cartPage")} style={styles.navbarCartBtn}>
-              🛒 Cart ({cartItems.reduce((a, c) => a + c.qty, 0)})
-            </button>
-          </div>
-        </header>
-
         {/* TAB 1: DASHBOARD (POS) */}
         {activeTab === "dashboard" && (
           <div style={styles.mainLayout}>
@@ -381,7 +382,7 @@ export default function Dashboard() {
                             <span style={styles.productPrice}>₹{priceVal}</span>
                             <div style={styles.cardBtnGroup}>
                               <button onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} style={styles.addBillBtn}>+ Add</button>
-                              <button onClick={() => addToCart({ ...item, name: itemName, price: priceVal })} style={styles.addCartBtn}>Add to Cart</button>
+                              <button onClick={() => addToCart({ ...item, name: itemName, price: priceVal })} style={styles.addCartBtn}>Cart</button>
                             </div>
                           </div>
                         </div>
@@ -490,14 +491,14 @@ export default function Dashboard() {
 
         {/* TAB 3: CART PAGE */}
         {activeTab === "cartPage" && (
-          <div style={{ padding: "40px", maxWidth: "900px", margin: "0 auto", width: "100%" }}>
+          <div style={{ padding: "40px", maxWidth: "900px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
             <h2 style={{ fontSize: "26px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>🛒 My Shopping Cart ({cartItems.reduce((a, c) => a + c.qty, 0)})</h2>
             {cartItems.length === 0 ? (
               <div style={styles.centerBox}>Your cart is empty. Add products using "Add to Cart" button!</div>
             ) : (
               <div style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.05)" }}>
                 {cartItems.map((item) => (
-                  <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 0", borderBottom: "1px solid #f1f5f9" }}>
+                  <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 0", borderBottom: "1px solid #f1f5f9", flexWrap: "wrap", gap: "10px" }}>
                     <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
                       <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name} style={{ width: "60px", height: "60px", objectFit: "cover", borderRadius: "10px" }} />
                       <div>
@@ -515,7 +516,7 @@ export default function Dashboard() {
                     </div>
                   </div>
                 ))}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "24px", paddingTop: "16px", borderTop: "2px solid #e2e8f0" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "24px", paddingTop: "16px", borderTop: "2px solid #e2e8f0", flexWrap: "wrap", gap: "10px" }}>
                   <span style={{ fontSize: "18px", fontWeight: "800", color: "#0f172a" }}>Total Cart Value: ₹{totalCartAmount}</span>
                   <button onClick={() => { setPopupModal({ show: true, message: "Cart Order Placed Successfully! 🎉" }); setCartItems([]); }} style={{ padding: "12px 28px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer", fontSize: "15px" }}>
                     Proceed to Checkout
@@ -553,7 +554,7 @@ export default function Dashboard() {
 
         {/* TAB 5: ORDERS & BILLS HISTORY */}
         {activeTab === "orders" && (
-          <div style={{ padding: "30px", maxWidth: "1000px", margin: "0 auto", width: "100%" }}>
+          <div style={{ padding: "30px", maxWidth: "1000px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
             <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>📋 Orders & Billing History</h2>
             {ordersList.length === 0 ? (
               <div style={styles.centerBox}>No orders or bills recorded yet. Complete a sale from the dashboard!</div>
@@ -567,7 +568,7 @@ export default function Dashboard() {
                     <div 
                       key={order.id || idx} 
                       onClick={() => setSelectedOrderDetails(order)}
-                      style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", transition: "all 0.2s" }}
+                      style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", transition: "all 0.2s", flexWrap: "wrap", gap: "10px" }}
                     >
                       <div>
                         <h4 style={{ margin: "0 0 6px 0", fontSize: "16px", color: "#1e293b" }}>Order ID: #{order.id.slice(-6).toUpperCase()}</h4>
@@ -591,7 +592,7 @@ export default function Dashboard() {
 
       </div>
 
-      {/* BILL DETAILS POPUP MODAL (RECEIPT VIEW ON CLICK) */}
+      {/* BILL DETAILS POPUP MODAL */}
       {selectedOrderDetails && (
         <div style={styles.modalOverlay} onClick={() => setSelectedOrderDetails(null)}>
           <div style={{ ...styles.modalBox, maxWidth: "450px" }} onClick={e => e.stopPropagation()}>
@@ -677,63 +678,62 @@ export default function Dashboard() {
 }
 
 const styles = {
-  appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif" },
-  sidebar: { width: "260px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", padding: "24px", position: "sticky", top: 0, height: "100vh", boxSizing: "border-box" },
-  logoArea: { display: "flex", alignItems: "center", gap: "12px", marginBottom: "30px" },
-  sidebarBrand: { fontSize: "22px", fontWeight: "800", color: "#1e3a8a", margin: 0 },
-  navLinks: { display: "flex", flexDirection: "column", gap: "10px", flex: 1 },
-  navBtn: { padding: "12px 16px", border: "none", borderRadius: "12px", textAlign: "left", fontWeight: "700", fontSize: "15px", cursor: "pointer", transition: "all 0.2s" },
-  logoutBtn: { padding: "12px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "12px", fontWeight: "700", cursor: "pointer" },
-  mainContent: { flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflowY: "auto" },
-  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 32px", backgroundColor: "#ffffff", borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, zIndex: 100 },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "10px 16px", borderRadius: "12px", width: "45%", gap: "10px" },
-  searchIcon: { fontSize: "16px" },
-  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "14px", color: "#1e293b" },
-  navRight: { display: "flex", alignItems: "center", gap: "20px" },
-  navbarCartBtn: { fontWeight: "700", color: "#1e3a8a", fontSize: "15px", backgroundColor: "#eff6ff", padding: "10px 18px", borderRadius: "12px", border: "1.5px solid #bfdbfe", cursor: "pointer" },
-  mainLayout: { display: "flex", flex: 1, padding: "24px", gap: "24px", boxSizing: "border-box" },
-  contentArea: { flex: 1 },
-  sectionTitle: { fontSize: "18px", fontWeight: "800", color: "#0f172a", marginBottom: "14px" },
-  categoryScroll: { display: "flex", gap: "12px", overflowX: "auto", paddingBottom: "12px", marginBottom: "20px" },
-  categoryCard: { padding: "8px 18px", borderRadius: "20px", cursor: "pointer", fontWeight: "700", fontSize: "13px", whiteSpace: "nowrap", border: "1px solid #e2e8f0" },
-  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "18px" },
-  productCard: { backgroundColor: "#ffffff", borderRadius: "16px", overflow: "hidden", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #f1f5f9", display: "flex", flexDirection: "column" },
-  imageWrapper: { position: "relative", height: "140px", width: "100%" },
+  appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column" },
+  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 20px", backgroundColor: "#ffffff", borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, zIndex: 100, flexWrap: "wrap", gap: "12px" },
+  logoArea: { display: "flex", alignItems: "center", gap: "10px" },
+  sidebarBrand: { fontSize: "20px", fontWeight: "800", color: "#1e3a8a", margin: 0 },
+  navLinks: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" },
+  navBtn: { padding: "8px 14px", border: "none", borderRadius: "10px", fontWeight: "700", fontSize: "13px", cursor: "pointer", transition: "all 0.2s", whiteSpace: "nowrap" },
+  logoutBtn: { padding: "8px 14px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer", fontSize: "13px", whiteSpace: "nowrap" },
+  mainContent: { flex: 1, display: "flex", flexDirection: "column", width: "100%", boxSizing: "border-box", overflowY: "auto" },
+  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "8px 14px", borderRadius: "10px", width: "250px", gap: "8px" },
+  searchIcon: { fontSize: "14px" },
+  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "13px", color: "#1e293b" },
+  navRight: { display: "flex", alignItems: "center", gap: "10px" },
+  navbarCartBtn: { fontWeight: "700", color: "#1e3a8a", fontSize: "13px", backgroundColor: "#eff6ff", padding: "8px 14px", borderRadius: "10px", border: "1.5px solid #bfdbfe", cursor: "pointer", whiteSpace: "nowrap" },
+  mainLayout: { display: "flex", flex: 1, padding: "20px", gap: "20px", boxSizing: "border-box", flexWrap: "wrap" },
+  contentArea: { flex: 1, minWidth: "280px" },
+  sectionTitle: { fontSize: "17px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
+  categoryScroll: { display: "flex", gap: "10px", overflowX: "auto", paddingBottom: "8px", marginBottom: "16px" },
+  categoryCard: { padding: "6px 14px", borderRadius: "18px", cursor: "pointer", fontWeight: "700", fontSize: "12px", whiteSpace: "nowrap", border: "1px solid #e2e8f0" },
+  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: "14px" },
+  productCard: { backgroundColor: "#ffffff", borderRadius: "14px", overflow: "hidden", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #f1f5f9", display: "flex", flexDirection: "column" },
+  imageWrapper: { position: "relative", height: "130px", width: "100%" },
   productImg: { width: "100%", height: "100%", objectFit: "cover" },
-  stockBadge: { position: "absolute", bottom: "8px", left: "8px", backgroundColor: "rgba(0, 0, 0, 0.75)", color: "#fff", padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: "700" },
-  likeBtn: { position: "absolute", top: "8px", right: "8px", backgroundColor: "#fff", border: "none", borderRadius: "50%", width: "32px", height: "32px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 2px 6px rgba(0,0,0,0.15)" },
-  productDetails: { padding: "12px", display: "flex", flexDirection: "column", gap: "6px", flex: 1, justifyContent: "space-between" },
-  productName: { fontSize: "14px", fontWeight: "700", color: "#1e293b", margin: 0 },
-  productCategory: { fontSize: "11px", color: "#64748b", margin: 0 },
+  stockBadge: { position: "absolute", bottom: "6px", left: "6px", backgroundColor: "rgba(0, 0, 0, 0.75)", color: "#fff", padding: "2px 6px", borderRadius: "4px", fontSize: "10px", fontWeight: "700" },
+  likeBtn: { position: "absolute", top: "6px", right: "6px", backgroundColor: "#fff", border: "none", borderRadius: "50%", width: "28px", height: "28px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 2px 6px rgba(0,0,0,0.15)" },
+  productDetails: { padding: "10px", display: "flex", flexDirection: "column", gap: "4px", flex: 1, justifyContent: "space-between" },
+  productName: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: 0 },
+  productCategory: { fontSize: "10px", color: "#64748b", margin: 0 },
   priceRow: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px" },
-  productPrice: { fontSize: "15px", fontWeight: "800", color: "#0f172a" },
-  cardBtnGroup: { display: "flex", gap: "6px" },
-  addBillBtn: { padding: "6px 10px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
-  addCartBtn: { padding: "6px 10px", backgroundColor: "#eff6ff", color: "#2563eb", border: "1px solid #bfdbfe", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
-  editCardBtn: { flex: 1, padding: "6px 10px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
-  deleteCardBtn: { flex: 1, padding: "6px 10px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
-  cartSidebar: { width: "340px", backgroundColor: "#ffffff", borderRadius: "20px", padding: "20px", border: "1px solid #e2e8f0", display: "flex", flexDirection: "column", height: "calc(100vh - 120px)", position: "sticky", top: "80px" },
-  cartTitle: { fontSize: "17px", fontWeight: "800", color: "#0f172a", marginBottom: "14px", borderBottom: "2px solid #f1f5f9", paddingBottom: "10px" },
-  emptyCart: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", color: "#94a3b8", gap: "8px" },
-  cartItemsList: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" },
-  cartItemRow: { display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "8px", borderBottom: "1px solid #f8fafc" },
-  cartItemName: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0" },
-  cartItemPrice: { fontSize: "11px", color: "#64748b" },
-  cartControls: { display: "flex", alignItems: "center", gap: "6px", backgroundColor: "#f1f5f9", padding: "3px 6px", borderRadius: "6px" },
-  qtyBtn: { border: "none", background: "transparent", fontWeight: "800", cursor: "pointer", color: "#fc8019" },
-  qtyText: { fontSize: "12px", fontWeight: "700", color: "#1e293b" },
-  cartFooter: { borderTop: "2px solid #f1f5f9", paddingTop: "14px", marginTop: "10px" },
-  totalRow: { display: "flex", justifyContent: "space-between", fontSize: "15px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
+  productPrice: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
+  cardBtnGroup: { display: "flex", gap: "4px" },
+  addBillBtn: { padding: "5px 8px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px" },
+  addCartBtn: { padding: "5px 8px", backgroundColor: "#eff6ff", color: "#2563eb", border: "1px solid #bfdbfe", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px" },
+  editCardBtn: { flex: 1, padding: "6px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  deleteCardBtn: { flex: 1, padding: "6px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  cartSidebar: { width: "320px", backgroundColor: "#ffffff", borderRadius: "16px", padding: "16px", border: "1px solid #e2e8f0", display: "flex", flexDirection: "column", maxHeight: "calc(100vh - 100px)", position: "sticky", top: "75px", boxSizing: "border-box" },
+  cartTitle: { fontSize: "16px", fontWeight: "800", color: "#0f172a", marginBottom: "12px", borderBottom: "2px solid #f1f5f9", paddingBottom: "8px" },
+  emptyCart: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", color: "#94a3b8", gap: "6px", padding: "20px 0" },
+  cartItemsList: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" },
+  cartItemRow: { display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "6px", borderBottom: "1px solid #f8fafc" },
+  cartItemName: { fontSize: "12px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0" },
+  cartItemPrice: { fontSize: "10px", color: "#64748b" },
+  cartControls: { display: "flex", alignItems: "center", gap: "4px", backgroundColor: "#f1f5f9", padding: "2px 4px", borderRadius: "6px" },
+  qtyBtn: { border: "none", background: "transparent", fontWeight: "800", cursor: "pointer", color: "#fc8019", fontSize: "12px" },
+  qtyText: { fontSize: "11px", fontWeight: "700", color: "#1e293b" },
+  cartFooter: { borderTop: "2px solid #f1f5f9", paddingTop: "12px", marginTop: "8px" },
+  totalRow: { display: "flex", justifyContent: "space-between", fontSize: "14px", fontWeight: "800", color: "#0f172a", marginBottom: "10px" },
   totalPrice: { color: "#fc8019" },
-  checkoutBtn: { width: "100%", padding: "12px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "800", fontSize: "14px", cursor: "pointer" },
-  printBillBtn: { padding: "8px 16px", backgroundColor: "#f1f5f9", color: "#1e293b", border: "1px solid #cbd5e1", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" },
-  centerBox: { gridColumn: "1 / -1", textAlign: "center", padding: "40px", color: "#64748b", fontWeight: "600" },
-  addNewBtn: { padding: "10px 18px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer" },
-  modalOverlay: { position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000 },
-  modalBox: { backgroundColor: "#fff", padding: "30px", borderRadius: "20px", width: "100%", maxWidth: "420px", boxShadow: "0 20px 25px rgba(0,0,0,0.2)" },
-  modalForm: { display: "flex", flexDirection: "column", gap: "12px", marginTop: "16px" },
-  modalInput: { padding: "12px", borderRadius: "10px", border: "1.5px solid #cbd5e1", fontSize: "14px", outline: "none" },
-  modalBtns: { display: "flex", gap: "10px", marginTop: "10px" },
-  saveModalBtn: { flex: 1, padding: "12px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer" },
-  cancelModalBtn: { flex: 1, padding: "12px", backgroundColor: "#e2e8f0", color: "#334155", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer" }
+  checkoutBtn: { width: "100%", padding: "10px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "800", fontSize: "13px", cursor: "pointer" },
+  printBillBtn: { padding: "6px 12px", backgroundColor: "#f1f5f9", color: "#1e293b", border: "1px solid #cbd5e1", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
+  centerBox: { gridColumn: "1 / -1", textAlign: "center", padding: "40px", color: "#64748b", fontWeight: "600", fontSize: "14px" },
+  addNewBtn: { padding: "8px 16px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" },
+  modalOverlay: { position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000, padding: "16px", boxSizing: "border-box" },
+  modalBox: { backgroundColor: "#fff", padding: "24px", borderRadius: "16px", width: "100%", maxWidth: "400px", boxShadow: "0 20px 25px rgba(0,0,0,0.2)", boxSizing: "border-box", maxHeight: "90vh", overflowY: "auto" },
+  modalForm: { display: "flex", flexDirection: "column", gap: "10px", marginTop: "12px" },
+  modalInput: { padding: "10px", borderRadius: "8px", border: "1.5px solid #cbd5e1", fontSize: "13px", outline: "none", width: "100%", boxSizing: "border-box" },
+  modalBtns: { display: "flex", gap: "8px", marginTop: "8px" },
+  saveModalBtn: { flex: 1, padding: "10px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" },
+  cancelModalBtn: { flex: 1, padding: "10px", backgroundColor: "#e2e8f0", color: "#334155", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }
 };
