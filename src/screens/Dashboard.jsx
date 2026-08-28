@@ -28,7 +28,7 @@ export default function Dashboard() {
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("Cash");
 
-  // Success Popup Modal State
+  // Success Animated Popup Modal State
   const [popupModal, setPopupModal] = useState({ show: false, message: "" });
 
   // View Bill Details Modal State (Receipt Popup)
@@ -47,6 +47,29 @@ export default function Dashboard() {
   const [image, setImage] = useState("");
 
   useEffect(() => {
+    // Inject CSS keyframes for Success Checkmark Animation dynamically
+    const styleSheet = document.createElement("style");
+    styleSheet.type = "text/css";
+    styleSheet.innerText = `
+      @keyframes scaleUp {
+        0% { transform: scale(0); opacity: 0; }
+        60% { transform: scale(1.1); opacity: 1; }
+        100% { transform: scale(1); opacity: 1; }
+      }
+      @keyframes checkDraw {
+        0% { stroke-dashoffset: 48; }
+        100% { stroke-dashoffset: 0; }
+      }
+      .animate-circle {
+        animation: scaleUp 0.4s ease-in-out forwards;
+      }
+      .animate-check {
+        stroke-dasharray: 48;
+        animation: checkDraw 0.4s 0.3s ease-in-out forwards;
+      }
+    `;
+    document.head.appendChild(styleSheet);
+
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) {
       setLoading(false);
@@ -204,7 +227,7 @@ export default function Dashboard() {
       setCustomerName("");
       setCustomerPhone("");
       setCurrentBill([]);
-      setPopupModal({ show: true, message: "Order Placed & Payment Recorded Successfully! 🎉" });
+      setPopupModal({ show: true, message: "Payment Successful & Order Recorded! 🎉" });
     } catch (err) {
       console.error("Checkout error:", err);
       alert("Checkout failed: " + err.message);
@@ -812,7 +835,7 @@ export default function Dashboard() {
         )}
       </div>
 
-      {/* PROFESSIONAL CHECKOUT MODAL WITH DYNAMIC QR BASED ON SETTINGS */}
+      {/* PROFESSIONAL CHECKOUT MODAL WITH AMOUNT-FIXED UPI QR CODE */}
       {isCheckoutModalOpen && (
         <div style={styles.modalOverlay}>
           <div style={{ ...styles.modalBox, maxWidth: "480px" }}>
@@ -827,7 +850,7 @@ export default function Dashboard() {
                 <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>₹{totalBillAmount}.00</span>
               </div>
 
-              {/* Customer Details Optional (Can skip easily) */}
+              {/* Customer Details Optional */}
               <div style={{ display: "flex", gap: "10px" }}>
                 <div style={{ ...styles.inputGroup, flex: 1 }}>
                   <label style={styles.label}>Customer Name (Optional)</label>
@@ -899,22 +922,22 @@ export default function Dashboard() {
                 </div>
               </div>
 
-{/* DYNAMIC UPI QR CODE DISPLAY USING SETTINGS UPI ID */}
-{paymentMethod === "UPI / QR" && (
-  <div style={styles.qrContainer}>
-    <div style={styles.qrBox}>
-      <img 
-        src={`https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(`upi://pay?pa=${storeSettings.upiId}&pn=${encodeURIComponent(userProfile.storeName)}&am=${totalBillAmount}&cu=INR`)}`} 
-        alt="UPI QR Code" 
-        style={{ width: "120px", height: "120px", borderRadius: "8px" }}
-      />
-    </div>
-    <div style={{ textAlign: "center" }}>
-      <p style={{ margin: "0 0 2px 0", fontSize: "12px", fontWeight: "700", color: "#1e293b" }}>Scan & Pay with GPay / PhonePe / Paytm</p>
-      <p style={{ margin: 0, fontSize: "11px", color: "#64748b" }}>UPI ID: {storeSettings.upiId}</p>
-    </div>
-  </div>
-)}
+              {/* DYNAMIC AMOUNT-FIXED UPI QR CODE */}
+              {paymentMethod === "UPI / QR" && (
+                <div style={styles.qrContainer}>
+                  <div style={styles.qrBox}>
+                    <img 
+                      src={`https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(`upi://pay?pa=${storeSettings.upiId}&pn=${encodeURIComponent(userProfile.storeName)}&am=${totalBillAmount}&cu=INR`)}`} 
+                      alt="UPI QR Code" 
+                      style={{ width: "120px", height: "120px", borderRadius: "8px" }}
+                    />
+                  </div>
+                  <div style={{ textAlign: "center" }}>
+                    <p style={{ margin: "0 0 2px 0", fontSize: "12px", fontWeight: "700", color: "#1e293b" }}>Scan & Pay ₹{totalBillAmount}.00</p>
+                    <p style={{ margin: 0, fontSize: "11px", color: "#64748b" }}>UPI ID: {storeSettings.upiId}</p>
+                  </div>
+                </div>
+              )}
 
               <div style={styles.modalBtns}>
                 <button type="submit" style={styles.saveModalBtn}>Confirm & Print Bill 🖨️</button>
@@ -953,13 +976,28 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* SUCCESS POPUP */}
+      {/* PROFESSIONAL SUCCESS ANIMATED POPUP (GPAY / PAYTM STYLE) */}
       {popupModal.show && (
         <div style={styles.modalOverlay}>
-          <div style={{ ...styles.modalBox, textAlign: "center", maxWidth: "340px" }}>
-            <span style={{ fontSize: "36px" }}>🎉</span>
-            <p style={{ margin: "14px 0", fontSize: "14px", fontWeight: "600" }}>{popupModal.message}</p>
-            <button onClick={() => setPopupModal({ show: false, message: "" })} style={{ width: "100%", padding: "10px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}>OK</button>
+          <div style={{ ...styles.modalBox, textAlign: "center", maxWidth: "340px", padding: "30px 20px" }}>
+            {/* Animated Green Checkmark SVG */}
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}>
+              <div className="animate-circle" style={{ width: "70px", height: "70px", borderRadius: "50%", backgroundColor: "#dcfce7", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline className="animate-check" points="20 6 9 17 4 12"></polyline>
+                </svg>
+              </div>
+            </div>
+
+            <h3 style={{ margin: "0 0 8px 0", color: "#0f172a", fontSize: "20px", fontWeight: "800" }}>Payment Successful!</h3>
+            <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "24px", lineHeight: "1.4" }}>{popupModal.message}</p>
+            
+            <button 
+              onClick={() => setPopupModal({ show: false, message: "" })} 
+              style={{ width: "100%", padding: "12px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "800", fontSize: "15px", cursor: "pointer", boxShadow: "0 4px 12px rgba(22, 163, 74, 0.3)" }}
+            >
+              Done
+            </button>
           </div>
         </div>
       )}
@@ -1064,7 +1102,7 @@ const styles = {
   profileLabel: { fontSize: "13px", fontWeight: "700", color: "#64748b" },
   profileValue: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
 
-// Payment Cards Grid
+  // Payment Cards Grid
   paymentCardsGrid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px", marginTop: "4px" },
   paymentCardOption: { padding: "12px", borderRadius: "10px", border: "2px solid #cbd5e1", display: "flex", flexDirection: "column", alignItems: "center", gap: "6px", cursor: "pointer", transition: "all 0.2s" },
 
