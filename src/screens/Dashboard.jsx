@@ -1,11 +1,13 @@
 // src/screens/Dashboard.jsx
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { signOut } from "firebase/auth";
+import Profile from "./Profile";
+import Settings from "./Settings";
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState("sales"); // "sales", "dashboard", "inventory", "wishlist", "orders", "profile", "settings"
+  const [activeTab, setActiveTab] = useState("sales"); // "sales", "dashboard", "inventory", "orders", "profile", "settings"
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState(["All"]);
   const [loading, setLoading] = useState(true);
@@ -13,14 +15,15 @@ export default function Dashboard() {
   const [selectedCategory, setSelectedCategory] = useState("All");
   
   const [currentBill, setCurrentBill] = useState([]);
-  const [cartItems, setCartItems] = useState([]);
-  const [wishlist, setWishlist] = useState([]);
   const [ordersList, setOrdersList] = useState([]);
 
+  // Dropdown State for Profile & Settings
+  const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
+  const dropdownRef = useRef(null);
+
   // User Profile & Settings States
-  const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store" });
+  const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store", profileImage: "" });
   const [storeSettings, setStoreSettings] = useState({ upiId: "kadaippro@okaxis", allowCash: true, allowUpi: true, allowCard: true });
-  const [savingSettings, setSavingSettings] = useState(false);
 
   // Checkout Modal State
   const [isCheckoutModalOpen, setIsCheckoutModalOpen] = useState(false);
@@ -46,8 +49,15 @@ export default function Dashboard() {
   const [brand, setBrand] = useState("");
   const [image, setImage] = useState("");
 
+  const handleClickOutside = (e) => {
+    if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+      setProfileDropdownOpen(false);
+    }
+  };
+
   useEffect(() => {
-    // Inject CSS keyframes for Success Checkmark Animation dynamically
+    document.addEventListener("mousedown", handleClickOutside);
+
     const styleSheet = document.createElement("style");
     styleSheet.type = "text/css";
     styleSheet.innerText = `
@@ -76,7 +86,6 @@ export default function Dashboard() {
       return;
     }
 
-    // 1. Fetch User Profile & Settings from Firestore
     const fetchUserData = async () => {
       try {
         const userDocRef = doc(db, "users", currentUid);
@@ -87,7 +96,8 @@ export default function Dashboard() {
             name: data.name || auth.currentUser?.displayName || "Store Owner",
             email: data.email || auth.currentUser?.email || "",
             phone: data.phone || "",
-            storeName: data.storeName || "Kadai Pro Store"
+            storeName: data.storeName || "Kadai Pro Store",
+            profileImage: data.profileImage || ""
           });
           if (data.settings) {
             setStoreSettings(data.settings);
@@ -99,7 +109,6 @@ export default function Dashboard() {
     };
     fetchUserData();
 
-    // 2. Real-time Inventory Listener
     const inventoryRef = collection(db, "users", currentUid, "inventory");
     const unsubscribeInventory = onSnapshot(inventoryRef, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -113,7 +122,6 @@ export default function Dashboard() {
       setLoading(false);
     });
 
-    // 3. Real-time Orders & Bills Listener
     const ordersRef = collection(db, "users", currentUid, "local_orders");
     const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
       const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -124,27 +132,11 @@ export default function Dashboard() {
     });
 
     return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
       unsubscribeInventory();
       unsubscribeOrders();
     };
   }, []);
-
-  const handleSaveSettings = async (e) => {
-    e.preventDefault();
-    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
-    if (!currentUid) return;
-
-    try {
-      setSavingSettings(true);
-      const userDocRef = doc(db, "users", currentUid);
-      await setDoc(userDocRef, { settings: storeSettings }, { merge: true });
-      setPopupModal({ show: true, message: "Store & Payment Settings Saved Successfully! ⚙️" });
-    } catch (err) {
-      alert("Error saving settings: " + err.message);
-    } finally {
-      setSavingSettings(false);
-    }
-  };
 
   const handleLogout = async () => {
     await signOut(auth);
@@ -174,33 +166,6 @@ export default function Dashboard() {
     setCurrentBill([]);
   };
 
-  const addToCart = (product) => {
-    setCartItems(prev => {
-      const exist = prev.find(item => item.id === product.id);
-      if (exist) {
-        return prev.map(item => item.id === product.id ? { ...item, qty: item.qty + 1 } : item);
-      }
-      return [...prev, { ...product, qty: 1 }];
-    });
-    setPopupModal({ show: true, message: `"${product.itemName || product.name}" added to Cart! 🛒` });
-  };
-
-  const removeFromCart = (id) => {
-    setCartItems(prev => prev.map(item => item.id === id ? { ...item, qty: item.qty - 1 } : item).filter(item => item.qty > 0));
-  };
-
-  const toggleWishlist = (product) => {
-    setWishlist(prev => {
-      const exists = prev.some(item => item.id === product.id);
-      if (exists) {
-        return prev.filter(item => item.id !== product.id);
-      } else {
-        return [...prev, product];
-      }
-    });
-  };
-
-  // Professional Checkout Submission
   const handleFinalCheckoutSubmit = async (e) => {
     e.preventDefault();
     if (currentBill.length === 0) return;
@@ -234,7 +199,6 @@ export default function Dashboard() {
     }
   };
 
-  // Print Bill Function
   const handlePrintBill = (order) => {
     const printWindow = window.open('', '_blank', 'width=400,height=600');
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : new Date().toLocaleString();
@@ -261,6 +225,7 @@ export default function Dashboard() {
         <body>
           <h2>${userProfile.storeName}</h2>
           <p>Store Billing Receipt</p>
+          <p style="font-size: 11px; color: #555;">Admin / Billed By: ${userProfile.name || "Store Owner"}</p>
           <p style="font-size: 11px; color: #555;">Customer: ${order.customerName || "Walk-in"}</p>
           <p style="font-size: 11px; color: #555;">Payment: ${order.paymentMethod || "Cash"}</p>
           <p style="font-size: 11px; color: #555;">Date: ${orderDate}</p>
@@ -370,7 +335,6 @@ export default function Dashboard() {
   };
 
   const totalBillAmount = currentBill.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
-  const totalCartAmount = cartItems.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
   const totalBillItemsCount = currentBill.reduce((sum, item) => sum + item.qty, 0);
 
   const filteredProducts = products.filter(item => {
@@ -385,52 +349,88 @@ export default function Dashboard() {
     <div style={styles.appContainer}>
       {/* Top Navbar Header */}
       <header style={styles.navbar}>
-        <div style={styles.logoArea}>
-          <span style={{ fontSize: "24px" }}>🏪</span>
-          <h2 style={styles.sidebarBrand}>{userProfile.storeName}</h2>
+        <div style={styles.navLeftGroup}>
+          <div style={styles.logoArea}>
+            <span style={{ fontSize: "22px" }}>🏪</span>
+            <h2 style={styles.sidebarBrand}>{userProfile.storeName}</h2>
+          </div>
+
+          <div style={styles.searchBarContainer}>
+            <span style={styles.searchIcon}>🔍</span>
+            <input 
+              type="text"
+              placeholder="Search products..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={styles.searchInput}
+            />
+          </div>
         </div>
 
         {/* Navigation Links */}
         <div style={styles.navLinks}>
           <button onClick={() => setActiveTab("sales")} style={{ ...styles.navBtn, backgroundColor: activeTab === "sales" ? "#ffedd5" : "transparent", color: activeTab === "sales" ? "#fc8019" : "#64748b" }}>
-            🧾 POS Terminal
+            🧾 Sales
           </button>
           <button onClick={() => setActiveTab("dashboard")} style={{ ...styles.navBtn, backgroundColor: activeTab === "dashboard" ? "#ffedd5" : "transparent", color: activeTab === "dashboard" ? "#fc8019" : "#64748b" }}>
-            🏠 Dashboard Grid
+            🏠 Dashboard
           </button>
           <button onClick={() => setActiveTab("inventory")} style={{ ...styles.navBtn, backgroundColor: activeTab === "inventory" ? "#ffedd5" : "transparent", color: activeTab === "inventory" ? "#fc8019" : "#64748b" }}>
-            📦 Store Inventory
-          </button>
-          <button onClick={() => setActiveTab("wishlist")} style={{ ...styles.navBtn, backgroundColor: activeTab === "wishlist" ? "#ffedd5" : "transparent", color: activeTab === "wishlist" ? "#fc8019" : "#64748b" }}>
-            ❤️ Wishlist ({wishlist.length})
+            📦 Inventory
           </button>
           <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
             📋 Orders ({ordersList.length})
           </button>
-          <button onClick={() => setActiveTab("profile")} style={{ ...styles.navBtn, backgroundColor: activeTab === "profile" ? "#ffedd5" : "transparent", color: activeTab === "profile" ? "#fc8019" : "#64748b" }}>
-            👤 Profile
-          </button>
-          <button onClick={() => setActiveTab("settings")} style={{ ...styles.navBtn, backgroundColor: activeTab === "settings" ? "#ffedd5" : "transparent", color: activeTab === "settings" ? "#fc8019" : "#64748b" }}>
-            ⚙️ Settings
-          </button>
-        </div>
 
-        <div style={styles.searchBarContainer}>
-          <span style={styles.searchIcon}>🔍</span>
-          <input 
-            type="text"
-            placeholder="Search products..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            style={styles.searchInput}
-          />
-        </div>
+          {/* Profile & Settings Dropdown */}
+          <div style={styles.dropdownWrapper} ref={dropdownRef}>
+            <button 
+              onClick={() => setProfileDropdownOpen(!profileDropdownOpen)} 
+              style={{ 
+                ...styles.navBtn, 
+                backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "transparent", 
+                color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#64748b",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px"
+              }}
+            >
+              <div style={{ width: "22px", height: "22px", borderRadius: "50%", overflow: "hidden", backgroundColor: "#ffedd5", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #fc8019", flexShrink: 0 }}>
+                {userProfile.profileImage ? (
+                  <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                ) : (
+                  <span style={{ fontSize: "10px", fontWeight: "800", color: "#fc8019" }}>
+                    {userProfile.name ? userProfile.name.charAt(0).toUpperCase() : "A"}
+                  </span>
+                )}
+              </div>
+              <span>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
+            </button>
 
-        <div style={styles.navRight}>
-          <button onClick={() => setActiveTab("cartPage")} style={styles.navbarCartBtn}>
-            🛒 Cart ({cartItems.reduce((a, c) => a + c.qty, 0)})
-          </button>
-          <button onClick={handleLogout} style={styles.logoutBtn}>Logout</button>
+            {profileDropdownOpen && (
+              <div style={styles.dropdownMenu}>
+                <button 
+                  onClick={() => { setActiveTab("profile"); setProfileDropdownOpen(false); }}
+                  style={{ ...styles.dropdownItem, backgroundColor: activeTab === "profile" ? "#fff7ed" : "transparent", color: activeTab === "profile" ? "#fc8019" : "#334155" }}
+                >
+                  👤 My Profile
+                </button>
+                <button 
+                  onClick={() => { setActiveTab("settings"); setProfileDropdownOpen(false); }}
+                  style={{ ...styles.dropdownItem, backgroundColor: activeTab === "settings" ? "#fff7ed" : "transparent", color: activeTab === "settings" ? "#fc8019" : "#334155" }}
+                >
+                  ⚙️ Settings
+                </button>
+                <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
+                <button 
+                  onClick={() => { setProfileDropdownOpen(false); handleLogout(); }}
+                  style={{ ...styles.dropdownItem, backgroundColor: "transparent", color: "#dc2626" }}
+                >
+                  🚪 Logout
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -446,7 +446,7 @@ export default function Dashboard() {
                 <button onClick={clearCurrentBill} style={styles.clearCartBtn}>CLEAR CART ✕</button>
               </div>
 
-              <div style={styles.posBillItemsList}>
+<div style={styles.posBillItemsList}>
                 {currentBill.length === 0 ? (
                   <div style={styles.posEmptyBox}>
                     <p style={{ color: "#94a3b8", fontSize: "14px" }}>No items in current bill</p>
@@ -456,7 +456,7 @@ export default function Dashboard() {
                   currentBill.map((item) => (
                     <div key={item.id} style={styles.posBillRow}>
                       <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name} style={styles.posRowImg} />
-                      <div style={{ flex: 1, marginLeft: "10px" }}>
+                      <div style={{ flex: 1, marginLeft: "10px", minWidth: 0 }}>
                         <h5 style={styles.posRowTitle}>{item.name}</h5>
                         <p style={styles.posRowSub}>Quantity: {item.qty}</p>
                       </div>
@@ -464,11 +464,6 @@ export default function Dashboard() {
                         <span style={styles.posRowPrice}>₹{item.price * item.qty}</span>
                       </div>
                       <div style={styles.posRowActions}>
-                        <div style={styles.cartControls}>
-                          <button onClick={() => removeFromCurrentBill(item.id)} style={styles.qtyBtn}>-</button>
-                          <span style={styles.qtyText}>{item.qty}</span>
-                          <button onClick={() => addToCurrentBill(item)} style={styles.qtyBtn}>+</button>
-                        </div>
                         <button onClick={() => deleteFromCurrentBill(item.id)} style={styles.deleteRowBtn}>🗑️</button>
                       </div>
                     </div>
@@ -528,7 +523,7 @@ export default function Dashboard() {
                     return (
                       <div key={item.id} style={styles.posListItem}>
                         <img src={imageVal} alt={itemName} style={styles.posListImg} />
-                        <div style={{ flex: 1, marginLeft: "14px" }}>
+                        <div style={{ flex: 1, marginLeft: "14px", minWidth: 0 }}>
                           <h4 style={styles.posListTitle}>{itemName}</h4>
                           <p style={styles.posListStock}>Stock: {stock}</p>
                           <span style={styles.posListPrice}>₹{priceVal}</span>
@@ -555,124 +550,29 @@ export default function Dashboard() {
 
         {/* PROFILE PAGE TAB */}
         {activeTab === "profile" && (
-          <div style={{ padding: "40px", maxWidth: "700px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-            <div style={{ backgroundColor: "#fff", borderRadius: "20px", padding: "30px", boxShadow: "0 4px 15px rgba(0,0,0,0.05)", border: "1px solid #e2e8f0" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "20px", borderBottom: "2px solid #f1f5f9", paddingBottom: "20px", marginBottom: "20px" }}>
-                <div style={{ width: "70px", height: "70px", borderRadius: "50%", backgroundColor: "#ffedd5", color: "#fc8019", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "30px", fontWeight: "800" }}>
-                  {userProfile.name.charAt(0).toUpperCase()}
-                </div>
-                <div>
-                  <h2 style={{ margin: "0 0 4px 0", fontSize: "22px", color: "#0f172a" }}>{userProfile.name}</h2>
-                  <p style={{ margin: 0, color: "#64748b", fontSize: "14px" }}>Registered Owner / Admin</p>
-                </div>
-              </div>
-
-              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                <div style={styles.profileRow}>
-                  <span style={styles.profileLabel}>Store Name</span>
-                  <span style={styles.profileValue}>{userProfile.storeName}</span>
-                </div>
-                <div style={styles.profileRow}>
-                  <span style={styles.profileLabel}>Email Address</span>
-                  <span style={styles.profileValue}>{userProfile.email || "Not Provided"}</span>
-                </div>
-                <div style={styles.profileRow}>
-                  <span style={styles.profileLabel}>Phone Number</span>
-                  <span style={styles.profileValue}>{userProfile.phone || "Not Provided"}</span>
-                </div>
-                <div style={styles.profileRow}>
-                  <span style={styles.profileLabel}>Configured UPI ID</span>
-                  <span style={styles.profileValue}>{storeSettings.upiId}</span>
-                </div>
-              </div>
-
-              <div style={{ marginTop: "30px", display: "flex", gap: "10px" }}>
-                <button onClick={() => setActiveTab("settings")} style={{ padding: "12px 24px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer" }}>
-                  ⚙️ Go to Settings & Payment Setup
-                </button>
-              </div>
-            </div>
-          </div>
+          <Profile 
+            userProfile={userProfile} 
+            setUserProfile={setUserProfile} 
+            storeSettings={storeSettings} 
+            setStoreSettings={setStoreSettings} 
+            setPopupModal={setPopupModal} 
+          />
         )}
 
         {/* SETTINGS PAGE TAB */}
         {activeTab === "settings" && (
-          <div style={{ padding: "40px", maxWidth: "700px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-            <div style={{ backgroundColor: "#fff", borderRadius: "20px", padding: "30px", boxShadow: "0 4px 15px rgba(0,0,0,0.05)", border: "1px solid #e2e8f0" }}>
-              <h2 style={{ fontSize: "22px", fontWeight: "800", color: "#0f172a", marginBottom: "6px" }}>⚙️ Store & Payment Settings</h2>
-              <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "24px" }}>Configure your store name and payment methods for POS checkout and QR generation.</p>
-
-              <form onSubmit={handleSaveSettings} style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-                <div style={styles.inputGroup}>
-                  <label style={styles.label}>Store Name</label>
-                  <input 
-                    type="text" 
-                    value={userProfile.storeName} 
-                    onChange={(e) => setUserProfile({ ...userProfile, storeName: e.target.value })} 
-                    style={styles.modalInput} 
-                    required 
-                  />
-                </div>
-
-                <div style={styles.inputGroup}>
-                  <label style={styles.label}>Your UPI ID (For QR Code Generation)</label>
-                  <input 
-                    type="text" 
-                    placeholder="e.g. yourname@okaxis" 
-                    value={storeSettings.upiId} 
-                    onChange={(e) => setStoreSettings({ ...storeSettings, upiId: e.target.value })} 
-                    style={styles.modalInput} 
-                    required 
-                  />
-                  <small style={{ color: "#64748b", fontSize: "12px" }}>This UPI ID will automatically generate dynamic payment QR codes during checkout.</small>
-                </div>
-
-                <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: "16px" }}>
-                  <label style={{ ...styles.label, marginBottom: "10px", display: "block" }}>Enabled Payment Methods at POS</label>
-                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer", fontSize: "14px", fontWeight: "600", color: "#1e293b" }}>
-                      <input 
-                        type="checkbox" 
-                        checked={storeSettings.allowCash} 
-                        onChange={(e) => setStoreSettings({ ...storeSettings, allowCash: e.target.checked })} 
-                        style={{ width: "16px", height: "16px" }}
-                      />
-                      💵 Cash Payments
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer", fontSize: "14px", fontWeight: "600", color: "#1e293b" }}>
-                      <input 
-                        type="checkbox" 
-                        checked={storeSettings.allowUpi} 
-                        onChange={(e) => setStoreSettings({ ...storeSettings, allowUpi: e.target.checked })} 
-                        style={{ width: "16px", height: "16px" }}
-                      />
-                      📱 UPI QR Code Payments
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer", fontSize: "14px", fontWeight: "600", color: "#1e293b" }}>
-                      <input 
-                        type="checkbox" 
-                        checked={storeSettings.allowCard} 
-                        onChange={(e) => setStoreSettings({ ...storeSettings, allowCard: e.target.checked })} 
-                        style={{ width: "16px", height: "16px" }}
-                      />
-                      💳 Credit / Debit Card Payments
-                    </label>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: "10px" }}>
-                  <button type="submit" disabled={savingSettings} style={{ padding: "12px 28px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer", fontSize: "15px" }}>
-                    {savingSettings ? "Saving..." : "Save Settings 💾"}
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
+          <Settings 
+            userProfile={userProfile} 
+            setUserProfile={setUserProfile} 
+            storeSettings={storeSettings} 
+            setStoreSettings={setStoreSettings} 
+            setPopupModal={setPopupModal} 
+          />
         )}
 
         {/* TAB 2: DASHBOARD */}
         {activeTab === "dashboard" && (
-          <div style={{ padding: "24px", paddingBottom: "80px" }}>
+          <div style={{ padding: "24px", paddingBottom: "80px", maxWidth: "1400px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
             <h2 style={styles.sectionTitle}>Shop Categories</h2>
             <div style={styles.categoryScroll}>
               {categories.map((cat, idx) => (
@@ -735,8 +635,8 @@ export default function Dashboard() {
 
         {/* TAB 3: STORE INVENTORY */}
         {activeTab === "inventory" && (
-          <div style={{ padding: "30px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+          <div style={{ padding: "30px", maxWidth: "1400px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", flexWrap: "wrap", gap: "10px" }}>
               <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>📦 Store Inventory Management</h2>
               <button onClick={openAddModal} style={styles.addNewBtn}>+ Add New Product</button>
             </div>
@@ -761,57 +661,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* TAB 4: CART PAGE */}
-        {activeTab === "cartPage" && (
-          <div style={{ padding: "40px", maxWidth: "900px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-            <h2 style={{ fontSize: "26px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>🛒 My Shopping Cart</h2>
-            {cartItems.length === 0 ? (
-              <div style={styles.centerBox}>Your cart is empty.</div>
-            ) : (
-              <div style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.05)" }}>
-                {cartItems.map((item) => (
-                  <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 0", borderBottom: "1px solid #f1f5f9" }}>
-                    <div>
-                      <h4 style={{ margin: 0, fontSize: "16px" }}>{item.name}</h4>
-                      <p style={{ margin: "4px 0 0 0", color: "#64748b", fontSize: "14px" }}>₹{item.price} x {item.qty}</p>
-                    </div>
-                    <span style={{ fontWeight: "800", fontSize: "16px" }}>₹{item.price * item.qty}</span>
-                  </div>
-                ))}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "24px", paddingTop: "16px", borderTop: "2px solid #e2e8f0" }}>
-                  <span style={{ fontSize: "18px", fontWeight: "800" }}>Total: ₹{totalCartAmount}</span>
-                  <button onClick={() => { setPopupModal({ show: true, message: "Cart Order Placed Successfully! 🎉" }); setCartItems([]); }} style={{ padding: "12px 28px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "700", cursor: "pointer" }}>
-                    Proceed to Checkout
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 5: WISHLIST */}
-        {activeTab === "wishlist" && (
-          <div style={{ padding: "30px" }}>
-            <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>❤️ Wishlist</h2>
-            {wishlist.length === 0 ? (
-              <div style={styles.centerBox}>Your wishlist is empty.</div>
-            ) : (
-              <div style={styles.productGrid}>
-                {wishlist.map((item) => (
-                  <div key={item.id} style={styles.productCard}>
-                    <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name} style={styles.productImg} />
-                    <div style={styles.productDetails}>
-                      <h4 style={styles.productName}>{item.itemName || item.name}</h4>
-                      <p>₹{item.salesPrice || item.price || 0}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 6: ORDERS */}
+        {/* TAB 4: ORDERS */}
         {activeTab === "orders" && (
           <div style={{ padding: "30px", maxWidth: "1000px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
             <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>📋 Orders & Billing History</h2>
@@ -820,8 +670,8 @@ export default function Dashboard() {
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
                 {ordersList.map((order, idx) => (
-                  <div key={order.id || idx} onClick={() => setSelectedOrderDetails(order)} style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
-                    <div>
+                  <div key={order.id || idx} onClick={() => setSelectedOrderDetails(order)} style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", flexWrap: "wrap", gap: "10px" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
                       <h4 style={{ margin: "0 0 6px 0", fontSize: "16px" }}>Order ID: #{order.id.slice(-6).toUpperCase()}</h4>
                       <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>Customer: {order.customerName || "Walk-in"} | Payment: {order.paymentMethod || "Cash"}</p>
                       <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount}</strong></p>
@@ -851,8 +701,8 @@ export default function Dashboard() {
               </div>
 
               {/* Customer Details Optional */}
-              <div style={{ display: "flex", gap: "10px" }}>
-                <div style={{ ...styles.inputGroup, flex: 1 }}>
+              <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
                   <label style={styles.label}>Customer Name (Optional)</label>
                   <input 
                     type="text" 
@@ -862,7 +712,7 @@ export default function Dashboard() {
                     style={styles.modalInput} 
                   />
                 </div>
-                <div style={{ ...styles.inputGroup, flex: 1 }}>
+                <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
                   <label style={styles.label}>Phone No. (Optional)</label>
                   <input 
                     type="tel" 
@@ -976,7 +826,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* PROFESSIONAL SUCCESS ANIMATED POPUP (GPAY / PAYTM STYLE) */}
+      {/* PROFESSIONAL SUCCESS ANIMATED POPUP */}
       {popupModal.show && (
         <div style={styles.modalOverlay}>
           <div style={{ ...styles.modalBox, textAlign: "center", maxWidth: "340px", padding: "30px 20px" }}>
@@ -989,7 +839,9 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <h3 style={{ margin: "0 0 8px 0", color: "#0f172a", fontSize: "20px", fontWeight: "800" }}>Payment Successful!</h3>
+            <h3 style={{ margin: "0 0 8px 0", color: "#0f172a", fontSize: "20px", fontWeight: "800" }}>
+              {popupModal.message.includes("Payment") ? "Payment Successful!" : "Success!"}
+            </h3>
             <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "24px", lineHeight: "1.4" }}>{popupModal.message}</p>
             
             <button 
@@ -1028,85 +880,83 @@ export default function Dashboard() {
     </div>
   );
 }
-
 const styles = {
   appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column" },
-  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 20px", backgroundColor: "#ffffff", borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, zIndex: 100, flexWrap: "wrap", gap: "10px" },
-  logoArea: { display: "flex", alignItems: "center", gap: "10px" },
-  sidebarBrand: { fontSize: "18px", fontWeight: "800", color: "#1e3a8a", margin: 0 },
-  navLinks: { display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" },
-  navBtn: { padding: "7px 12px", border: "none", borderRadius: "8px", fontWeight: "700", fontSize: "12px", cursor: "pointer", whiteSpace: "nowrap" },
-  logoutBtn: { padding: "7px 12px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
-  mainContent: { flex: 1, display: "flex", flexDirection: "column", width: "100%", boxSizing: "border-box" },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "6px 12px", borderRadius: "8px", width: "200px", gap: "6px" },
-  searchIcon: { fontSize: "13px" },
-  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "12px", color: "#1e293b" },
-  navRight: { display: "flex", alignItems: "center", gap: "8px" },
-  navbarCartBtn: { fontWeight: "700", color: "#1e3a8a", fontSize: "12px", backgroundColor: "#eff6ff", padding: "7px 12px", borderRadius: "8px", border: "1.5px solid #bfdbfe", cursor: "pointer" },
+  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", backgroundColor: "#ffffff", borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, zIndex: 1000, gap: "10px", flexWrap: "nowrap", overflow: "visible" },
+  navLeftGroup: { display: "flex", alignItems: "center", gap: "10px", flexShrink: 0 },
+  sidebarBrand: { fontSize: "14px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
+  navLinks: { display: "flex", gap: "4px", flexWrap: "nowrap", alignItems: "center", overflowX: "auto", flexShrink: 1, minWidth: 0, overflow: "visible", paddingBottom: "2px" },
+  navBtn: { padding: "5px 8px", border: "none", borderRadius: "6px", fontWeight: "700", fontSize: "11px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 },
+  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "4px 8px", borderRadius: "8px", width: "130px", gap: "4px", flexShrink: 0 },
+  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "11px", color: "#1e293b" },
+  searchIcon: { fontSize: "14px" },
   
-  posLayout: { display: "flex", flex: 1, height: "calc(100vh - 65px)", boxSizing: "border-box" },
-  posLeftPane: { width: "380px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", position: "sticky", top: "65px" },
+  // Dropdown Styles (Fixed)
+  dropdownWrapper: { position: "relative", display: "inline-block", overflow: "visible", zIndex: 9999 },  
+  dropdownMenu: { position: "absolute", top: "100%", right: 0, marginTop: "8px", backgroundColor: "#ffffff", borderRadius: "10px", boxShadow: "0 10px 25px rgba(0,0,0,0.2)", border: "1px solid #e2e8f0", display: "flex", flexDirection: "column", minWidth: "160px", zIndex: 99999, padding: "4px" },  
+  dropdownItem: { padding: "10px 14px", textAlign: "left", background: "transparent", border: "none", fontSize: "12px", fontWeight: "700", cursor: "pointer", borderRadius: "6px", whiteSpace: "nowrap", width: "100%" },
+
+  posLayout: { display: "flex", flex: 1, height: "calc(100vh - 57px)", boxSizing: "border-box", overflow: "hidden" },
+  posLeftPane: { width: "360px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },
   posHeaderTop: { padding: "12px 16px", borderBottom: "1px solid #f1f5f9", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 },
   clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "11px", cursor: "pointer" },
-  posBillItemsList: { flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: "10px", maxHeight: "calc(100vh - 180px)" },
+  posBillItemsList: { flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: "10px" },
   posEmptyBox: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "6px", minHeight: "200px" },
   posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "8px", borderRadius: "10px", border: "1px solid #f1f5f9" },
-  posRowImg: { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px" },
-  posRowTitle: { fontSize: "12px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0" },
+  posRowImg: { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0 },
+  posRowTitle: { fontSize: "12px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
   posRowSub: { fontSize: "10px", color: "#64748b", margin: 0 },
-  posRowPrice: { fontSize: "13px", fontWeight: "800", color: "#0f172a" },
-  posRowActions: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-end" },
+  posRowPrice: { fontSize: "13px", fontWeight: "800", color: "#0f172a", whiteSpace: "nowrap" },
+  posRowActions: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-end", flexShrink: 0 },
   deleteRowBtn: { background: "transparent", border: "none", cursor: "pointer", fontSize: "12px" },
   posBillFooter: { borderTop: "2px solid #f1f5f9", padding: "16px", backgroundColor: "#fff", flexShrink: 0 },
   posTotalRow: { display: "flex", justifyContent: "space-between", fontSize: "16px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
   posTotalPrice: { color: "#fc8019" },
   posCheckoutBtn: { width: "100%", padding: "14px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "800", fontSize: "14px", cursor: "pointer", textAlign: "center" },
 
-  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "16px", height: "calc(100vh - 65px)", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box" },
+  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "16px", height: "100%", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box", minWidth: 0 },
   posVerticalList: { display: "flex", flexDirection: "column", gap: "10px", paddingBottom: "40px" },
   posListItem: { backgroundColor: "#ffffff", borderRadius: "12px", padding: "10px 14px", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" },
-  posListImg: { width: "48px", height: "48px", objectFit: "cover", borderRadius: "8px" },
-  posListTitle: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0" },
+  posListImg: { width: "48px", height: "48px", objectFit: "cover", borderRadius: "8px", flexShrink: 0 },
+  posListTitle: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
   posListStock: { fontSize: "10px", color: "#64748b", margin: "0 0 2px 0" },
   posListPrice: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
-  posListAddBtn: { padding: "6px 14px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "800", fontSize: "12px", cursor: "pointer" },
-  posListQtyControl: { display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "2px 8px", width: "80px" },
+  posListAddBtn: { padding: "6px 14px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "800", fontSize: "12px", cursor: "pointer", whiteSpace: "nowrap" },
+  posListQtyControl: { display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "2px 6px", width: "75px", flexShrink: 0 },
   posListQtyBtn: { border: "none", background: "transparent", fontWeight: "800", color: "#fc8019", cursor: "pointer", fontSize: "13px" },
   posListQtyVal: { fontSize: "13px", fontWeight: "800", color: "#1e293b" },
 
   sectionTitle: { fontSize: "17px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
-  categoryScroll: { display: "flex", gap: "10px", overflowX: "auto", paddingBottom: "8px", marginBottom: "16px", flexShrink: 0 },
-  categoryCard: { padding: "6px 14px", borderRadius: "18px", cursor: "pointer", fontWeight: "700", fontSize: "12px", whiteSpace: "nowrap", border: "1px solid #e2e8f0" },
-  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: "14px" },
+  categoryScroll: { display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "8px", marginBottom: "16px", flexShrink: "0" },
+  categoryCard: { padding: "6px 14px", borderRadius: "18px", cursor: "pointer", fontWeight: "700", fontSize: "12px", whiteSpace: "nowrap", border: "1px solid #e2e8f0", flexShrink: 0 },
+  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "14px" },
   productCard: { backgroundColor: "#ffffff", borderRadius: "14px", overflow: "hidden", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #f1f5f9", display: "flex", flexDirection: "column" },
   imageWrapper: { position: "relative", height: "130px", width: "100%" },
   productImg: { width: "100%", height: "100%", objectFit: "cover" },
   stockBadge: { position: "absolute", bottom: "6px", left: "6px", backgroundColor: "rgba(0, 0, 0, 0.75)", color: "#fff", padding: "2px 6px", borderRadius: "4px", fontSize: "10px", fontWeight: "700" },
   productDetails: { padding: "10px", display: "flex", flexDirection: "column", gap: "4px", flex: 1, justifyContent: "space-between" },
-  productName: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: 0 },
+  productName: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
   productCategory: { fontSize: "10px", color: "#64748b", margin: 0 },
   addBillBtn: { width: "100%", padding: "6px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
   
-  floatingBar: { position: "fixed", bottom: "20px", left: "50%", transform: "translateX(-50%)", backgroundColor: "#fc8019", color: "#fff", padding: "12px 24px", borderRadius: "30px", display: "flex", justifyContent: "space-between", alignItems: "center", width: "90%", maxWidth: "500px", boxShadow: "0 10px 25px rgba(252, 128, 25, 0.4)", cursor: "pointer", zIndex: 999 },
-  editCardBtn: { flex: 1, padding: "6px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
-  deleteCardBtn: { flex: 1, padding: "6px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  floatingBar: { position: "fixed", bottom: "20px", left: "50%", transform: "translateX(-50%)", backgroundColor: "#fc8019", color: "#fff", padding: "12px 24px", borderRadius: "30px", display: "flex", justifyContent: "space-between", alignItems: "center", width: "90%", maxWidth: "500px", boxShadow: "0 10px 25px rgba(252, 128, 25, 0.4)", cursor: "pointer", zIndex: 999, boxSizing: "border-box" },
+  editCardBtn: { flex: 1, padding: "6px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center", whiteSpace: "nowrap" },
+  deleteCardBtn: { flex: 1, padding: "6px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center", whiteSpace: "nowrap" },
   cartControls: { display: "flex", alignItems: "center", gap: "4px", backgroundColor: "#f1f5f9", padding: "2px 4px", borderRadius: "6px" },
   qtyBtn: { border: "none", background: "transparent", fontWeight: "800", cursor: "pointer", color: "#fc8019", fontSize: "11px" },
   qtyText: { fontSize: "11px", fontWeight: "700", color: "#1e293b" },
-  printBillBtn: { padding: "6px 12px", backgroundColor: "#f1f5f9", color: "#1e293b", border: "1px solid #cbd5e1", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "12px" },
+  printBillBtn: { padding: "6px 12px", backgroundColor: "#f1f5f9", color: "#1e293b", border: "1.5px solid #cbd5e1", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "12px", whiteSpace: "nowrap" },
   centerBox: { gridColumn: "1 / -1", textAlign: "center", padding: "40px", color: "#64748b", fontWeight: "600", fontSize: "14px" },
-  addNewBtn: { padding: "8px 16px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" },
+  addNewBtn: { padding: "8px 16px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px", whiteSpace: "nowrap" },
   
-  // Profile Row Styling
-  profileRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", backgroundColor: "#f8fafc", borderRadius: "10px", border: "1px solid #f1f5f9" },
+  profileRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", backgroundColor: "#f8fafc", borderRadius: "10px", border: "1px solid #e2e8f0", gap: "10px", flexWrap: "wrap" },
   profileLabel: { fontSize: "13px", fontWeight: "700", color: "#64748b" },
   profileValue: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
+  profileEditInput: { padding: "8px 12px", borderRadius: "8px", border: "1.5px solid #cbd5e1", fontSize: "14px", fontWeight: "700", color: "#1e293b", outline: "none", width: "240px", boxSizing: "border-box", backgroundColor: "#f8fafc" },
 
-  // Payment Cards Grid
   paymentCardsGrid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px", marginTop: "4px" },
-  paymentCardOption: { padding: "12px", borderRadius: "10px", border: "2px solid #cbd5e1", display: "flex", flexDirection: "column", alignItems: "center", gap: "6px", cursor: "pointer", transition: "all 0.2s" },
+  paymentCardOption: { padding: "10px", borderRadius: "10px", border: "2px solid #cbd5e1", display: "flex", flexDirection: "column", alignItems: "center", gap: "4px", cursor: "pointer", transition: "all 0.2s" },
 
-  // QR Container
   qrContainer: { display: "flex", flexDirection: "column", alignItems: "center", backgroundColor: "#f8fafc", padding: "12px", borderRadius: "10px", border: "1px dashed #cbd5e1", margin: "10px 0", gap: "8px" },
   qrBox: { backgroundColor: "#fff", padding: "8px", borderRadius: "8px", boxShadow: "0 2px 8px rgba(0,0,0,0.05)" },
 
