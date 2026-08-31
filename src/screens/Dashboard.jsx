@@ -446,7 +446,7 @@ export default function Dashboard() {
                 <button onClick={clearCurrentBill} style={styles.clearCartBtn}>CLEAR CART ✕</button>
               </div>
 
-<div style={styles.posBillItemsList}>
+              <div style={styles.posBillItemsList}>
                 {currentBill.length === 0 ? (
                   <div style={styles.posEmptyBox}>
                     <p style={{ color: "#94a3b8", fontSize: "14px" }}>No items in current bill</p>
@@ -880,26 +880,38 @@ export default function Dashboard() {
     </div>
   );
 }
+
 const styles = {
   appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column" },
-  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", backgroundColor: "#ffffff", borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, zIndex: 1000, gap: "10px", flexWrap: "nowrap", overflow: "visible" },
-  navLeftGroup: { display: "flex", alignItems: "center", gap: "10px", flexShrink: 0 },
+navbar: { 
+  display: "flex", 
+  justifyContent: "space-between", 
+  alignItems: "center", 
+  padding: "8px 14px", 
+  backgroundColor: "#ffffff", 
+  borderBottom: "1px solid #e2e8f0", 
+  position: "sticky", 
+  top: 0, 
+  zIndex: 100, 
+  gap: "12px", 
+  width: "100%", 
+  boxSizing: "border-box", 
+  flexWrap: "wrap" 
+},  navLeftGroup: { display: "flex", alignItems: "center", gap: "12px", flexShrink: 1, minWidth: 0 },
   sidebarBrand: { fontSize: "14px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
-  navLinks: { display: "flex", gap: "4px", flexWrap: "nowrap", alignItems: "center", overflowX: "auto", flexShrink: 1, minWidth: 0, overflow: "visible", paddingBottom: "2px" },
+  navLinks: { display: "flex", gap: "6px", flexWrap: "nowrap", alignItems: "center", overflowX: "auto", flexShrink: 0, paddingBottom: "2px" },
   navBtn: { padding: "5px 8px", border: "none", borderRadius: "6px", fontWeight: "700", fontSize: "11px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "4px 8px", borderRadius: "8px", width: "130px", gap: "4px", flexShrink: 0 },
+  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "4px 8px", borderRadius: "8px", width: "140px", gap: "4px", flexShrink: 1, minWidth: "90px" },
   searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "11px", color: "#1e293b" },
   searchIcon: { fontSize: "14px" },
   
-  // Dropdown Styles (Fixed)
+  // Dropdown Styles
   dropdownWrapper: { position: "relative", display: "inline-block", overflow: "visible", zIndex: 9999 },  
   dropdownMenu: { position: "absolute", top: "100%", right: 0, marginTop: "8px", backgroundColor: "#ffffff", borderRadius: "10px", boxShadow: "0 10px 25px rgba(0,0,0,0.2)", border: "1px solid #e2e8f0", display: "flex", flexDirection: "column", minWidth: "160px", zIndex: 99999, padding: "4px" },  
   dropdownItem: { padding: "10px 14px", textAlign: "left", background: "transparent", border: "none", fontSize: "12px", fontWeight: "700", cursor: "pointer", borderRadius: "6px", whiteSpace: "nowrap", width: "100%" },
 
-  posLayout: { display: "flex", flex: 1, height: "calc(100vh - 57px)", boxSizing: "border-box", overflow: "hidden" },
-  posLeftPane: { width: "360px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },
-  posHeaderTop: { padding: "12px 16px", borderBottom: "1px solid #f1f5f9", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 },
-  clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "11px", cursor: "pointer" },
+  posLayout: { display: "flex", flexDirection: "row", flex: 1, height: "calc(100vh - 57px)", boxSizing: "border-box", overflow: "hidden" },  
+  posLeftPane: { width: "340px", minWidth: "320px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },  clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "11px", cursor: "pointer" },
   posBillItemsList: { flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: "10px" },
   posEmptyBox: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "6px", minHeight: "200px" },
   posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "8px", borderRadius: "10px", border: "1px solid #f1f5f9" },
