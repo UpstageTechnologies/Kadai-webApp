@@ -1,5 +1,6 @@
 // src/screens/Dashboard.jsx
 import React, { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { signOut } from "firebase/auth";
@@ -7,7 +8,7 @@ import Profile from "./Profile";
 import Settings from "./Settings";
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState("sales"); // "sales", "dashboard", "inventory", "orders", "profile", "settings"
+  const [activeTab, setActiveTab] = useState("sales");
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState(["All"]);
   const [loading, setLoading] = useState(true);
@@ -17,9 +18,10 @@ export default function Dashboard() {
   const [currentBill, setCurrentBill] = useState([]);
   const [ordersList, setOrdersList] = useState([]);
 
-  // Dropdown State for Profile & Settings
+  // Profile Dropdown State and Dynamic Coordinates
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
-  const dropdownRef = useRef(null);
+  const [menuCoords, setMenuCoords] = useState({ top: 0, right: 0 });
+  const profileBtnRef = useRef(null);
 
   // User Profile & Settings States
   const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store", profileImage: "" });
@@ -49,14 +51,31 @@ export default function Dashboard() {
   const [brand, setBrand] = useState("");
   const [image, setImage] = useState("");
 
-  const handleClickOutside = (e) => {
-    if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+  const toggleProfileDropdown = (e) => {
+    e.stopPropagation();
+    if (!profileDropdownOpen && profileBtnRef.current) {
+      const rect = profileBtnRef.current.getBoundingClientRect();
+      setMenuCoords({
+        top: rect.bottom + 8,
+        right: window.innerWidth - rect.right
+      });
+      setProfileDropdownOpen(true);
+    } else {
       setProfileDropdownOpen(false);
     }
   };
 
   useEffect(() => {
-    document.addEventListener("mousedown", handleClickOutside);
+    const handleOutsideClick = (e) => {
+      if (profileBtnRef.current && profileBtnRef.current.contains(e.target)) {
+        return;
+      }
+      setProfileDropdownOpen(false);
+    };
+
+    window.addEventListener("click", handleOutsideClick);
+    window.addEventListener("scroll", () => setProfileDropdownOpen(false), true);
+    window.addEventListener("resize", () => setProfileDropdownOpen(false));
 
     const styleSheet = document.createElement("style");
     styleSheet.type = "text/css";
@@ -96,7 +115,7 @@ export default function Dashboard() {
             name: data.name || auth.currentUser?.displayName || "Store Owner",
             email: data.email || auth.currentUser?.email || "",
             phone: data.phone || "",
-            storeName: data.storeName || "Kadai Pro Store",
+            storeName: data.storeName || data.shopName || "Kadai Pro Store",
             profileImage: data.profileImage || ""
           });
           if (data.settings) {
@@ -109,6 +128,7 @@ export default function Dashboard() {
     };
     fetchUserData();
 
+    // 1. Inventory Sync
     const inventoryRef = collection(db, "users", currentUid, "inventory");
     const unsubscribeInventory = onSnapshot(inventoryRef, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -122,6 +142,7 @@ export default function Dashboard() {
       setLoading(false);
     });
 
+    // 2. Orders History Sync
     const ordersRef = collection(db, "users", currentUid, "local_orders");
     const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
       const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -131,10 +152,26 @@ export default function Dashboard() {
       console.error("Error fetching orders:", error);
     });
 
+    // 3. Real-time Active Cart Sync with Mobile App
+    const activeCartRef = doc(db, "users", currentUid, "active_cart", "current");
+    const unsubscribeActiveCart = onSnapshot(activeCartRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setCurrentBill(data.items || []);
+      } else {
+        setCurrentBill([]);
+      }
+    }, (err) => {
+      console.error("Cart sync listener error:", err);
+    });
+
     return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("click", handleOutsideClick);
+      window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
+      window.removeEventListener("resize", () => setProfileDropdownOpen(false));
       unsubscribeInventory();
       unsubscribeOrders();
+      unsubscribeActiveCart();
     };
   }, []);
 
@@ -144,26 +181,74 @@ export default function Dashboard() {
     window.location.href = "/login";
   };
 
-  const addToCurrentBill = (product) => {
-    setCurrentBill(prev => {
-      const exist = prev.find(item => item.id === product.id);
-      if (exist) {
-        return prev.map(item => item.id === product.id ? { ...item, qty: item.qty + 1 } : item);
-      }
-      return [...prev, { ...product, qty: 1 }];
-    });
+  const syncWebCartToCloud = async (updatedItems) => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!currentUid) return;
+    try {
+      const activeCartRef = doc(db, "users", currentUid, "active_cart", "current");
+      await setDoc(activeCartRef, {
+        items: updatedItems,
+        updatedAt: serverTimestamp()
+      });
+    } catch (e) {
+      console.error("Cloud cart push error:", e);
+    }
   };
 
-  const removeFromCurrentBill = (id) => {
-    setCurrentBill(prev => prev.map(item => item.id === id ? { ...item, qty: item.qty - 1 } : item).filter(item => item.qty > 0));
+  const addToCurrentBill = async (product) => {
+    const pId = product.id || product.barcode;
+    const pName = product.itemName || product.name;
+    const pPrice = Number(product.salesPrice || product.price || 0);
+
+    let updated;
+    const exist = currentBill.find(item => (item.id && item.id === pId) || (item.barcode && item.barcode === product.barcode));
+    if (exist) {
+      updated = currentBill.map(item => ((item.id && item.id === pId) || (item.barcode && item.barcode === product.barcode)) ? { ...item, qty: item.qty + 1 } : item);
+    } else {
+      updated = [
+        ...currentBill, 
+        { 
+          ...product, 
+          id: pId, 
+          barcode: product.barcode || pId,
+          name: pName, 
+          itemName: pName,
+          price: pPrice, 
+          salesPrice: pPrice,
+          purchasePrice: Number(product.purchasePrice || 0),
+          taxPercent: product.taxPercent || 0,
+          qty: 1 
+        }
+      ];
+    }
+    setCurrentBill(updated);
+    await syncWebCartToCloud(updated);
   };
 
-  const deleteFromCurrentBill = (id) => {
-    setCurrentBill(prev => prev.filter(item => item.id !== id));
+  const removeFromCurrentBill = async (id) => {
+    const exist = currentBill.find(item => item.id === id || item.barcode === id);
+    if (!exist) return;
+
+    let updated;
+    if (exist.qty === 1) {
+      updated = currentBill.filter(item => item.id !== id && item.barcode !== id);
+    } else {
+      updated = currentBill.map(item => (item.id === id || item.barcode === id) ? { ...item, qty: item.qty - 1 } : item);
+    }
+
+    setCurrentBill(updated);
+    await syncWebCartToCloud(updated);
   };
 
-  const clearCurrentBill = () => {
+  const deleteFromCurrentBill = async (id) => {
+    const updated = currentBill.filter(item => item.id !== id && item.barcode !== id);
+    setCurrentBill(updated);
+    await syncWebCartToCloud(updated);
+  };
+
+  const clearCurrentBill = async () => {
     setCurrentBill([]);
+    await syncWebCartToCloud([]);
   };
 
   const handleFinalCheckoutSubmit = async (e) => {
@@ -192,6 +277,7 @@ export default function Dashboard() {
       setCustomerName("");
       setCustomerPhone("");
       setCurrentBill([]);
+      await syncWebCartToCloud([]);
       setPopupModal({ show: true, message: "Payment Successful & Order Recorded! 🎉" });
     } catch (err) {
       console.error("Checkout error:", err);
@@ -298,12 +384,15 @@ export default function Dashboard() {
       if (!currentUid) return;
 
       const productData = {
+        name: name.trim(),
         itemName: name.trim(),
         category: category.trim(),
         salesPrice: Number(price) || 0,
+        price: Number(price) || 0,
         quantity: Number(qty) || 0,
         brand: brand.trim() || "Local",
         image: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
+        imageUrl: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         updatedAt: serverTimestamp()
       };
 
@@ -367,7 +456,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Navigation Links */}
+        {/* Navigation Links Right Area */}
         <div style={styles.navLinks}>
           <button onClick={() => setActiveTab("sales")} style={{ ...styles.navBtn, backgroundColor: activeTab === "sales" ? "#ffedd5" : "transparent", color: activeTab === "sales" ? "#fc8019" : "#64748b" }}>
             🧾 Sales
@@ -382,57 +471,70 @@ export default function Dashboard() {
             📋 Orders ({ordersList.length})
           </button>
 
-          {/* Profile & Settings Dropdown */}
-          <div style={styles.dropdownWrapper} ref={dropdownRef}>
-            <button 
-              onClick={() => setProfileDropdownOpen(!profileDropdownOpen)} 
-              style={{ 
-                ...styles.navBtn, 
-                backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "transparent", 
-                color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#64748b",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px"
-              }}
-            >
-              <div style={{ width: "22px", height: "22px", borderRadius: "50%", overflow: "hidden", backgroundColor: "#ffedd5", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #fc8019", flexShrink: 0 }}>
-                {userProfile.profileImage ? (
-                  <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                ) : (
-                  <span style={{ fontSize: "10px", fontWeight: "800", color: "#fc8019" }}>
-                    {userProfile.name ? userProfile.name.charAt(0).toUpperCase() : "A"}
-                  </span>
-                )}
-              </div>
-              <span>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
-            </button>
-
-            {profileDropdownOpen && (
-              <div style={styles.dropdownMenu}>
-                <button 
-                  onClick={() => { setActiveTab("profile"); setProfileDropdownOpen(false); }}
-                  style={{ ...styles.dropdownItem, backgroundColor: activeTab === "profile" ? "#fff7ed" : "transparent", color: activeTab === "profile" ? "#fc8019" : "#334155" }}
-                >
-                  👤 My Profile
-                </button>
-                <button 
-                  onClick={() => { setActiveTab("settings"); setProfileDropdownOpen(false); }}
-                  style={{ ...styles.dropdownItem, backgroundColor: activeTab === "settings" ? "#fff7ed" : "transparent", color: activeTab === "settings" ? "#fc8019" : "#334155" }}
-                >
-                  ⚙️ Settings
-                </button>
-                <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
-                <button 
-                  onClick={() => { setProfileDropdownOpen(false); handleLogout(); }}
-                  style={{ ...styles.dropdownItem, backgroundColor: "transparent", color: "#dc2626" }}
-                >
-                  🚪 Logout
-                </button>
-              </div>
-            )}
-          </div>
+          {/* Profile Trigger Button */}
+          <button 
+            ref={profileBtnRef}
+            type="button"
+            onClick={toggleProfileDropdown} 
+            style={{ 
+              ...styles.navBtn, 
+              backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "transparent", 
+              color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#64748b",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              cursor: "pointer"
+            }}
+          >
+            <div style={{ width: "24px", height: "24px", borderRadius: "50%", overflow: "hidden", backgroundColor: "#ffedd5", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #fc8019", flexShrink: 0 }}>
+              {userProfile.profileImage ? (
+                <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              ) : (
+                <span style={{ fontSize: "11px", fontWeight: "800", color: "#fc8019" }}>
+                  {userProfile.name ? userProfile.name.charAt(0).toUpperCase() : "A"}
+                </span>
+              )}
+            </div>
+            <span>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
+          </button>
         </div>
       </header>
+
+      {/* REACT PORTAL: Escapes all containers and renders directly in Document Body */}
+      {profileDropdownOpen && createPortal(
+        <div 
+          style={{
+            ...styles.portalDropdownMenu,
+            top: `${menuCoords.top}px`,
+            right: `${menuCoords.right}px`
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("profile"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "profile" ? "#fff7ed" : "transparent", color: activeTab === "profile" ? "#fc8019" : "#334155" }}
+          >
+            👤 My Profile
+          </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("settings"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "settings" ? "#fff7ed" : "transparent", color: activeTab === "settings" ? "#fc8019" : "#334155" }}
+          >
+            ⚙️ Settings
+          </button>
+          <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
+          <button 
+            type="button"
+            onClick={() => { setProfileDropdownOpen(false); handleLogout(); }}
+            style={{ ...styles.dropdownItem, backgroundColor: "transparent", color: "#dc2626" }}
+          >
+            🚪 Logout
+          </button>
+        </div>,
+        document.body
+      )}
 
       {/* Main Content Area */}
       <div style={styles.mainContent}>
@@ -453,18 +555,18 @@ export default function Dashboard() {
                     <span style={{ fontSize: "28px" }}>🧾</span>
                   </div>
                 ) : (
-                  currentBill.map((item) => (
-                    <div key={item.id} style={styles.posBillRow}>
-                      <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name} style={styles.posRowImg} />
+                  currentBill.map((item, idx) => (
+                    <div key={item.id || item.barcode || idx} style={styles.posBillRow}>
+                      <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name || item.itemName} style={styles.posRowImg} />
                       <div style={{ flex: 1, marginLeft: "10px", minWidth: 0 }}>
-                        <h5 style={styles.posRowTitle}>{item.name}</h5>
+                        <h5 style={styles.posRowTitle}>{item.name || item.itemName}</h5>
                         <p style={styles.posRowSub}>Quantity: {item.qty}</p>
                       </div>
                       <div style={{ textAlign: "right", marginRight: "10px" }}>
-                        <span style={styles.posRowPrice}>₹{item.price * item.qty}</span>
+                        <span style={styles.posRowPrice}>₹{(item.salesPrice || item.price || 0) * item.qty}</span>
                       </div>
                       <div style={styles.posRowActions}>
-                        <button onClick={() => deleteFromCurrentBill(item.id)} style={styles.deleteRowBtn}>🗑️</button>
+                        <button onClick={() => deleteFromCurrentBill(item.id || item.barcode)} style={styles.deleteRowBtn}>🗑️</button>
                       </div>
                     </div>
                   ))
@@ -517,7 +619,7 @@ export default function Dashboard() {
                     const stock = item.quantity || 0;
                     const imageVal = item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
                     
-                    const existingBillItem = currentBill.find(b => b.id === item.id);
+                    const existingBillItem = currentBill.find(b => (b.id && b.id === item.id) || (b.barcode && b.barcode === item.barcode));
                     const itemQtyInBill = existingBillItem ? existingBillItem.qty : 0;
 
                     return (
@@ -533,7 +635,7 @@ export default function Dashboard() {
                             <button onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} style={styles.posListAddBtn}>ADD +</button>
                           ) : (
                             <div style={styles.posListQtyControl}>
-                              <button onClick={() => removeFromCurrentBill(item.id)} style={styles.posListQtyBtn}>-</button>
+                              <button onClick={() => removeFromCurrentBill(item.id || item.barcode)} style={styles.posListQtyBtn}>-</button>
                               <span style={styles.posListQtyVal}>{itemQtyInBill}</span>
                               <button onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} style={styles.posListQtyBtn}>+</button>
                             </div>
@@ -685,7 +787,7 @@ export default function Dashboard() {
         )}
       </div>
 
-      {/* PROFESSIONAL CHECKOUT MODAL WITH AMOUNT-FIXED UPI QR CODE */}
+      {/* CHECKOUT MODAL */}
       {isCheckoutModalOpen && (
         <div style={styles.modalOverlay}>
           <div style={{ ...styles.modalBox, maxWidth: "480px" }}>
@@ -700,7 +802,6 @@ export default function Dashboard() {
                 <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>₹{totalBillAmount}.00</span>
               </div>
 
-              {/* Customer Details Optional */}
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
                 <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
                   <label style={styles.label}>Customer Name (Optional)</label>
@@ -724,7 +825,6 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* BIG PAYMENT CARDS SELECTION */}
               <div style={styles.inputGroup}>
                 <label style={styles.label}>Select Payment Method</label>
                 <div style={styles.paymentCardsGrid}>
@@ -772,7 +872,6 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* DYNAMIC AMOUNT-FIXED UPI QR CODE */}
               {paymentMethod === "UPI / QR" && (
                 <div style={styles.qrContainer}>
                   <div style={styles.qrBox}>
@@ -798,7 +897,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* BILL DETAILS POPUP MODAL */}
+      {/* RECEIPT PREVIEW MODAL */}
       {selectedOrderDetails && (
         <div style={styles.modalOverlay} onClick={() => setSelectedOrderDetails(null)}>
           <div style={{ ...styles.modalBox, maxWidth: "450px" }} onClick={e => e.stopPropagation()}>
@@ -809,8 +908,8 @@ export default function Dashboard() {
             <div style={{ maxHeight: "220px", overflowY: "auto", margin: "10px 0", borderTop: "1px solid #eee", borderBottom: "1px solid #eee", padding: "10px 0" }}>
               {(selectedOrderDetails.items || []).map((item, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "14px", paddingBottom: "6px" }}>
-                  <span>{item.name} (x{item.qty})</span>
-                  <span>₹{item.price * item.qty}</span>
+                  <span>{item.name || item.itemName} (x{item.qty})</span>
+                  <span>₹{(item.price || item.salesPrice || 0) * item.qty}</span>
                 </div>
               ))}
             </div>
@@ -826,11 +925,10 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* PROFESSIONAL SUCCESS ANIMATED POPUP */}
+      {/* POPUP MODAL */}
       {popupModal.show && (
         <div style={styles.modalOverlay}>
           <div style={{ ...styles.modalBox, textAlign: "center", maxWidth: "340px", padding: "30px 20px" }}>
-            {/* Animated Green Checkmark SVG */}
             <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}>
               <div className="animate-circle" style={{ width: "70px", height: "70px", borderRadius: "50%", backgroundColor: "#dcfce7", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
@@ -882,89 +980,94 @@ export default function Dashboard() {
 }
 
 const styles = {
-  appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column" },
-navbar: { 
-  display: "flex", 
-  justifyContent: "space-between", 
-  alignItems: "center", 
-  padding: "8px 14px", 
-  backgroundColor: "#ffffff", 
-  borderBottom: "1px solid #e2e8f0", 
-  position: "sticky", 
-  top: 0, 
-  zIndex: 100, 
-  gap: "12px", 
-  width: "100%", 
-  boxSizing: "border-box", 
-  flexWrap: "wrap" 
-},  navLeftGroup: { display: "flex", alignItems: "center", gap: "12px", flexShrink: 1, minWidth: 0 },
-  sidebarBrand: { fontSize: "14px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
-  navLinks: { display: "flex", gap: "6px", flexWrap: "nowrap", alignItems: "center", overflowX: "auto", flexShrink: 0, paddingBottom: "2px" },
-  navBtn: { padding: "5px 8px", border: "none", borderRadius: "6px", fontWeight: "700", fontSize: "11px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "4px 8px", borderRadius: "8px", width: "140px", gap: "4px", flexShrink: 1, minWidth: "90px" },
-  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "11px", color: "#1e293b" },
+  appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column", width: "100%" },
+  navbar: { 
+    display: "flex", 
+    justifyContent: "space-between", 
+    alignItems: "center", 
+    padding: "10px 20px", 
+    backgroundColor: "#ffffff", 
+    borderBottom: "1px solid #e2e8f0", 
+    position: "sticky", 
+    top: 0, 
+    zIndex: 100, 
+    gap: "16px", 
+    width: "100%", 
+    boxSizing: "border-box"
+  },
+  navLeftGroup: { display: "flex", alignItems: "center", gap: "16px", flexShrink: 0 },
+  logoArea: { display: "flex", alignItems: "center", gap: "8px" },
+  sidebarBrand: { fontSize: "16px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
+  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "6px 12px", borderRadius: "8px", width: "220px", gap: "6px" },
+  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "12px", color: "#1e293b" },
   searchIcon: { fontSize: "14px" },
-  
-  // Dropdown Styles
-  dropdownWrapper: { position: "relative", display: "inline-block", overflow: "visible", zIndex: 9999 },  
-  dropdownMenu: { position: "absolute", top: "100%", right: 0, marginTop: "8px", backgroundColor: "#ffffff", borderRadius: "10px", boxShadow: "0 10px 25px rgba(0,0,0,0.2)", border: "1px solid #e2e8f0", display: "flex", flexDirection: "column", minWidth: "160px", zIndex: 99999, padding: "4px" },  
-  dropdownItem: { padding: "10px 14px", textAlign: "left", background: "transparent", border: "none", fontSize: "12px", fontWeight: "700", cursor: "pointer", borderRadius: "6px", whiteSpace: "nowrap", width: "100%" },
+  navLinks: { display: "flex", gap: "10px", alignItems: "center", flexShrink: 0 },
+  navBtn: { padding: "7px 14px", border: "none", borderRadius: "8px", fontWeight: "700", fontSize: "13px", cursor: "pointer", whiteSpace: "nowrap" },
 
-  posLayout: { display: "flex", flexDirection: "row", flex: 1, height: "calc(100vh - 57px)", boxSizing: "border-box", overflow: "hidden" },  
-  posLeftPane: { width: "340px", minWidth: "320px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },  clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "11px", cursor: "pointer" },
-  posBillItemsList: { flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: "10px" },
-  posEmptyBox: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "6px", minHeight: "200px" },
-  posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "8px", borderRadius: "10px", border: "1px solid #f1f5f9" },
-  posRowImg: { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0 },
-  posRowTitle: { fontSize: "12px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  posRowSub: { fontSize: "10px", color: "#64748b", margin: 0 },
-  posRowPrice: { fontSize: "13px", fontWeight: "800", color: "#0f172a", whiteSpace: "nowrap" },
+  portalDropdownMenu: { 
+    position: "fixed", 
+    backgroundColor: "#ffffff", 
+    borderRadius: "12px", 
+    boxShadow: "0 14px 35px rgba(0,0,0,0.22)", 
+    border: "1px solid #cbd5e1", 
+    display: "flex", 
+    flexDirection: "column", 
+    minWidth: "180px", 
+    zIndex: 9999999, 
+    padding: "6px" 
+  },  
+  dropdownItem: { padding: "10px 14px", textAlign: "left", background: "transparent", border: "none", fontSize: "13px", fontWeight: "700", cursor: "pointer", borderRadius: "8px", whiteSpace: "nowrap", width: "100%" },
+
+  mainContent: { flex: 1, display: "flex", flexDirection: "column" },
+  posLayout: { display: "flex", flexDirection: "row", flex: 1, height: "calc(100vh - 61px)", boxSizing: "border-box", overflow: "hidden" },  
+  posLeftPane: { width: "350px", minWidth: "330px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },
+  posHeaderTop: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", borderBottom: "1px solid #f1f5f9" },
+  clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "12px", cursor: "pointer" },
+  posBillItemsList: { flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: "10px" },
+  posEmptyBox: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "8px", minHeight: "220px" },
+  posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "10px", borderRadius: "10px", border: "1px solid #f1f5f9" },
+  posRowImg: { width: "42px", height: "42px", objectFit: "cover", borderRadius: "6px", flexShrink: 0 },
+  posRowTitle: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  posRowSub: { fontSize: "11px", color: "#64748b", margin: 0 },
+  posRowPrice: { fontSize: "14px", fontWeight: "800", color: "#0f172a", whiteSpace: "nowrap" },
   posRowActions: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-end", flexShrink: 0 },
-  deleteRowBtn: { background: "transparent", border: "none", cursor: "pointer", fontSize: "12px" },
+  deleteRowBtn: { background: "transparent", border: "none", cursor: "pointer", fontSize: "14px" },
   posBillFooter: { borderTop: "2px solid #f1f5f9", padding: "16px", backgroundColor: "#fff", flexShrink: 0 },
   posTotalRow: { display: "flex", justifyContent: "space-between", fontSize: "16px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
   posTotalPrice: { color: "#fc8019" },
   posCheckoutBtn: { width: "100%", padding: "14px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "800", fontSize: "14px", cursor: "pointer", textAlign: "center" },
 
-  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "16px", height: "100%", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box", minWidth: 0 },
+  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "20px", height: "100%", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box", minWidth: 0 },
   posVerticalList: { display: "flex", flexDirection: "column", gap: "10px", paddingBottom: "40px" },
-  posListItem: { backgroundColor: "#ffffff", borderRadius: "12px", padding: "10px 14px", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" },
-  posListImg: { width: "48px", height: "48px", objectFit: "cover", borderRadius: "8px", flexShrink: 0 },
-  posListTitle: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  posListStock: { fontSize: "10px", color: "#64748b", margin: "0 0 2px 0" },
-  posListPrice: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
-  posListAddBtn: { padding: "6px 14px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "800", fontSize: "12px", cursor: "pointer", whiteSpace: "nowrap" },
-  posListQtyControl: { display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "2px 6px", width: "75px", flexShrink: 0 },
-  posListQtyBtn: { border: "none", background: "transparent", fontWeight: "800", color: "#fc8019", cursor: "pointer", fontSize: "13px" },
+  posListItem: { backgroundColor: "#ffffff", borderRadius: "12px", padding: "12px 16px", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" },
+  posListImg: { width: "50px", height: "50px", objectFit: "cover", borderRadius: "8px", flexShrink: 0 },
+  posListTitle: { fontSize: "14px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  posListStock: { fontSize: "11px", color: "#64748b", margin: "0 0 2px 0" },
+  posListPrice: { fontSize: "15px", fontWeight: "800", color: "#0f172a" },
+  posListAddBtn: { padding: "8px 18px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "8px", fontWeight: "800", fontSize: "12px", cursor: "pointer", whiteSpace: "nowrap" },
+  posListQtyControl: { display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "8px", padding: "4px 8px", width: "80px", flexShrink: 0 },
+  posListQtyBtn: { border: "none", background: "transparent", fontWeight: "800", color: "#fc8019", cursor: "pointer", fontSize: "14px" },
   posListQtyVal: { fontSize: "13px", fontWeight: "800", color: "#1e293b" },
 
-  sectionTitle: { fontSize: "17px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
-  categoryScroll: { display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "8px", marginBottom: "16px", flexShrink: "0" },
-  categoryCard: { padding: "6px 14px", borderRadius: "18px", cursor: "pointer", fontWeight: "700", fontSize: "12px", whiteSpace: "nowrap", border: "1px solid #e2e8f0", flexShrink: 0 },
-  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "14px" },
+  sectionTitle: { fontSize: "18px", fontWeight: "800", color: "#0f172a", marginBottom: "14px" },
+  categoryScroll: { display: "flex", gap: "10px", overflowX: "auto", paddingBottom: "10px", marginBottom: "16px", flexShrink: 0 },
+  categoryCard: { padding: "8px 16px", borderRadius: "20px", cursor: "pointer", fontWeight: "700", fontSize: "13px", whiteSpace: "nowrap", border: "1px solid #e2e8f0", flexShrink: 0 },
+  productGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: "16px" },
   productCard: { backgroundColor: "#ffffff", borderRadius: "14px", overflow: "hidden", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #f1f5f9", display: "flex", flexDirection: "column" },
-  imageWrapper: { position: "relative", height: "130px", width: "100%" },
+  imageWrapper: { position: "relative", height: "140px", width: "100%" },
   productImg: { width: "100%", height: "100%", objectFit: "cover" },
-  stockBadge: { position: "absolute", bottom: "6px", left: "6px", backgroundColor: "rgba(0, 0, 0, 0.75)", color: "#fff", padding: "2px 6px", borderRadius: "4px", fontSize: "10px", fontWeight: "700" },
-  productDetails: { padding: "10px", display: "flex", flexDirection: "column", gap: "4px", flex: 1, justifyContent: "space-between" },
-  productName: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  productCategory: { fontSize: "10px", color: "#64748b", margin: 0 },
-  addBillBtn: { width: "100%", padding: "6px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  stockBadge: { position: "absolute", bottom: "8px", left: "8px", backgroundColor: "rgba(0, 0, 0, 0.75)", color: "#fff", padding: "3px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: "700" },
+  productDetails: { padding: "12px", display: "flex", flexDirection: "column", gap: "6px", flex: 1, justifyContent: "space-between" },
+  productName: { fontSize: "14px", fontWeight: "700", color: "#1e293b", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  productCategory: { fontSize: "12px", color: "#64748b", margin: 0, fontWeight: "600" },
+  addBillBtn: { width: "100%", padding: "8px", backgroundColor: "#fff7ed", color: "#fc8019", border: "1px solid #fed7aa", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "12px", textAlign: "center" },
   
   floatingBar: { position: "fixed", bottom: "20px", left: "50%", transform: "translateX(-50%)", backgroundColor: "#fc8019", color: "#fff", padding: "12px 24px", borderRadius: "30px", display: "flex", justifyContent: "space-between", alignItems: "center", width: "90%", maxWidth: "500px", boxShadow: "0 10px 25px rgba(252, 128, 25, 0.4)", cursor: "pointer", zIndex: 999, boxSizing: "border-box" },
-  editCardBtn: { flex: 1, padding: "6px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center", whiteSpace: "nowrap" },
-  deleteCardBtn: { flex: 1, padding: "6px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center", whiteSpace: "nowrap" },
-  cartControls: { display: "flex", alignItems: "center", gap: "4px", backgroundColor: "#f1f5f9", padding: "2px 4px", borderRadius: "6px" },
-  qtyBtn: { border: "none", background: "transparent", fontWeight: "800", cursor: "pointer", color: "#fc8019", fontSize: "11px" },
-  qtyText: { fontSize: "11px", fontWeight: "700", color: "#1e293b" },
+  editCardBtn: { flex: 1, padding: "6px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  deleteCardBtn: { flex: 1, padding: "6px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "11px", textAlign: "center" },
   printBillBtn: { padding: "6px 12px", backgroundColor: "#f1f5f9", color: "#1e293b", border: "1.5px solid #cbd5e1", borderRadius: "6px", fontWeight: "700", cursor: "pointer", fontSize: "12px", whiteSpace: "nowrap" },
   centerBox: { gridColumn: "1 / -1", textAlign: "center", padding: "40px", color: "#64748b", fontWeight: "600", fontSize: "14px" },
   addNewBtn: { padding: "8px 16px", backgroundColor: "#fc8019", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px", whiteSpace: "nowrap" },
-  
-  profileRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", backgroundColor: "#f8fafc", borderRadius: "10px", border: "1px solid #e2e8f0", gap: "10px", flexWrap: "wrap" },
-  profileLabel: { fontSize: "13px", fontWeight: "700", color: "#64748b" },
-  profileValue: { fontSize: "14px", fontWeight: "800", color: "#0f172a" },
-  profileEditInput: { padding: "8px 12px", borderRadius: "8px", border: "1.5px solid #cbd5e1", fontSize: "14px", fontWeight: "700", color: "#1e293b", outline: "none", width: "240px", boxSizing: "border-box", backgroundColor: "#f8fafc" },
 
   paymentCardsGrid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px", marginTop: "4px" },
   paymentCardOption: { padding: "10px", borderRadius: "10px", border: "2px solid #cbd5e1", display: "flex", flexDirection: "column", alignItems: "center", gap: "4px", cursor: "pointer", transition: "all 0.2s" },
@@ -972,7 +1075,7 @@ navbar: {
   qrContainer: { display: "flex", flexDirection: "column", alignItems: "center", backgroundColor: "#f8fafc", padding: "12px", borderRadius: "10px", border: "1px dashed #cbd5e1", margin: "10px 0", gap: "8px" },
   qrBox: { backgroundColor: "#fff", padding: "8px", borderRadius: "8px", boxShadow: "0 2px 8px rgba(0,0,0,0.05)" },
 
-  modalOverlay: { position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000, padding: "16px", boxSizing: "border-box" },
+  modalOverlay: { position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 10000, padding: "16px", boxSizing: "border-box" },
   modalBox: { backgroundColor: "#fff", padding: "24px", borderRadius: "16px", width: "100%", maxWidth: "420px", boxShadow: "0 20px 25px rgba(0,0,0,0.2)", boxSizing: "border-box", maxHeight: "90vh", overflowY: "auto" },
   modalForm: { display: "flex", flexDirection: "column", gap: "12px", marginTop: "12px" },
   inputGroup: { display: "flex", flexDirection: "column", gap: "4px" },
