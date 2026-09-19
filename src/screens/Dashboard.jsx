@@ -142,9 +142,9 @@ export default function Dashboard() {
       setLoading(false);
     });
 
-    // 2. Orders History Sync
-    const ordersRef = collection(db, "users", currentUid, "local_orders");
-    const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
+    // 2. Orders History Sync (Sales Collection)
+    const salesRef = collection(db, "users", currentUid, "sales");
+    const unsubscribeOrders = onSnapshot(salesRef, (snapshot) => {
       const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       orders.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
       setOrdersList(orders);
@@ -189,7 +189,7 @@ export default function Dashboard() {
       await setDoc(activeCartRef, {
         items: updatedItems,
         updatedAt: serverTimestamp()
-      });
+      }, { merge: true });
     } catch (e) {
       console.error("Cloud cart push error:", e);
     }
@@ -257,27 +257,56 @@ export default function Dashboard() {
     try {
       const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
       const totalAmt = currentBill.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
+      const totalProfit = currentBill.reduce((sum, i) => sum + (Number(i.salesPrice || i.price || 0) - Number(i.purchasePrice || 0)) * i.qty, 0);
+
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const day = String(now.getDate()).padStart(2, "0");
+      const datePrefix = `${year}${month}${day}`;
+      const sequenceNum = String(ordersList.length + 1).padStart(4, "0");
+      const bNo = `${datePrefix}-${sequenceNum}`;
+      const bDate = now.toLocaleDateString("en-GB");
       
-      const orderData = {
+      const saleRecord = {
+        billNo: bNo,
+        invoiceId: bNo,
+        billDate: bDate,
         items: currentBill,
+        total: totalAmt,
         totalAmount: totalAmt,
+        profit: totalProfit,
         customerName: customerName.trim() || "Walk-in Customer",
         customerPhone: customerPhone.trim() || "N/A",
+        paymentMode: paymentMethod.toUpperCase(),
         paymentMethod: paymentMethod,
-        createdAt: serverTimestamp(),
-        status: "Completed"
+        isGlobalMode: false,
+        createdAt: serverTimestamp()
       };
 
       if (currentUid) {
-        const ordersRef = collection(db, "users", currentUid, "local_orders");
-        await addDoc(ordersRef, orderData);
+        // 1. Direct save in "sales" collection (No online order notification)
+        await addDoc(collection(db, "users", currentUid, "sales"), saleRecord);
+
+        // 2. Transmit confirmation event to Mobile App
+        const cartRef = doc(db, "users", currentUid, "active_cart", "current");
+        await setDoc(cartRef, {
+          items: [],
+          updatedAt: serverTimestamp(),
+          lastConfirmedSale: {
+            billNo: bNo,
+            billDate: bDate,
+            items: currentBill,
+            total: totalAmt,
+            timestamp: Date.now()
+          }
+        });
       }
 
       setIsCheckoutModalOpen(false);
       setCustomerName("");
       setCustomerPhone("");
       setCurrentBill([]);
-      await syncWebCartToCloud([]);
       setPopupModal({ show: true, message: "Payment Successful & Order Recorded! 🎉" });
     } catch (err) {
       console.error("Checkout error:", err);
@@ -313,7 +342,7 @@ export default function Dashboard() {
           <p>Store Billing Receipt</p>
           <p style="font-size: 11px; color: #555;">Admin / Billed By: ${userProfile.name || "Store Owner"}</p>
           <p style="font-size: 11px; color: #555;">Customer: ${order.customerName || "Walk-in"}</p>
-          <p style="font-size: 11px; color: #555;">Payment: ${order.paymentMethod || "Cash"}</p>
+          <p style="font-size: 11px; color: #555;">Payment: ${order.paymentMethod || order.paymentMode || "Cash"}</p>
           <p style="font-size: 11px; color: #555;">Date: ${orderDate}</p>
           <hr style="border: 0; border-top: 1px dashed #000;" />
           <table>
@@ -330,7 +359,7 @@ export default function Dashboard() {
           </table>
           <div class="total">
             <span>TOTAL:</span>
-            <span>₹${order.totalAmount || 0}</span>
+            <span>₹${order.totalAmount || order.total || 0}</span>
           </div>
           <p style="margin-top: 20px; font-size: 11px; text-align: center;">*** Thank You Come Again ***</p>
         </body>
@@ -560,9 +589,17 @@ export default function Dashboard() {
                       <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name || item.itemName} style={styles.posRowImg} />
                       <div style={{ flex: 1, marginLeft: "10px", minWidth: 0 }}>
                         <h5 style={styles.posRowTitle}>{item.name || item.itemName}</h5>
-                        <p style={styles.posRowSub}>Quantity: {item.qty}</p>
+                        <p style={styles.posRowSub}>₹{item.salesPrice || item.price || 0}</p>
                       </div>
-                      <div style={{ textAlign: "right", marginRight: "10px" }}>
+
+                      {/* Pill Shaped - 1 + Control UI matching exact reference */}
+                      <div style={styles.cartQtyPill}>
+                        <button onClick={() => removeFromCurrentBill(item.id || item.barcode)} style={styles.cartQtyBtn}>-</button>
+                        <span style={styles.cartQtyNum}>{item.qty}</span>
+                        <button onClick={() => addToCurrentBill(item)} style={styles.cartQtyBtn}>+</button>
+                      </div>
+
+                      <div style={{ textAlign: "right", marginLeft: "10px" }}>
                         <span style={styles.posRowPrice}>₹{(item.salesPrice || item.price || 0) * item.qty}</span>
                       </div>
                       <div style={styles.posRowActions}>
@@ -775,8 +812,8 @@ export default function Dashboard() {
                   <div key={order.id || idx} onClick={() => setSelectedOrderDetails(order)} style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", flexWrap: "wrap", gap: "10px" }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <h4 style={{ margin: "0 0 6px 0", fontSize: "16px" }}>Order ID: #{order.id.slice(-6).toUpperCase()}</h4>
-                      <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>Customer: {order.customerName || "Walk-in"} | Payment: {order.paymentMethod || "Cash"}</p>
-                      <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount}</strong></p>
+                      <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>Customer: {order.customerName || "Walk-in"} | Payment: {order.paymentMethod || order.paymentMode || "Cash"}</p>
+                      <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount || order.total}</strong></p>
                     </div>
                     <button onClick={(e) => { e.stopPropagation(); handlePrintBill(order); }} style={styles.printBillBtn}>🖨️ Print Bill</button>
                   </div>
@@ -903,7 +940,7 @@ export default function Dashboard() {
           <div style={{ ...styles.modalBox, maxWidth: "450px" }} onClick={e => e.stopPropagation()}>
             <h3 style={{ margin: 0, color: "#1e3a8a", textAlign: "center" }}>{userProfile.storeName} RECEIPT</h3>
             <p style={{ textAlign: "center", fontSize: "12px", color: "#64748b", margin: "4px 0 12px 0" }}>
-              Customer: {selectedOrderDetails.customerName || "Walk-in"} | Paid via: {selectedOrderDetails.paymentMethod || "Cash"}
+              Customer: {selectedOrderDetails.customerName || "Walk-in"} | Paid via: {selectedOrderDetails.paymentMethod || selectedOrderDetails.paymentMode || "Cash"}
             </p>
             <div style={{ maxHeight: "220px", overflowY: "auto", margin: "10px 0", borderTop: "1px solid #eee", borderBottom: "1px solid #eee", padding: "10px 0" }}>
               {(selectedOrderDetails.items || []).map((item, i) => (
@@ -915,7 +952,7 @@ export default function Dashboard() {
             </div>
             <div style={{ paddingTop: "6px", display: "flex", justifyContent: "space-between", fontWeight: "800", fontSize: "16px" }}>
               <span>Total:</span>
-              <span style={{ color: "#fc8019" }}>₹{selectedOrderDetails.totalAmount}</span>
+              <span style={{ color: "#fc8019" }}>₹{selectedOrderDetails.totalAmount || selectedOrderDetails.total}</span>
             </div>
             <div style={{ display: "flex", gap: "8px", marginTop: "16px" }}>
               <button onClick={() => handlePrintBill(selectedOrderDetails)} style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}>Print Receipt</button>
@@ -1020,7 +1057,7 @@ const styles = {
 
   mainContent: { flex: 1, display: "flex", flexDirection: "column" },
   posLayout: { display: "flex", flexDirection: "row", flex: 1, height: "calc(100vh - 61px)", boxSizing: "border-box", overflow: "hidden" },  
-  posLeftPane: { width: "350px", minWidth: "330px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },
+  posLeftPane: { width: "380px", minWidth: "350px", backgroundColor: "#ffffff", borderRight: "1px solid #e2e8f0", display: "flex", flexDirection: "column", boxSizing: "border-box", height: "100%", flexShrink: 0 },
   posHeaderTop: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", borderBottom: "1px solid #f1f5f9" },
   clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "12px", cursor: "pointer" },
   posBillItemsList: { flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: "10px" },
@@ -1028,10 +1065,44 @@ const styles = {
   posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "10px", borderRadius: "10px", border: "1px solid #f1f5f9" },
   posRowImg: { width: "42px", height: "42px", objectFit: "cover", borderRadius: "6px", flexShrink: 0 },
   posRowTitle: { fontSize: "13px", fontWeight: "700", color: "#1e293b", margin: "0 0 2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  posRowSub: { fontSize: "11px", color: "#64748b", margin: 0 },
+  posRowSub: { fontSize: "11px", color: "#64748b", margin: 0, fontWeight: "600" },
   posRowPrice: { fontSize: "14px", fontWeight: "800", color: "#0f172a", whiteSpace: "nowrap" },
-  posRowActions: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-end", flexShrink: 0 },
+  posRowActions: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-end", flexShrink: 0, marginLeft: "8px" },
   deleteRowBtn: { background: "transparent", border: "none", cursor: "pointer", fontSize: "14px" },
+  
+  // Custom Orange Border Pill for Quantity control in Web Cart
+  cartQtyPill: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#fff7ed",
+    border: "1.5px solid #fed7aa",
+    borderRadius: "18px",
+    padding: "2px 8px",
+    width: "72px",
+    height: "28px",
+    flexShrink: 0,
+    boxSizing: "border-box"
+  },
+  cartQtyBtn: {
+    background: "transparent",
+    border: "none",
+    color: "#ea580c",
+    fontSize: "15px",
+    fontWeight: "800",
+    cursor: "pointer",
+    padding: "0 2px",
+    lineHeight: "1",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  cartQtyNum: {
+    fontSize: "13px",
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+
   posBillFooter: { borderTop: "2px solid #f1f5f9", padding: "16px", backgroundColor: "#fff", flexShrink: 0 },
   posTotalRow: { display: "flex", justifyContent: "space-between", fontSize: "16px", fontWeight: "800", color: "#0f172a", marginBottom: "12px" },
   posTotalPrice: { color: "#fc8019" },
