@@ -1,12 +1,14 @@
 // src/screens/Login.jsx
 import React, { useState } from "react";
 import { signInWithEmailAndPassword } from "firebase/auth";
-import { auth } from "../utils/firebase";
+import { doc, getDoc } from "firebase/firestore";
+import { auth, db } from "../utils/firebase";
 import { Link } from "react-router-dom";
 
 export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -20,6 +22,25 @@ export default function Login() {
       const uid = userCredential.user.uid;
 
       localStorage.setItem("uid", uid);
+
+      // Pre-fetch user document to cache shop_type and storeName for seamless dashboard loading
+      try {
+        const userDocRef = doc(db, "users", uid);
+        const userSnap = await getDoc(userDocRef);
+        if (userSnap.exists()) {
+          const data = userSnap.data();
+          const sType = (data.shopType || data.shop_type || data.businessType || "").trim();
+          const sName = data.storeName || data.shopName || data.shop_name || "Kadai Pro Store";
+          if (sType) {
+            localStorage.setItem("shop_type", sType);
+          }
+          if (sName) {
+            localStorage.setItem("store_name", sName);
+          }
+        }
+      } catch (cacheErr) {
+        console.warn("User profile pre-cache skipped:", cacheErr);
+      }
       
       // Force reload and redirect to dashboard
       window.location.href = "/dashboard";
@@ -27,10 +48,20 @@ export default function Login() {
       console.log("Firebase Login Error Code:", err.code);
       console.log("Firebase Login Error Message:", err.message);
       
-      if (err.code === "auth/invalid-credential" || err.code === "auth/wrong-password" || err.code === "auth/user-not-found" || err.code === "auth/invalid-email") {
+      if (
+        err.code === "auth/invalid-credential" || 
+        err.code === "auth/wrong-password" || 
+        err.code === "auth/user-not-found"
+      ) {
         setError("Incorrect email or password ❌");
+      } else if (err.code === "auth/invalid-email") {
+        setError("Please enter a valid email address ⚠️");
+      } else if (err.code === "auth/too-many-requests") {
+        setError("Too many failed attempts. Please try again later ⏳");
+      } else if (err.code === "auth/network-request-failed") {
+        setError("Network error. Please check your internet connection 🌐");
       } else {
-        setError(err.message);
+        setError(err.message || "Failed to sign in. Please try again.");
       }
     } finally {
       setLoading(false);
@@ -43,7 +74,7 @@ export default function Login() {
         <div style={styles.headerContainer}>
           <div style={styles.iconCircle}>🏪</div>
           <h2 style={styles.title}>Kadai Pro Web</h2>
-          <p style={styles.subtitle}>Sign in to manage your shop & inventory</p>
+          <p style={styles.subtitle}>Sign in to manage your shop, restaurant & inventory</p>
         </div>
 
         <form onSubmit={handleLogin} style={styles.form}>
@@ -55,23 +86,48 @@ export default function Login() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               style={styles.input}
+              disabled={loading}
               required
             />
           </div>
 
           <div style={styles.inputGroup}>
             <label style={styles.label}>Password</label>
-            <input
-              type="password"
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              style={styles.input}
-              required
-            />
+            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <input
+                type={showPassword ? "text" : "password"}
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={{ ...styles.input, paddingRight: "42px" }}
+                disabled={loading}
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                style={{
+                  position: "absolute",
+                  right: "12px",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  fontSize: "16px",
+                  color: "#64748b",
+                  padding: "4px"
+                }}
+                tabIndex={-1}
+              >
+                {showPassword ? "👁️" : "👁️‍🗨️"}
+              </button>
+            </div>
           </div>
 
-          <button type="submit" style={styles.button} disabled={loading}>
+          <button 
+            type="submit" 
+            style={{ ...styles.button, opacity: loading ? 0.7 : 1, cursor: loading ? "not-allowed" : "pointer" }} 
+            disabled={loading}
+          >
             {loading ? "Signing in..." : "Login to Dashboard"}
           </button>
 

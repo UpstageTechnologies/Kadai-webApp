@@ -15,6 +15,10 @@ export default function Dashboard() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("All");
   
+  // Restaurant Mode Detection
+  const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
+  const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
+
   const [currentBill, setCurrentBill] = useState([]);
   const [ordersList, setOrdersList] = useState([]);
 
@@ -111,11 +115,17 @@ export default function Dashboard() {
         const userSnap = await getDoc(userDocRef);
         if (userSnap.exists()) {
           const data = userSnap.data();
+          const sType = (data.shopType || data.shop_type || data.businessType || "").trim();
+          if (sType) {
+            setShopType(sType);
+            localStorage.setItem("shop_type", sType);
+          }
+          const isRest = sType.toLowerCase() === "restaurant";
           setUserProfile({
-            name: data.name || auth.currentUser?.displayName || "Store Owner",
+            name: data.name || auth.currentUser?.displayName || (isRest ? "Restaurant Manager" : "Store Owner"),
             email: data.email || auth.currentUser?.email || "",
             phone: data.phone || "",
-            storeName: data.storeName || data.shopName || "Kadai Pro Store",
+            storeName: data.storeName || data.shopName || data.shop_name || (isRest ? "Restaurant POS" : "Kadai Pro Store"),
             profileImage: data.profileImage || ""
           });
           if (data.settings) {
@@ -128,17 +138,41 @@ export default function Dashboard() {
     };
     fetchUserData();
 
-    // 1. Inventory Sync
-    const inventoryRef = collection(db, "users", currentUid, "inventory");
+    // 1. Items Sync (Listens to restaurant_menu for Restaurant, inventory for retail)
+    const collectionName = isRestaurant ? "restaurant_menu" : "inventory";
+    const inventoryRef = collection(db, "users", currentUid, collectionName);
     const unsubscribeInventory = onSnapshot(inventoryRef, (snapshot) => {
-      const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const items = snapshot.docs.map(docSnap => {
+        const data = docSnap.data();
+        const itemName = data.name || data.itemName || "Unnamed Item";
+        const price = Number(data.price ?? data.salesPrice ?? 0);
+        const image = data.imageUrl || data.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+        const isAvailable = data.isAvailable !== false;
+        const quantity = data.quantity !== undefined ? data.quantity : (isAvailable ? "In Stock" : "Out of Stock");
+
+        return {
+          id: docSnap.id,
+          ...data,
+          name: itemName,
+          itemName: itemName,
+          price: price,
+          salesPrice: price,
+          image: image,
+          imageUrl: image,
+          category: data.category || (isRestaurant ? "Main Course" : "General"),
+          quantity: quantity,
+          isAvailable: isAvailable,
+          brand: data.brand || ""
+        };
+      });
       setProducts(items);
 
-      const uniqueCats = ["All", ...new Set(items.map(item => item.category || "General").filter(Boolean))];
+      const defaultCategory = isRestaurant ? "Main Course" : "General";
+      const uniqueCats = ["All", ...new Set(items.map(item => item.category || defaultCategory).filter(Boolean))];
       setCategories(uniqueCats);
       setLoading(false);
     }, (error) => {
-      console.error("Error fetching inventory:", error);
+      console.error(`Error fetching ${collectionName}:`, error);
       setLoading(false);
     });
 
@@ -173,11 +207,17 @@ export default function Dashboard() {
       unsubscribeOrders();
       unsubscribeActiveCart();
     };
-  }, []);
+  }, [isRestaurant]);
 
   const handleLogout = async () => {
-    await signOut(auth);
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error("Sign out error:", e);
+    }
     localStorage.removeItem("uid");
+    localStorage.removeItem("shop_type");
+    localStorage.removeItem("store_name");
     window.location.href = "/login";
   };
 
@@ -196,14 +236,15 @@ export default function Dashboard() {
   };
 
   const addToCurrentBill = async (product) => {
-    const pId = product.id || product.barcode;
-    const pName = product.itemName || product.name;
-    const pPrice = Number(product.salesPrice || product.price || 0);
+    const pId = product.id || product.barcode || String(Date.now());
+    const pName = product.itemName || product.name || "Item";
+    const pPrice = Number(product.salesPrice ?? product.price ?? 0);
+    const pImg = product.image || product.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
 
     let updated;
-    const exist = currentBill.find(item => (item.id && item.id === pId) || (item.barcode && item.barcode === product.barcode));
+    const exist = currentBill.find(item => (item.id && item.id === pId) || (item.barcode && product.barcode && item.barcode === product.barcode));
     if (exist) {
-      updated = currentBill.map(item => ((item.id && item.id === pId) || (item.barcode && item.barcode === product.barcode)) ? { ...item, qty: item.qty + 1 } : item);
+      updated = currentBill.map(item => ((item.id && item.id === pId) || (item.barcode && product.barcode && item.barcode === product.barcode)) ? { ...item, qty: item.qty + 1 } : item);
     } else {
       updated = [
         ...currentBill, 
@@ -215,6 +256,8 @@ export default function Dashboard() {
           itemName: pName,
           price: pPrice, 
           salesPrice: pPrice,
+          image: pImg,
+          imageUrl: pImg,
           purchasePrice: Number(product.purchasePrice || 0),
           taxPercent: product.taxPercent || 0,
           qty: 1 
@@ -276,11 +319,13 @@ export default function Dashboard() {
         total: totalAmt,
         totalAmount: totalAmt,
         profit: totalProfit,
-        customerName: customerName.trim() || "Walk-in Customer",
+        customerName: customerName.trim() || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
         customerPhone: customerPhone.trim() || "N/A",
         paymentMode: paymentMethod.toUpperCase(),
         paymentMethod: paymentMethod,
         isGlobalMode: false,
+        isRestaurant: isRestaurant,
+        shopType: isRestaurant ? "restaurant" : "retail",
         createdAt: serverTimestamp()
       };
 
@@ -386,9 +431,9 @@ export default function Dashboard() {
     setIsEditing(false);
     setEditId(null);
     setName("");
-    setCategory("General");
+    setCategory(isRestaurant ? "Main Course" : "General");
     setPrice("");
-    setQty("");
+    setQty(isRestaurant ? "100" : "");
     setBrand("");
     setImage("");
     setIsModalOpen(true);
@@ -398,11 +443,11 @@ export default function Dashboard() {
     setIsEditing(true);
     setEditId(item.id);
     setName(item.itemName || item.name || "");
-    setCategory(item.category || "General");
-    setPrice(String(item.salesPrice || item.price || ""));
-    setQty(String(item.quantity || "0"));
+    setCategory(item.category || (isRestaurant ? "Main Course" : "General"));
+    setPrice(String(item.salesPrice ?? item.price ?? ""));
+    setQty(String(item.quantity ?? "0"));
     setBrand(item.brand || "");
-    setImage(item.image || "");
+    setImage(item.image || item.imageUrl || "");
     setIsModalOpen(true);
   };
 
@@ -412,40 +457,44 @@ export default function Dashboard() {
       const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
       if (!currentUid) return;
 
+      const targetCol = isRestaurant ? "restaurant_menu" : "inventory";
       const productData = {
         name: name.trim(),
         itemName: name.trim(),
-        category: category.trim(),
+        category: category.trim() || (isRestaurant ? "Main Course" : "General"),
         salesPrice: Number(price) || 0,
         price: Number(price) || 0,
-        quantity: Number(qty) || 0,
-        brand: brand.trim() || "Local",
+        quantity: isNaN(Number(qty)) ? 100 : Number(qty),
+        isAvailable: true,
+        brand: brand.trim() || (isRestaurant ? "" : "Local"),
         image: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         imageUrl: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         updatedAt: serverTimestamp()
       };
 
       if (isEditing && editId) {
-        await updateDoc(doc(db, "users", currentUid, "inventory", editId), productData);
-        setPopupModal({ show: true, message: "Product updated successfully! ✅" });
+        await updateDoc(doc(db, "users", currentUid, targetCol, editId), productData);
+        setPopupModal({ show: true, message: isRestaurant ? "Food item updated successfully! ✅" : "Product updated successfully! ✅" });
       } else {
-        await addDoc(collection(db, "users", currentUid, "inventory"), { ...productData, createdAt: serverTimestamp() });
-        setPopupModal({ show: true, message: "Product added successfully! 🚀" });
+        await addDoc(collection(db, "users", currentUid, targetCol), { ...productData, createdAt: serverTimestamp() });
+        setPopupModal({ show: true, message: isRestaurant ? "Food item added successfully! 🚀" : "Product added successfully! 🚀" });
       }
 
       setIsModalOpen(false);
     } catch (err) {
-      alert("Error saving product: " + err.message);
+      alert("Error saving item: " + err.message);
     }
   };
 
   const handleDeleteProduct = async (id) => {
-    if (window.confirm("Are you sure you want to delete this product?")) {
+    const itemLabel = isRestaurant ? "food item" : "product";
+    if (window.confirm(`Are you sure you want to delete this ${itemLabel}?`)) {
       try {
         const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
         if (!currentUid) return;
-        await deleteDoc(doc(db, "users", currentUid, "inventory", id));
-        setPopupModal({ show: true, message: "Product deleted successfully 🗑️" });
+        const targetCol = isRestaurant ? "restaurant_menu" : "inventory";
+        await deleteDoc(doc(db, "users", currentUid, targetCol, id));
+        setPopupModal({ show: true, message: isRestaurant ? "Food item deleted successfully 🗑️" : "Product deleted successfully 🗑️" });
       } catch (err) {
         alert("Delete failed: " + err.message);
       }
@@ -469,7 +518,7 @@ export default function Dashboard() {
       <header style={styles.navbar}>
         <div style={styles.navLeftGroup}>
           <div style={styles.logoArea}>
-            <span style={{ fontSize: "22px" }}>🏪</span>
+            <span style={{ fontSize: "22px" }}>{isRestaurant ? "🍽️" : "🏪"}</span>
             <h2 style={styles.sidebarBrand}>{userProfile.storeName}</h2>
           </div>
 
@@ -477,7 +526,7 @@ export default function Dashboard() {
             <span style={styles.searchIcon}>🔍</span>
             <input 
               type="text"
-              placeholder="Search products..."
+              placeholder={isRestaurant ? "Search food or menu items..." : "Search products..."}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               style={styles.searchInput}
@@ -488,13 +537,13 @@ export default function Dashboard() {
         {/* Navigation Links Right Area */}
         <div style={styles.navLinks}>
           <button onClick={() => setActiveTab("sales")} style={{ ...styles.navBtn, backgroundColor: activeTab === "sales" ? "#ffedd5" : "transparent", color: activeTab === "sales" ? "#fc8019" : "#64748b" }}>
-            🧾 Sales
+            🧾 {isRestaurant ? "Billing" : "Sales"}
           </button>
           <button onClick={() => setActiveTab("dashboard")} style={{ ...styles.navBtn, backgroundColor: activeTab === "dashboard" ? "#ffedd5" : "transparent", color: activeTab === "dashboard" ? "#fc8019" : "#64748b" }}>
             🏠 Dashboard
           </button>
           <button onClick={() => setActiveTab("inventory")} style={{ ...styles.navBtn, backgroundColor: activeTab === "inventory" ? "#ffedd5" : "transparent", color: activeTab === "inventory" ? "#fc8019" : "#64748b" }}>
-            📦 Inventory
+            📦 {isRestaurant ? "Menu" : "Inventory"}
           </button>
           <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
             📋 Orders ({ordersList.length})
@@ -573,20 +622,25 @@ export default function Dashboard() {
             {/* LEFT SIDE: Current Bill / Cart Summary */}
             <div style={styles.posLeftPane}>
               <div style={styles.posHeaderTop}>
-                <h3 style={{ margin: 0, fontSize: "16px", color: "#0f172a" }}>{totalBillItemsCount} Items</h3>
+                <h3 style={{ margin: 0, fontSize: "16px", color: "#0f172a" }}>{totalBillItemsCount} {isRestaurant ? "Food Items" : "Items"}</h3>
                 <button onClick={clearCurrentBill} style={styles.clearCartBtn}>CLEAR CART ✕</button>
               </div>
 
               <div style={styles.posBillItemsList}>
                 {currentBill.length === 0 ? (
                   <div style={styles.posEmptyBox}>
-                    <p style={{ color: "#94a3b8", fontSize: "14px" }}>No items in current bill</p>
-                    <span style={{ fontSize: "28px" }}>🧾</span>
+                    <p style={{ color: "#94a3b8", fontSize: "14px" }}>{isRestaurant ? "No food items in current order" : "No items in current bill"}</p>
+                    <span style={{ fontSize: "28px" }}>{isRestaurant ? "🍽️" : "🧾"}</span>
                   </div>
                 ) : (
                   currentBill.map((item, idx) => (
                     <div key={item.id || item.barcode || idx} style={styles.posBillRow}>
-                      <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name || item.itemName} style={styles.posRowImg} />
+                      <img 
+                        src={item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} 
+                        alt={item.name || item.itemName} 
+                        style={styles.posRowImg}
+                        onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                      />
                       <div style={{ flex: 1, marginLeft: "10px", minWidth: 0 }}>
                         <h5 style={styles.posRowTitle}>{item.name || item.itemName}</h5>
                         <p style={styles.posRowSub}>₹{item.salesPrice || item.price || 0}</p>
@@ -645,26 +699,33 @@ export default function Dashboard() {
               </div>
 
               {loading ? (
-                <div style={styles.centerBox}>Loading products...</div>
+                <div style={styles.centerBox}>{isRestaurant ? "Loading menu items..." : "Loading products..."}</div>
               ) : filteredProducts.length === 0 ? (
-                <div style={styles.centerBox}>No products found ❌</div>
+                <div style={styles.centerBox}>{isRestaurant ? "No food items found ❌" : "No products found ❌"}</div>
               ) : (
                 <div style={styles.posVerticalList}>
                   {filteredProducts.map((item) => {
                     const itemName = item.itemName || item.name || "Unnamed Item";
                     const priceVal = item.salesPrice || item.price || 0;
-                    const stock = item.quantity || 0;
-                    const imageVal = item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+                    const stock = item.quantity !== undefined ? item.quantity : (item.isAvailable !== false ? "In Stock" : "Out of Stock");
+                    const imageVal = item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
                     
                     const existingBillItem = currentBill.find(b => (b.id && b.id === item.id) || (b.barcode && b.barcode === item.barcode));
                     const itemQtyInBill = existingBillItem ? existingBillItem.qty : 0;
 
                     return (
                       <div key={item.id} style={styles.posListItem}>
-                        <img src={imageVal} alt={itemName} style={styles.posListImg} />
+                        <img 
+                          src={imageVal} 
+                          alt={itemName} 
+                          style={styles.posListImg} 
+                          onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                        />
                         <div style={{ flex: 1, marginLeft: "14px", minWidth: 0 }}>
                           <h4 style={styles.posListTitle}>{itemName}</h4>
-                          <p style={styles.posListStock}>Stock: {stock}</p>
+                          <p style={styles.posListStock}>
+                            {typeof stock === "number" ? `Stock: ${stock}` : stock}
+                          </p>
                           <span style={styles.posListPrice}>₹{priceVal}</span>
                         </div>
                         <div style={{ minWidth: "100px", textAlign: "right" }}>
@@ -712,7 +773,7 @@ export default function Dashboard() {
         {/* TAB 2: DASHBOARD */}
         {activeTab === "dashboard" && (
           <div style={{ padding: "24px", paddingBottom: "80px", maxWidth: "1400px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-            <h2 style={styles.sectionTitle}>Shop Categories</h2>
+            <h2 style={styles.sectionTitle}>{isRestaurant ? "Food Categories" : "Shop Categories"}</h2>
             <div style={styles.categoryScroll}>
               {categories.map((cat, idx) => (
                 <div 
@@ -729,25 +790,30 @@ export default function Dashboard() {
               ))}
             </div>
 
-            <h2 style={styles.sectionTitle}>Available Products ({filteredProducts.length})</h2>
+            <h2 style={styles.sectionTitle}>{isRestaurant ? `Available Foods (${filteredProducts.length})` : `Available Products (${filteredProducts.length})`}</h2>
 
             <div style={styles.productGrid}>
               {filteredProducts.map((item) => {
                 const itemName = item.itemName || item.name || "Unnamed Item";
                 const priceVal = item.salesPrice || item.price || 0;
-                const stock = item.quantity || 0;
-                const imageVal = item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+                const stock = item.quantity !== undefined ? item.quantity : (item.isAvailable !== false ? "In Stock" : "Out of Stock");
+                const imageVal = item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
                 
                 return (
                   <div key={item.id} style={styles.productCard}>
                     <div style={styles.imageWrapper}>
-                      <img src={imageVal} alt={itemName} style={styles.productImg} />
-                      <span style={styles.stockBadge}>Stock: {stock}</span>
+                      <img 
+                        src={imageVal} 
+                        alt={itemName} 
+                        style={styles.productImg} 
+                        onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                      />
+                      <span style={styles.stockBadge}>{typeof stock === "number" ? `Stock: ${stock}` : stock}</span>
                     </div>
                     <div style={styles.productDetails}>
                       <h4 style={styles.productName}>{itemName}</h4>
                       <p style={styles.productCategory}>₹{priceVal}</p>
-                      <button onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} style={styles.addBillBtn}>+ Add to POS Bill</button>
+                      <button onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} style={styles.addBillBtn}>{isRestaurant ? "+ Add to Order" : "+ Add to POS Bill"}</button>
                     </div>
                   </div>
                 );
@@ -776,15 +842,26 @@ export default function Dashboard() {
         {activeTab === "inventory" && (
           <div style={{ padding: "30px", maxWidth: "1400px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", flexWrap: "wrap", gap: "10px" }}>
-              <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>📦 Store Inventory Management</h2>
-              <button onClick={openAddModal} style={styles.addNewBtn}>+ Add New Product</button>
+              <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
+                {isRestaurant ? "🍽️ Restaurant Menu Management" : "📦 Store Inventory Management"}
+              </h2>
+              <button onClick={openAddModal} style={styles.addNewBtn}>
+                {isRestaurant ? "+ Add New Food" : "+ Add New Product"}
+              </button>
             </div>
             <div style={styles.productGrid}>
               {products.map((item) => (
                 <div key={item.id} style={styles.productCard}>
                   <div style={styles.imageWrapper}>
-                    <img src={item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} alt={item.name} style={styles.productImg} />
-                    <span style={styles.stockBadge}>Stock: {item.quantity || 0}</span>
+                    <img 
+                      src={item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"} 
+                      alt={item.name || item.itemName} 
+                      style={styles.productImg} 
+                      onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                    />
+                    <span style={styles.stockBadge}>
+                      {typeof item.quantity === "number" ? `Stock: ${item.quantity}` : (item.isAvailable !== false ? "In Stock" : "Unavailable")}
+                    </span>
                   </div>
                   <div style={styles.productDetails}>
                     <h4 style={styles.productName}>{item.itemName || item.name}</h4>
@@ -803,7 +880,9 @@ export default function Dashboard() {
         {/* TAB 4: ORDERS */}
         {activeTab === "orders" && (
           <div style={{ padding: "30px", maxWidth: "1000px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-            <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>📋 Orders & Billing History</h2>
+            <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", marginBottom: "20px" }}>
+              {isRestaurant ? "📋 Restaurant Orders & Bills" : "📋 Orders & Billing History"}
+            </h2>
             {ordersList.length === 0 ? (
               <div style={styles.centerBox}>No orders recorded yet.</div>
             ) : (
@@ -993,19 +1072,53 @@ export default function Dashboard() {
       {isModalOpen && (
         <div style={styles.modalOverlay}>
           <div style={styles.modalBox}>
-            <h3>{isEditing ? "Edit Product" : "Add New Product"}</h3>
+            <h3>{isRestaurant ? (isEditing ? "Edit Food Item" : "Add New Food") : (isEditing ? "Edit Product" : "Add New Product")}</h3>
             <form onSubmit={handleSaveProduct} style={styles.modalForm}>
-              <input type="text" placeholder="Product Name" value={name} onChange={e => setName(e.target.value)} style={styles.modalInput} required />
-              <input type="text" placeholder="Category" value={category} onChange={e => setCategory(e.target.value)} style={styles.modalInput} required />
-              <input type="number" placeholder="Sales Price (₹)" value={price} onChange={e => setPrice(e.target.value)} style={styles.modalInput} required />
-              <input type="number" placeholder="Quantity / Stock" value={qty} onChange={e => setQty(e.target.value)} style={styles.modalInput} required />
-              <input type="text" placeholder="Brand Name" value={brand} onChange={e => setBrand(e.target.value)} style={styles.modalInput} />
+              <input 
+                type="text" 
+                placeholder={isRestaurant ? "Food Name (e.g. Chicken Biryani, Dosa)" : "Product Name"} 
+                value={name} 
+                onChange={e => setName(e.target.value)} 
+                style={styles.modalInput} 
+                required 
+              />
+              <input 
+                type="text" 
+                placeholder={isRestaurant ? "Category (e.g. Starters, Main Course, Beverages)" : "Category"} 
+                value={category} 
+                onChange={e => setCategory(e.target.value)} 
+                style={styles.modalInput} 
+                required 
+              />
+              <input 
+                type="number" 
+                placeholder="Sales Price (₹)" 
+                value={price} 
+                onChange={e => setPrice(e.target.value)} 
+                style={styles.modalInput} 
+                required 
+              />
+              <input 
+                type="number" 
+                placeholder={isRestaurant ? "Available Stock / Portions (e.g. 100)" : "Quantity / Stock"} 
+                value={qty} 
+                onChange={e => setQty(e.target.value)} 
+                style={styles.modalInput} 
+                required 
+              />
+              <input 
+                type="text" 
+                placeholder={isRestaurant ? "Serving / Diet Notes (e.g. Spicy, Veg, Non-Veg)" : "Brand Name"} 
+                value={brand} 
+                onChange={e => setBrand(e.target.value)} 
+                style={styles.modalInput} 
+              />
               <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                <label style={{ fontSize: "12px", fontWeight: "700" }}>Product Photo</label>
+                <label style={{ fontSize: "12px", fontWeight: "700" }}>{isRestaurant ? "Food Photo" : "Product Photo"}</label>
                 <input type="file" accept="image/*" onChange={handleImageChange} style={{ fontSize: "12px" }} />
               </div>
               <div style={styles.modalBtns}>
-                <button type="submit" style={styles.saveModalBtn}>Save</button>
+                <button type="submit" style={styles.saveModalBtn}>{isRestaurant ? "Save Food" : "Save Product"}</button>
                 <button type="button" onClick={() => setIsModalOpen(false)} style={styles.cancelModalBtn}>Cancel</button>
               </div>
             </form>

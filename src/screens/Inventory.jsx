@@ -1,6 +1,6 @@
 // src/screens/Inventory.jsx
 import React, { useState, useEffect } from "react";
-import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc } from "firebase/firestore";
+import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 
 export default function Inventory() {
@@ -9,6 +9,10 @@ export default function Inventory() {
   const [searchQuery, setSearchQuery] = useState("");
   const [modalVisible, setModalVisible] = useState(false);
   
+  // Restaurant Mode Detection
+  const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
+  const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
+
   // Form states for Add/Edit
   const [currentItemId, setCurrentItemId] = useState(null);
   const [itemName, setItemName] = useState("");
@@ -25,13 +29,51 @@ export default function Inventory() {
       return;
     }
 
-    // Real-time listener for user's inventory
-    const inventoryRef = collection(db, "users", currentUid, "inventory");
-    const unsubscribe = onSnapshot(inventoryRef, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
+    // Check user profile for shopType
+    const checkType = async () => {
+      try {
+        const uDoc = await getDoc(doc(db, "users", currentUid));
+        if (uDoc.exists()) {
+          const d = uDoc.data();
+          const st = (d.shopType || d.shop_type || d.businessType || "").trim();
+          if (st) {
+            setShopType(st);
+            localStorage.setItem("shop_type", st);
+          }
+        }
+      } catch (e) {
+        console.warn("Could not check shop type:", e);
+      }
+    };
+    checkType();
+
+    // Real-time listener for user's inventory or restaurant_menu
+    const colName = isRestaurant ? "restaurant_menu" : "inventory";
+    const itemsRef = collection(db, "users", currentUid, colName);
+    const unsubscribe = onSnapshot(itemsRef, (snapshot) => {
+      const data = snapshot.docs.map(docSnap => {
+        const docData = docSnap.data();
+        const pName = docData.name || docData.itemName || "Unnamed";
+        const price = Number(docData.price ?? docData.salesPrice ?? 0);
+        const img = docData.imageUrl || docData.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+        const isAvail = docData.isAvailable !== false;
+        const qty = docData.quantity !== undefined ? docData.quantity : (isAvail ? "In Stock" : "Out of Stock");
+
+        return {
+          id: docSnap.id,
+          ...docData,
+          name: pName,
+          itemName: pName,
+          price: price,
+          salesPrice: price,
+          image: img,
+          imageUrl: img,
+          category: docData.category || (isRestaurant ? "Main Course" : "General"),
+          quantity: qty,
+          isAvailable: isAvail,
+          brand: docData.brand || ""
+        };
+      });
       setItems(data);
       setLoading(false);
     }, (error) => {
@@ -40,15 +82,15 @@ export default function Inventory() {
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [isRestaurant]);
 
   const handleOpenAddModal = () => {
     setCurrentItemId(null);
     setItemName("");
-    setCategory("");
+    setCategory(isRestaurant ? "Main Course" : "General");
     setBrand("");
     setSalesPrice("");
-    setQuantity("");
+    setQuantity(isRestaurant ? "100" : "");
     setImage("");
     setModalVisible(true);
   };
@@ -56,11 +98,11 @@ export default function Inventory() {
   const handleOpenEditModal = (item) => {
     setCurrentItemId(item.id);
     setItemName(item.itemName || item.name || "");
-    setCategory(item.category || "");
+    setCategory(item.category || (isRestaurant ? "Main Course" : "General"));
     setBrand(item.brand || "");
-    setSalesPrice(String(item.salesPrice || item.price || ""));
-    setQuantity(String(item.quantity || "0"));
-    setImage(item.image || "");
+    setSalesPrice(String(item.salesPrice ?? item.price ?? ""));
+    setQuantity(String(item.quantity ?? "0"));
+    setImage(item.image || item.imageUrl || "");
     setModalVisible(true);
   };
 
@@ -70,22 +112,27 @@ export default function Inventory() {
     if (!currentUid) return;
 
     try {
-      const inventoryRef = collection(db, "users", currentUid, "inventory");
+      const colName = isRestaurant ? "restaurant_menu" : "inventory";
+      const targetRef = collection(db, "users", currentUid, colName);
       const productData = {
+        name: itemName.trim(),
         itemName: itemName.trim(),
-        category: category.trim() || "General",
-        brand: brand.trim() || "No Brand",
+        category: category.trim() || (isRestaurant ? "Main Course" : "General"),
+        brand: brand.trim() || (isRestaurant ? "" : "No Brand"),
         salesPrice: Number(salesPrice) || 0,
-        quantity: Number(quantity) || 0,
-        image: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"
+        price: Number(salesPrice) || 0,
+        quantity: isNaN(Number(quantity)) ? 100 : Number(quantity),
+        isAvailable: true,
+        image: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
+        imageUrl: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"
       };
 
       if (currentItemId) {
         // Update existing item
-        await updateDoc(doc(db, "users", currentUid, "inventory", currentItemId), productData);
+        await updateDoc(doc(db, "users", currentUid, colName, currentItemId), productData);
       } else {
         // Add new item
-        await addDoc(inventoryRef, productData);
+        await addDoc(targetRef, productData);
       }
 
       setModalVisible(false);
@@ -99,9 +146,11 @@ export default function Inventory() {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) return;
 
-    if (window.ensure || window.confirm("Are you sure you want to delete this product?")) {
+    const label = isRestaurant ? "food item" : "product";
+    if (window.confirm(`Are you sure you want to delete this ${label}?`)) {
       try {
-        await deleteDoc(doc(db, "users", currentUid, "inventory", id));
+        const colName = isRestaurant ? "restaurant_menu" : "inventory";
+        await deleteDoc(doc(db, "users", currentUid, colName, id));
       } catch (err) {
         console.error("Delete error:", err);
       }
@@ -121,17 +170,17 @@ export default function Inventory() {
       {/* Header bar */}
       <div style={styles.headerRow}>
         <div>
-          <h2 style={styles.title}>📦 Store Inventory</h2>
-          <p style={styles.subtitle}>Manage your products, prices, and stock levels</p>
+          <h2 style={styles.title}>{isRestaurant ? "🍽️ Restaurant Menu" : "📦 Store Inventory"}</h2>
+          <p style={styles.subtitle}>{isRestaurant ? "Manage your food items, prices, and availability" : "Manage your products, prices, and stock levels"}</p>
         </div>
-        <button onClick={handleOpenAddModal} style={styles.addBtn}>+ Add New Product</button>
+        <button onClick={handleOpenAddModal} style={styles.addBtn}>{isRestaurant ? "+ Add New Food" : "+ Add New Product"}</button>
       </div>
 
       {/* Search Bar */}
       <div style={styles.searchContainer}>
         <input 
           type="text"
-          placeholder="Search products by name, brand or category..."
+          placeholder={isRestaurant ? "Search foods by name or category..." : "Search products by name, brand or category..."}
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           style={styles.searchInput}
@@ -140,28 +189,33 @@ export default function Inventory() {
 
       {/* Products List / Grid */}
       {loading ? (
-        <div style={styles.centerBox}>Loading inventory items...</div>
+        <div style={styles.centerBox}>{isRestaurant ? "Loading food menu..." : "Loading inventory items..."}</div>
       ) : filteredItems.length === 0 ? (
-        <div style={styles.centerBox}>No products found in your inventory ❌</div>
+        <div style={styles.centerBox}>{isRestaurant ? "No food items found in menu ❌" : "No products found in your inventory ❌"}</div>
       ) : (
         <div style={styles.grid}>
           {filteredItems.map((item) => {
             const name = item.itemName || item.name || "Unnamed";
             const price = item.salesPrice || item.price || 0;
-            const stock = item.quantity || 0;
-            const img = item.image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+            const stock = item.quantity !== undefined ? item.quantity : (item.isAvailable !== false ? "In Stock" : "Unavailable");
+            const img = item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
 
             return (
               <div key={item.id} style={styles.card}>
                 <div style={styles.imgBox}>
-                  <img src={img} alt={name} style={styles.img} />
-                  <span style={{ ...styles.stockTag, backgroundColor: stock <= 5 ? "#ef4444" : "#10b981" }}>
+                  <img 
+                    src={img} 
+                    alt={name} 
+                    style={styles.img} 
+                    onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                  />
+                  <span style={{ ...styles.stockTag, backgroundColor: (typeof stock === "number" && stock <= 5) ? "#ef4444" : "#10b981" }}>
                     Stock: {stock}
                   </span>
                 </div>
                 <div style={styles.cardBody}>
                   <h4 style={styles.productName}>{name}</h4>
-                  <p style={styles.productMeta}>{item.category || "General"} {item.brand ? `• ${item.brand}` : ""}</p>
+                  <p style={styles.productMeta}>{item.category || (isRestaurant ? "Main Course" : "General")} {item.brand ? `• ${item.brand}` : ""}</p>
                   <div style={styles.cardFooter}>
                     <span style={styles.priceText}>₹{price}</span>
                     <div style={styles.actionBtns}>
@@ -180,15 +234,16 @@ export default function Inventory() {
       {modalVisible && (
         <div style={styles.modalOverlay}>
           <div style={styles.modalContent}>
-            <h3>{currentItemId ? "Edit Product" : "Add New Product"}</h3>
+            <h3>{isRestaurant ? (currentItemId ? "Edit Food Item" : "Add New Food") : (currentItemId ? "Edit Product" : "Add New Product")}</h3>
             <form onSubmit={handleSaveItem} style={styles.form}>
               <div style={styles.inputGroup}>
-                <label style={styles.label}>Product Name</label>
+                <label style={styles.label}>{isRestaurant ? "Food Name" : "Product Name"}</label>
                 <input 
                   type="text" 
                   value={itemName} 
                   onChange={(e) => setItemName(e.target.value)} 
                   style={styles.input} 
+                  placeholder={isRestaurant ? "e.g. Chicken Biryani, Butter Naan" : "Product Name"}
                   required 
                 />
               </div>
@@ -199,17 +254,18 @@ export default function Inventory() {
                   value={category} 
                   onChange={(e) => setCategory(e.target.value)} 
                   style={styles.input} 
-                  placeholder="e.g. Grocery, Snacks" 
+                  placeholder={isRestaurant ? "e.g. Starters, Main Course, Desserts" : "e.g. Grocery, Snacks"} 
                   required 
                 />
               </div>
               <div style={styles.inputGroup}>
-                <label style={styles.label}>Brand</label>
+                <label style={styles.label}>{isRestaurant ? "Serving / Diet Notes (Optional)" : "Brand"}</label>
                 <input 
                   type="text" 
                   value={brand} 
                   onChange={(e) => setBrand(e.target.value)} 
                   style={styles.input} 
+                  placeholder={isRestaurant ? "e.g. Spicy, Veg, Non-Veg" : "Brand Name"}
                 />
               </div>
               <div style={styles.rowInputs}>
@@ -224,7 +280,7 @@ export default function Inventory() {
                   />
                 </div>
                 <div style={styles.inputGroup}>
-                  <label style={styles.label}>Quantity / Stock</label>
+                  <label style={styles.label}>{isRestaurant ? "Available Stock / Portions" : "Quantity / Stock"}</label>
                   <input 
                     type="number" 
                     value={quantity} 
@@ -246,7 +302,7 @@ export default function Inventory() {
               </div>
 
               <div style={styles.modalActions}>
-                <button type="submit" style={styles.saveBtn}>Save Product</button>
+                <button type="submit" style={styles.saveBtn}>{isRestaurant ? "Save Food" : "Save Product"}</button>
                 <button type="button" onClick={() => setModalVisible(false)} style={styles.cancelBtn}>Cancel</button>
               </div>
             </form>

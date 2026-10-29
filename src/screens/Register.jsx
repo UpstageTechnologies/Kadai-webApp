@@ -1,13 +1,15 @@
 import React, { useState } from "react";
 import { createUserWithEmailAndPassword } from "firebase/auth";
-import { auth, db, storage } from "../utils/firebase";
+import { auth, db } from "../utils/firebase";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 
 export default function Register() {
   const [shopName, setShopName] = useState("");
+  const [shopType, setShopType] = useState("Store");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -15,6 +17,11 @@ export default function Register() {
   const handleRegister = async (e) => {
     e.preventDefault();
     setError("");
+
+    if (!shopName.trim()) {
+      setError("Please enter your shop or restaurant name ⚠️");
+      return;
+    }
 
     if (password.length < 6) {
       setError("Password must be at least 6 characters ⚠️");
@@ -27,8 +34,16 @@ export default function Register() {
       const userCredential = await createUserWithEmailAndPassword(auth, email.trim(), password);
       const uid = userCredential.user.uid;
 
+      const trimmedName = shopName.trim();
+      const sType = shopType.trim();
+
       await setDoc(doc(db, "users", uid), {
-        shopName: shopName.trim(),
+        shopName: trimmedName,
+        shop_name: trimmedName,
+        storeName: trimmedName,
+        shopType: sType,
+        shop_type: sType,
+        businessType: sType,
         email: email.trim(),
         createdAt: serverTimestamp(),
         subscriptionPlan: "Free Trial",
@@ -36,11 +51,18 @@ export default function Register() {
       });
 
       localStorage.setItem("uid", uid);
-      navigate("/dashboard");
+      localStorage.setItem("shop_type", sType);
+      localStorage.setItem("store_name", trimmedName);
+
+      window.location.href = "/dashboard";
     } catch (err) {
       console.error("Registration error:", err);
       if (err.code === "auth/email-already-in-use") {
         setError("Email already in use ❌");
+      } else if (err.code === "auth/invalid-email") {
+        setError("Please enter a valid email address ⚠️");
+      } else if (err.code === "auth/weak-password") {
+        setError("Password is too weak. Must be at least 6 characters ⚠️");
       } else {
         setError(err.message || "Failed to create account.");
       }
@@ -60,15 +82,33 @@ export default function Register() {
 
         <form onSubmit={handleRegister} style={styles.form}>
           <div style={styles.inputGroup}>
-            <label style={styles.label}>Shop Name</label>
+            <label style={styles.label}>Shop / Restaurant Name</label>
             <input
               type="text"
-              placeholder="e.g. My Supermarket"
+              placeholder="e.g. Malabar Restaurant or Fresh Supermarket"
               value={shopName}
               onChange={(e) => setShopName(e.target.value)}
               style={styles.input}
+              disabled={loading}
               required
             />
+          </div>
+
+          <div style={styles.inputGroup}>
+            <label style={styles.label}>Shop Type / வகை</label>
+            <select
+              value={shopType}
+              onChange={(e) => setShopType(e.target.value)}
+              style={{ ...styles.input, cursor: "pointer", backgroundColor: "#fff" }}
+              disabled={loading}
+            >
+              <option value="Store">🏪 Store (General Retail)</option>
+              <option value="Restaurant">🍽️ Restaurant (Food & Dining)</option>
+              <option value="Super Market">🛒 Super Market</option>
+              <option value="Factory">🏭 Factory</option>
+              <option value="Medical">💊 Medical / Pharmacy</option>
+              <option value="Other">🏢 Other</option>
+            </select>
           </div>
 
           <div style={styles.inputGroup}>
@@ -79,23 +119,48 @@ export default function Register() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               style={styles.input}
+              disabled={loading}
               required
             />
           </div>
 
           <div style={styles.inputGroup}>
             <label style={styles.label}>Password</label>
-            <input
-              type="password"
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              style={styles.input}
-              required
-            />
+            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <input
+                type={showPassword ? "text" : "password"}
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={{ ...styles.input, paddingRight: "42px" }}
+                disabled={loading}
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                style={{
+                  position: "absolute",
+                  right: "12px",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  fontSize: "16px",
+                  color: "#64748b",
+                  padding: "4px"
+                }}
+                tabIndex={-1}
+              >
+                {showPassword ? "👁️" : "👁️‍🗨️"}
+              </button>
+            </div>
           </div>
 
-          <button type="submit" style={styles.button} disabled={loading}>
+          <button 
+            type="submit" 
+            style={{ ...styles.button, opacity: loading ? 0.7 : 1, cursor: loading ? "not-allowed" : "pointer" }} 
+            disabled={loading}
+          >
             {loading ? "Creating Account..." : "Sign Up"}
           </button>
 
@@ -104,12 +169,9 @@ export default function Register() {
 
         <div style={styles.footerText}>
           Already have an account?{" "}
-          <span 
-            onClick={() => navigate("/login")} 
-            style={styles.link}
-          >
+          <Link to="/login" style={styles.link}>
             Login here →
-          </span>
+          </Link>
         </div>
       </div>
     </div>
