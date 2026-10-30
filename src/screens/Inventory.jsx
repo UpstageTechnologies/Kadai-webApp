@@ -13,6 +13,10 @@ export default function Inventory() {
   const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
   const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
 
+  // Shop Mode: Local vs Global
+  const [appMode, setAppMode] = useState(() => localStorage.getItem("app_mode") || "local");
+  const isGlobalMode = appMode === "global";
+
   // Form states for Add/Edit
   const [currentItemId, setCurrentItemId] = useState(null);
   const [itemName, setItemName] = useState("");
@@ -48,7 +52,7 @@ export default function Inventory() {
     checkType();
 
     // Real-time listener for user's inventory or restaurant_menu
-    const colName = isRestaurant ? "restaurant_menu" : "inventory";
+    const colName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
     const itemsRef = collection(db, "users", currentUid, colName);
     const unsubscribe = onSnapshot(itemsRef, (snapshot) => {
       const data = snapshot.docs.map(docSnap => {
@@ -82,7 +86,7 @@ export default function Inventory() {
     });
 
     return () => unsubscribe();
-  }, [isRestaurant]);
+  }, [isRestaurant, appMode]);
 
   const handleOpenAddModal = () => {
     setCurrentItemId(null);
@@ -112,19 +116,21 @@ export default function Inventory() {
     if (!currentUid) return;
 
     try {
-      const colName = isRestaurant ? "restaurant_menu" : "inventory";
+      const colName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
       const targetRef = collection(db, "users", currentUid, colName);
       const productData = {
         name: itemName.trim(),
         itemName: itemName.trim(),
         category: category.trim() || (isRestaurant ? "Main Course" : "General"),
-        brand: brand.trim() || (isRestaurant ? "" : "No Brand"),
+        brand: brand.trim() || (isRestaurant ? "" : isGlobalMode ? "Global" : "Local"),
         salesPrice: Number(salesPrice) || 0,
         price: Number(salesPrice) || 0,
         quantity: isNaN(Number(quantity)) ? 100 : Number(quantity),
         isAvailable: true,
         image: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
-        imageUrl: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"
+        imageUrl: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
+        isGlobalMode: isGlobalMode,
+        inventoryMode: isGlobalMode ? "global" : "local"
       };
 
       if (currentItemId) {
@@ -146,10 +152,10 @@ export default function Inventory() {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) return;
 
-    const label = isRestaurant ? "food item" : "product";
+    const label = isRestaurant ? "food item" : isGlobalMode ? "global product" : "local product";
     if (window.confirm(`Are you sure you want to delete this ${label}?`)) {
       try {
-        const colName = isRestaurant ? "restaurant_menu" : "inventory";
+        const colName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
         await deleteDoc(doc(db, "users", currentUid, colName, id));
       } catch (err) {
         console.error("Delete error:", err);

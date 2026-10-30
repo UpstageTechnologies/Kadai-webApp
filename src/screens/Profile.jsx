@@ -193,10 +193,14 @@ export default function Profile({ userProfile, setUserProfile, storeSettings, se
             const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
             if (!currentUid) return;
             try {
+              const curMode = localStorage.getItem("app_mode") || "local";
               const userDocRef = doc(db, "users", currentUid);
               await setDoc(userDocRef, { 
                 name: userProfile.name, 
                 storeName: userProfile.storeName,
+                shopName: userProfile.storeName,
+                [`${curMode}_shopName`]: userProfile.storeName,
+                [`${curMode}_shopLogo`]: userProfile.profileImage,
                 email: userProfile.email,
                 phone: userProfile.phone,
                 profileImage: userProfile.profileImage,
