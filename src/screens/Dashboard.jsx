@@ -987,138 +987,8 @@ export default function Dashboard() {
       <div style={styles.mainContent}>
         {/* TAB 1: POS TERMINAL */}
         {activeTab === "sales" && (
-          <div style={styles.salesTabContainer}>
-            {/* Top Stat Cards Row & Welcome Banner Matching Reference */}
-            <div style={styles.salesStatsBanner}>
-              {/* Top Row: Welcome & Subtitle + Timeframe Selector */}
-              <div style={styles.salesStatsHeaderRow}>
-                <div>
-                  <h2 style={styles.salesStatsWelcomeTitle}>
-                    Welcome back, {userProfile.name ? userProfile.name.split(" ")[0] : (isRestaurant ? "Chef" : "Owner")}! 👋
-                  </h2>
-                  <p style={styles.salesStatsWelcomeSub}>
-                    Here's what's happening with your {isRestaurant ? "restaurant" : "store"} today.
-                  </p>
-                </div>
-
-                <div style={styles.statsTimeframePill}>
-                  <button
-                    type="button"
-                    onClick={() => setStatsTimeframe("today")}
-                    style={{
-                      ...styles.statsTimeframeBtn,
-                      backgroundColor: statsTimeframe === "today" ? "#0d9488" : "transparent",
-                      color: statsTimeframe === "today" ? "#ffffff" : "#64748b",
-                      fontWeight: statsTimeframe === "today" ? "700" : "600"
-                    }}
-                  >
-                    Today
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setStatsTimeframe("all")}
-                    style={{
-                      ...styles.statsTimeframeBtn,
-                      backgroundColor: statsTimeframe === "all" ? "#0d9488" : "transparent",
-                      color: statsTimeframe === "all" ? "#ffffff" : "#64748b",
-                      fontWeight: statsTimeframe === "all" ? "700" : "600"
-                    }}
-                  >
-                    All Time
-                  </button>
-                </div>
-              </div>
-
-              {/* 4 Analytics Metric Cards Grid */}
-              <div style={styles.salesStatsCardsGrid}>
-                {/* CARD 1: Total Sales */}
-                <div style={styles.salesStatCard}>
-                  <div style={styles.statCardHeader}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                      <div style={styles.statCardIconCircle}>
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M6 3h12M6 8h12M6 13l8.5 8M6 13h3a4.5 4.5 0 0 0 0-9"/>
-                        </svg>
-                      </div>
-                      <span style={styles.statCardTitle}>Total Sales</span>
-                    </div>
-                    <span style={styles.statCardThreeDots} title="Total revenue from sales">⋮</span>
-                  </div>
-                  <div style={styles.statCardValue}>{statTotalSalesText}</div>
-                  <div style={styles.statCardSubtext}>
-                    <span style={styles.statCardArrowUp}>↑</span> {statSalesGrowth}
-                  </div>
-                </div>
-
-                {/* CARD 2: Orders */}
-                <div style={styles.salesStatCard}>
-                  <div style={styles.statCardHeader}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                      <div style={styles.statCardIconCircle}>
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="5" y="4" width="14" height="16" rx="2"/>
-                          <path d="M9 4a2 2 0 0 1 4 0"/>
-                          <path d="M9 12l2 2 4-4"/>
-                        </svg>
-                      </div>
-                      <span style={styles.statCardTitle}>Orders</span>
-                    </div>
-                    <span style={styles.statCardThreeDots} title="Total number of orders">⋮</span>
-                  </div>
-                  <div style={styles.statCardValue}>{statOrdersText}</div>
-                  <div style={styles.statCardSubtext}>
-                    <span style={styles.statCardArrowUp}>↑</span> {statOrdersGrowth}
-                  </div>
-                </div>
-
-                {/* CARD 3: Customers */}
-                <div style={styles.salesStatCard}>
-                  <div style={styles.statCardHeader}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                      <div style={styles.statCardIconCircle}>
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
-                          <circle cx="9" cy="7" r="4"/>
-                          <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
-                          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                        </svg>
-                      </div>
-                      <span style={styles.statCardTitle}>Customers</span>
-                    </div>
-                    <span style={styles.statCardThreeDots} title="Total unique customers">⋮</span>
-                  </div>
-                  <div style={styles.statCardValue}>{statCustomersText}</div>
-                  <div style={styles.statCardSubtext}>
-                    <span style={styles.statCardArrowUp}>↑</span> {statCustomersGrowth}
-                  </div>
-                </div>
-
-                {/* CARD 4: Avg. Order Value */}
-                <div style={styles.salesStatCard}>
-                  <div style={styles.statCardHeader}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                      <div style={styles.statCardIconCircle}>
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
-                          <line x1="3" y1="6" x2="21" y2="6"/>
-                          <path d="M16 10a4 4 0 0 1-8 0"/>
-                        </svg>
-                      </div>
-                      <span style={styles.statCardTitle}>Avg. Order Value</span>
-                    </div>
-                    <span style={styles.statCardThreeDots} title="Average sale value per order">⋮</span>
-                  </div>
-                  <div style={styles.statCardValue}>{statAvgOrderText}</div>
-                  <div style={styles.statCardSubtext}>
-                    <span style={styles.statCardArrowUp}>↑</span> {statAvgGrowth}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Bottom: POS Split Screen (Left Cart 640px, Right Products Grid) */}
-            <div style={styles.posLayout}>
-            {/* LEFT SIDE: Current Bill / Cart Summary */}
+          <div style={styles.posLayout}>
+            {/* LEFT SIDE: Current Bill / Cart Summary (Full Height) */}
             <div style={styles.posLeftPane}>
               <div style={styles.posHeaderTop}>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -1296,6 +1166,134 @@ export default function Dashboard() {
 
             {/* RIGHT SIDE: Products Grid Matching Image 2 */}
             <div style={styles.posRightPane}>
+              {/* Top Compact Stat Cards Row & Welcome Banner on Right Side */}
+              <div style={styles.salesStatsBanner}>
+                {/* Top Row: Welcome & Subtitle + Timeframe Selector */}
+                <div style={styles.salesStatsHeaderRow}>
+                  <div>
+                    <h2 style={styles.salesStatsWelcomeTitle}>
+                      Welcome back, {userProfile.name ? userProfile.name.split(" ")[0] : (isRestaurant ? "Chef" : "Owner")}! 👋
+                    </h2>
+                    <p style={styles.salesStatsWelcomeSub}>
+                      Here's what's happening with your {isRestaurant ? "restaurant" : "store"} today.
+                    </p>
+                  </div>
+
+                  <div style={styles.statsTimeframePill}>
+                    <button
+                      type="button"
+                      onClick={() => setStatsTimeframe("today")}
+                      style={{
+                        ...styles.statsTimeframeBtn,
+                        backgroundColor: statsTimeframe === "today" ? "#0d9488" : "transparent",
+                        color: statsTimeframe === "today" ? "#ffffff" : "#64748b",
+                        fontWeight: statsTimeframe === "today" ? "700" : "600"
+                      }}
+                    >
+                      Today
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStatsTimeframe("all")}
+                      style={{
+                        ...styles.statsTimeframeBtn,
+                        backgroundColor: statsTimeframe === "all" ? "#0d9488" : "transparent",
+                        color: statsTimeframe === "all" ? "#ffffff" : "#64748b",
+                        fontWeight: statsTimeframe === "all" ? "700" : "600"
+                      }}
+                    >
+                      All Time
+                    </button>
+                  </div>
+                </div>
+
+                {/* 4 Compact Analytics Metric Cards Grid */}
+                <div style={styles.salesStatsCardsGrid}>
+                  {/* CARD 1: Total Sales */}
+                  <div style={styles.salesStatCard}>
+                    <div style={styles.statCardHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                        <div style={styles.statCardIconCircle}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M6 3h12M6 8h12M6 13l8.5 8M6 13h3a4.5 4.5 0 0 0 0-9"/>
+                          </svg>
+                        </div>
+                        <span style={styles.statCardTitle}>Total Sales</span>
+                      </div>
+                      <span style={styles.statCardThreeDots} title="Total revenue from sales">⋮</span>
+                    </div>
+                    <div style={styles.statCardValue}>{statTotalSalesText}</div>
+                    <div style={styles.statCardSubtext}>
+                      <span style={styles.statCardArrowUp}>↑</span> {statSalesGrowth}
+                    </div>
+                  </div>
+
+                  {/* CARD 2: Orders */}
+                  <div style={styles.salesStatCard}>
+                    <div style={styles.statCardHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                        <div style={styles.statCardIconCircle}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="5" y="4" width="14" height="16" rx="2"/>
+                            <path d="M9 4a2 2 0 0 1 4 0"/>
+                            <path d="M9 12l2 2 4-4"/>
+                          </svg>
+                        </div>
+                        <span style={styles.statCardTitle}>Orders</span>
+                      </div>
+                      <span style={styles.statCardThreeDots} title="Total number of orders">⋮</span>
+                    </div>
+                    <div style={styles.statCardValue}>{statOrdersText}</div>
+                    <div style={styles.statCardSubtext}>
+                      <span style={styles.statCardArrowUp}>↑</span> {statOrdersGrowth}
+                    </div>
+                  </div>
+
+                  {/* CARD 3: Customers */}
+                  <div style={styles.salesStatCard}>
+                    <div style={styles.statCardHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                        <div style={styles.statCardIconCircle}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                            <circle cx="9" cy="7" r="4"/>
+                            <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                          </svg>
+                        </div>
+                        <span style={styles.statCardTitle}>Customers</span>
+                      </div>
+                      <span style={styles.statCardThreeDots} title="Total unique customers">⋮</span>
+                    </div>
+                    <div style={styles.statCardValue}>{statCustomersText}</div>
+                    <div style={styles.statCardSubtext}>
+                      <span style={styles.statCardArrowUp}>↑</span> {statCustomersGrowth}
+                    </div>
+                  </div>
+
+                  {/* CARD 4: Avg. Order Value */}
+                  <div style={styles.salesStatCard}>
+                    <div style={styles.statCardHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                        <div style={styles.statCardIconCircle}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
+                            <line x1="3" y1="6" x2="21" y2="6"/>
+                            <path d="M16 10a4 4 0 0 1-8 0"/>
+                          </svg>
+                        </div>
+                        <span style={styles.statCardTitle}>Avg. Order Value</span>
+                      </div>
+                      <span style={styles.statCardThreeDots} title="Average sale value per order">⋮</span>
+                    </div>
+                    <div style={styles.statCardValue}>{statAvgOrderText}</div>
+                    <div style={styles.statCardSubtext}>
+                      <span style={styles.statCardArrowUp}>↑</span> {statAvgGrowth}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div style={styles.categoryScroll}>
                 {categories.map((cat, idx) => (
                   <div 
@@ -1383,8 +1381,7 @@ export default function Dashboard() {
               )}
             </div>
           </div>
-        </div>
-      )}
+        )}
 
         {/* PROFILE PAGE TAB */}
         {activeTab === "profile" && (
@@ -2188,84 +2185,77 @@ const styles = {
 
   mainContent: { flex: 1, display: "flex", flexDirection: "column" },
 
-  salesTabContainer: {
+  salesStatsBanner: {
+    marginBottom: "16px",
     display: "flex",
     flexDirection: "column",
-    height: "calc(100vh - 61px)",
-    overflow: "hidden",
-    backgroundColor: "#f8fafc",
-    width: "100%",
-    boxSizing: "border-box"
-  },
-  salesStatsBanner: {
-    padding: "16px 28px 16px 28px",
-    backgroundColor: "#ffffff",
-    borderBottom: "1px solid #e2e8f0",
     flexShrink: 0,
-    boxSizing: "border-box"
+    boxSizing: "border-box",
+    width: "100%"
   },
   salesStatsHeaderRow: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: "14px",
+    marginBottom: "10px",
     flexWrap: "wrap",
-    gap: "10px"
+    gap: "8px"
   },
   salesStatsWelcomeTitle: {
-    fontSize: "19px",
+    fontSize: "17px",
     fontWeight: "800",
     color: "#0f172a",
-    margin: "0 0 3px 0",
+    margin: "0 0 2px 0",
     letterSpacing: "-0.3px"
   },
   salesStatsWelcomeSub: {
-    fontSize: "13px",
+    fontSize: "12px",
     color: "#64748b",
     margin: 0,
     fontWeight: "500"
   },
   statsTimeframePill: {
     display: "flex",
-    backgroundColor: "#f1f5f9",
+    backgroundColor: "#e2e8f0",
     borderRadius: "20px",
-    padding: "3px",
+    padding: "2px",
     gap: "2px"
   },
   statsTimeframeBtn: {
     border: "none",
-    padding: "5px 14px",
+    padding: "4px 10px",
     borderRadius: "16px",
-    fontSize: "12px",
+    fontSize: "11px",
     cursor: "pointer",
     transition: "all 0.15s ease"
   },
   salesStatsCardsGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: "16px",
+    gap: "10px",
     width: "100%",
     boxSizing: "border-box"
   },
   salesStatCard: {
     backgroundColor: "#ffffff",
     border: "1px solid #e2e8f0",
-    borderRadius: "14px",
-    padding: "14px 18px",
+    borderRadius: "12px",
+    padding: "9px 12px",
     boxShadow: "0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02)",
     display: "flex",
     flexDirection: "column",
-    boxSizing: "border-box"
+    boxSizing: "border-box",
+    minWidth: 0
   },
   statCardHeader: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: "8px"
+    marginBottom: "4px"
   },
   statCardIconCircle: {
-    width: "36px",
-    height: "36px",
+    width: "28px",
+    height: "28px",
     borderRadius: "50%",
     backgroundColor: "#0d9488",
     display: "flex",
@@ -2274,12 +2264,15 @@ const styles = {
     flexShrink: 0
   },
   statCardTitle: {
-    fontSize: "13px",
+    fontSize: "11.5px",
     fontWeight: "600",
-    color: "#64748b"
+    color: "#64748b",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
   },
   statCardThreeDots: {
-    fontSize: "16px",
+    fontSize: "14px",
     color: "#94a3b8",
     cursor: "pointer",
     fontWeight: "800",
@@ -2287,22 +2280,28 @@ const styles = {
     padding: "0 2px"
   },
   statCardValue: {
-    fontSize: "23px",
+    fontSize: "17px",
     fontWeight: "800",
     color: "#0f172a",
-    margin: "0 0 6px 0",
-    letterSpacing: "-0.5px"
+    margin: "0 0 3px 0",
+    letterSpacing: "-0.4px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
   },
   statCardSubtext: {
-    fontSize: "11.5px",
+    fontSize: "10px",
     fontWeight: "600",
     color: "#10b981",
     display: "flex",
     alignItems: "center",
-    gap: "4px"
+    gap: "3px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
   },
   statCardArrowUp: {
-    fontSize: "13px",
+    fontSize: "10.5px",
     fontWeight: "800"
   },
 
@@ -2310,8 +2309,7 @@ const styles = {
     display: "flex", 
     flexDirection: "row", 
     flex: 1, 
-    minHeight: 0, 
-    height: "100%", 
+    height: "calc(100vh - 61px)", 
     boxSizing: "border-box", 
     overflow: "hidden" 
   },  
