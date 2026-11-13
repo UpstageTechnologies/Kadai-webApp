@@ -783,7 +783,10 @@ export default function Dashboard() {
     : "3.1% from yesterday";
 
   return (
-    <div style={styles.appContainer}>
+    <div style={{
+      ...styles.appContainer,
+      ...(activeTab === "sales" ? { height: "100vh", maxHeight: "100vh", overflow: "hidden" } : {})
+    }}>
       {/* Top Navbar Header */}
       <header style={styles.navbar}>
         <div style={styles.navLeftGroup}>
@@ -984,7 +987,10 @@ export default function Dashboard() {
       )}
 
       {/* Main Content Area */}
-      <div style={styles.mainContent}>
+      <div style={{
+        ...styles.mainContent,
+        ...(activeTab === "sales" ? { minHeight: 0, overflow: "hidden" } : {})
+      }}>
         {/* TAB 1: POS TERMINAL */}
         {activeTab === "sales" && (
           <div style={styles.posLayout}>
@@ -2082,7 +2088,8 @@ const styles = {
     zIndex: 100, 
     gap: "16px", 
     width: "100%", 
-    boxSizing: "border-box"
+    boxSizing: "border-box",
+    flexShrink: 0
   },
   navLeftGroup: { display: "flex", alignItems: "center", gap: "16px", flexShrink: 0 },
   logoArea: { display: "flex", alignItems: "center", gap: "8px" },
@@ -2309,9 +2316,11 @@ const styles = {
     display: "flex", 
     flexDirection: "row", 
     flex: 1, 
-    height: "calc(100vh - 61px)", 
+    height: "100%", 
+    maxHeight: "100%",
     boxSizing: "border-box", 
-    overflow: "hidden" 
+    overflow: "hidden",
+    minHeight: 0
   },  
   posLeftPane: { 
     width: "640px", 
@@ -2323,11 +2332,13 @@ const styles = {
     flexDirection: "column", 
     boxSizing: "border-box", 
     height: "100%", 
-    flexShrink: 0 
+    maxHeight: "100%",
+    flexShrink: 0,
+    overflow: "hidden" 
   },
-  posHeaderTop: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "18px 28px", borderBottom: "1px solid #f1f5f9" },
+  posHeaderTop: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "18px 28px", borderBottom: "1px solid #f1f5f9", flexShrink: 0 },
   clearCartBtn: { background: "transparent", border: "none", color: "#ef4444", fontWeight: "800", fontSize: "13px", cursor: "pointer" },
-  posBillItemsList: { flex: 1, overflowY: "auto", padding: "18px 28px", display: "flex", flexDirection: "column", gap: "14px" },
+  posBillItemsList: { flex: 1, minHeight: 0, overflowY: "auto", padding: "18px 28px", display: "flex", flexDirection: "column", gap: "14px" },
   posEmptyBox: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "8px", minHeight: "220px" },
   posBillRow: { display: "flex", alignItems: "center", backgroundColor: "#f8fafc", padding: "14px 20px", borderRadius: "14px", border: "1px solid #f1f5f9" },
   posRowImg: { width: "54px", height: "54px", objectFit: "cover", borderRadius: "10px", flexShrink: 0 },
@@ -2370,12 +2381,12 @@ const styles = {
     color: "#0f172a"
   },
 
-  posBillFooter: { borderTop: "2px solid #f1f5f9", padding: "20px 28px", backgroundColor: "#fff", flexShrink: 0 },
+  posBillFooter: { borderTop: "2px solid #f1f5f9", padding: "16px 28px 20px", backgroundColor: "#fff", flexShrink: 0, marginTop: "auto" },
   posTotalRow: { display: "flex", justifyContent: "space-between", fontSize: "19px", fontWeight: "800", color: "#0f172a", marginBottom: "14px" },
   posTotalPrice: { color: "#fc8019", fontSize: "24px" },
   posCheckoutBtn: { width: "100%", padding: "16px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "12px", fontWeight: "800", fontSize: "16px", cursor: "pointer", textAlign: "center", boxShadow: "0 4px 14px rgba(37, 99, 235, 0.28)" },
 
-  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "20px 24px", height: "100%", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box", minWidth: 0 },
+  posRightPane: { flex: 1, backgroundColor: "#f8fafc", padding: "20px 24px", height: "100%", maxHeight: "100%", overflowY: "auto", display: "flex", flexDirection: "column", boxSizing: "border-box", minWidth: 0 },
   posCardQtyControl: {
     display: "flex",
     justifyContent: "space-between",
