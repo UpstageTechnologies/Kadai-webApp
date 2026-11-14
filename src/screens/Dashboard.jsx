@@ -1,5 +1,4 @@
-// src/screens/Dashboard.jsx
-import React, { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
@@ -37,7 +36,27 @@ export default function Dashboard() {
     const saved = localStorage.getItem("speed_dial_visible");
     return saved !== null ? saved === "true" : true;
   });
-  const [speedDialSlots, setSpeedDialSlots] = useState({});
+  const [speedDialSlots, setSpeedDialSlots] = useState(() => {
+    try {
+      const sType = (localStorage.getItem("shop_type") || "").trim().toLowerCase();
+      const isRest = sType === "restaurant";
+      const aMode = localStorage.getItem("app_mode") || "local";
+      const modeKey = isRest ? "restaurant" : (aMode === "global" ? "global" : "local");
+      const currentUid = localStorage.getItem("uid") || "";
+      if (currentUid) {
+        const saved = localStorage.getItem(`speed_dial_slots_${modeKey}_${currentUid}`);
+        if (saved) return JSON.parse(saved);
+      }
+    } catch (e) {
+      console.warn("Error reading initial speed dial slots:", e);
+    }
+    return {};
+  });
+  const speedDialSlotsRef = useRef(speedDialSlots);
+  useEffect(() => {
+    speedDialSlotsRef.current = speedDialSlots;
+  }, [speedDialSlots]);
+
   const [isConfiguringSpeedDial, setIsConfiguringSpeedDial] = useState(false);
   const [selectedSlotForConfig, setSelectedSlotForConfig] = useState(1);
   const [speedDialSearch, setSpeedDialSearch] = useState("");
@@ -46,6 +65,15 @@ export default function Dashboard() {
   const [currentBill, setCurrentBill] = useState([]);
   const [ordersList, setOrdersList] = useState([]);
   const [statsTimeframe, setStatsTimeframe] = useState("all");
+
+  // Hold Bill Feature States
+  const [heldOrders, setHeldOrders] = useState([]);
+  const [showHoldModal, setShowHoldModal] = useState(false);
+  const [holdCustomerName, setHoldCustomerName] = useState("");
+  const [holdCustomerPhone, setHoldCustomerPhone] = useState("");
+  const [showResumeModal, setShowResumeModal] = useState(false);
+  const [activeResumedOrderId, setActiveResumedOrderId] = useState(null);
+  const [holdConflictModal, setHoldConflictModal] = useState({ show: false, pendingOrder: null });
 
   // Profile Dropdown State and Dynamic Coordinates
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
@@ -114,8 +142,12 @@ export default function Dashboard() {
     setAppMode(mode);
     localStorage.setItem("app_mode", mode);
     setShopModeDropdownOpen(false);
+    const isRest = (shopType || "").trim().toLowerCase() === "restaurant";
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid") || "";
+    const modeKey = isRest ? "restaurant" : (mode === "global" ? "global" : "local");
+    const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
+
     if (rawUserData) {
-      const isRest = (shopType || "").trim().toLowerCase() === "restaurant";
       const activeStoreName = mode === "global"
         ? (rawUserData.global_shopName || rawUserData.globalStoreName || rawUserData.shopName || rawUserData.storeName || "Global Shop")
         : (rawUserData.local_shopName || rawUserData.localStoreName || rawUserData.shopName || rawUserData.storeName || (isRest ? "Restaurant POS" : "Local Shop"));
@@ -125,18 +157,21 @@ export default function Dashboard() {
         storeName: activeStoreName,
         profileImage: (mode === "global" ? rawUserData.global_shopLogo : rawUserData.local_shopLogo) || rawUserData.profileImage || rawUserData.shopLogo || ""
       }));
+    }
 
-      const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
-      const modeKey = isRest ? "restaurant" : (mode === "global" ? "global" : "local");
-      const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
-      const saved = localStorage.getItem(speedDialStorageKey);
-      if (saved) {
-        try { setSpeedDialSlots(JSON.parse(saved)); } catch (e) { setSpeedDialSlots({}); }
-      } else if (rawUserData?.speedDialSlots?.[modeKey]) {
-        setSpeedDialSlots(rawUserData.speedDialSlots[modeKey]);
-      } else {
-        setSpeedDialSlots({});
+    const saved = localStorage.getItem(speedDialStorageKey);
+    if (saved) {
+      try { 
+        setSpeedDialSlots(JSON.parse(saved)); 
+      } catch (err) { 
+        console.warn("Could not parse speed dial slots on mode switch:", err);
+        setSpeedDialSlots({}); 
       }
+    } else if (rawUserData?.speedDialSlots?.[modeKey]) {
+      setSpeedDialSlots(rawUserData.speedDialSlots[modeKey]);
+      localStorage.setItem(speedDialStorageKey, JSON.stringify(rawUserData.speedDialSlots[modeKey]));
+    } else {
+      setSpeedDialSlots({});
     }
   };
 
@@ -180,6 +215,14 @@ export default function Dashboard() {
       .animate-check {
         stroke-dasharray: 48;
         animation: checkDraw 0.4s 0.3s ease-in-out forwards;
+      }
+      @keyframes badgePop {
+        0% { transform: scale(0.6); opacity: 0.8; }
+        60% { transform: scale(1.22); opacity: 1; }
+        100% { transform: scale(1); opacity: 1; }
+      }
+      .animate-badge-pop {
+        animation: badgePop 0.22s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
       }
     `;
     document.head.appendChild(styleSheet);
@@ -226,7 +269,21 @@ export default function Dashboard() {
           } else {
             const savedSlots = localStorage.getItem(speedDialStorageKey);
             if (savedSlots) {
-              try { setSpeedDialSlots(JSON.parse(savedSlots)); } catch (e) {}
+              try { 
+                setSpeedDialSlots(JSON.parse(savedSlots)); 
+              } catch (err) {
+                console.warn("Could not parse speed dial slots:", err);
+              }
+            }
+          }
+
+          // Load local cached held orders for immediate availability
+          const savedHeld = localStorage.getItem(`held_orders_${currentUid}`);
+          if (savedHeld) {
+            try { 
+              setHeldOrders(JSON.parse(savedHeld)); 
+            } catch (err) {
+              console.warn("Could not parse saved held orders:", err);
             }
           }
         }
@@ -297,6 +354,24 @@ export default function Dashboard() {
       console.error("Cart sync listener error:", err);
     });
 
+    // 4. Real-time Held Orders Sync across Web and Mobile
+    const heldOrdersRef = collection(db, "users", currentUid, "held_orders");
+    const unsubscribeHeldOrders = onSnapshot(heldOrdersRef, (snapshot) => {
+      const list = snapshot.docs.map(docSnap => ({
+        id: docSnap.id,
+        ...docSnap.data()
+      }));
+      list.sort((a, b) => {
+        const timeA = a.createdAt?.toMillis?.() || (typeof a.id === "number" ? a.id : Number(a.id) || 0);
+        const timeB = b.createdAt?.toMillis?.() || (typeof b.id === "number" ? b.id : Number(b.id) || 0);
+        return timeB - timeA;
+      });
+      setHeldOrders(list);
+      localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(list));
+    }, (err) => {
+      console.warn("Held orders sync listener notice:", err);
+    });
+
     return () => {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
@@ -304,6 +379,7 @@ export default function Dashboard() {
       unsubscribeInventory();
       unsubscribeOrders();
       unsubscribeActiveCart();
+      unsubscribeHeldOrders();
     };
   }, [isRestaurant, appMode]);
 
@@ -334,62 +410,255 @@ export default function Dashboard() {
   };
 
   const addToCurrentBill = async (product) => {
-    const pId = product.id || product.barcode || String(Date.now());
+    if (!product) return;
+    const pId = String(product.id || product.barcode || "");
+    const pBarcode = product.barcode ? String(product.barcode) : "";
     const pName = product.itemName || product.name || "Item";
     const pPrice = Number(product.salesPrice ?? product.price ?? 0);
     const pImg = product.image || product.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
+    const pPurchasePrice = Number(product.purchasePrice || 0);
+    const pTax = Number(product.taxPercent || 0);
 
-    let updated;
-    const exist = currentBill.find(item => (item.id && item.id === pId) || (item.barcode && product.barcode && item.barcode === product.barcode));
-    if (exist) {
-      updated = currentBill.map(item => ((item.id && item.id === pId) || (item.barcode && product.barcode && item.barcode === product.barcode)) ? { ...item, qty: item.qty + 1 } : item);
-    } else {
-      updated = [
-        ...currentBill, 
-        { 
-          ...product, 
-          id: pId, 
-          barcode: product.barcode || pId,
-          name: pName, 
+    let updatedCart;
+    setCurrentBill(prevBill => {
+      const existIndex = prevBill.findIndex(item => {
+        const itemId = String(item.id || item.barcode || "");
+        const itemBarcode = item.barcode ? String(item.barcode) : "";
+        if (pId && itemId && pId === itemId) return true;
+        if (pBarcode && itemBarcode && pBarcode === itemBarcode) return true;
+        return false;
+      });
+
+      if (existIndex >= 0) {
+        updatedCart = prevBill.map((item, idx) => 
+          idx === existIndex ? { ...item, qty: (Number(item.qty) || 1) + 1 } : item
+        );
+      } else {
+        const newItem = {
+          ...product,
+          id: pId || String(new Date().getTime()),
+          barcode: pBarcode || pId,
+          name: pName,
           itemName: pName,
-          price: pPrice, 
+          price: pPrice,
           salesPrice: pPrice,
           image: pImg,
           imageUrl: pImg,
-          purchasePrice: Number(product.purchasePrice || 0),
-          taxPercent: product.taxPercent || 0,
-          qty: 1 
-        }
-      ];
+          purchasePrice: pPurchasePrice,
+          taxPercent: pTax,
+          qty: 1
+        };
+        updatedCart = [...prevBill, newItem];
+      }
+      return updatedCart;
+    });
+
+    if (updatedCart) {
+      await syncWebCartToCloud(updatedCart);
     }
-    setCurrentBill(updated);
-    await syncWebCartToCloud(updated);
   };
 
   const removeFromCurrentBill = async (id) => {
-    const exist = currentBill.find(item => item.id === id || item.barcode === id);
-    if (!exist) return;
+    const targetId = String(id);
+    let updatedCart;
+    setCurrentBill(prevBill => {
+      const exist = prevBill.find(item => String(item.id) === targetId || String(item.barcode) === targetId);
+      if (!exist) return prevBill;
 
-    let updated;
-    if (exist.qty === 1) {
-      updated = currentBill.filter(item => item.id !== id && item.barcode !== id);
-    } else {
-      updated = currentBill.map(item => (item.id === id || item.barcode === id) ? { ...item, qty: item.qty - 1 } : item);
+      if (exist.qty <= 1) {
+        updatedCart = prevBill.filter(item => String(item.id) !== targetId && String(item.barcode) !== targetId);
+      } else {
+        updatedCart = prevBill.map(item => 
+          (String(item.id) === targetId || String(item.barcode) === targetId) 
+            ? { ...item, qty: item.qty - 1 } 
+            : item
+        );
+      }
+      return updatedCart;
+    });
+
+    if (updatedCart) {
+      await syncWebCartToCloud(updatedCart);
     }
-
-    setCurrentBill(updated);
-    await syncWebCartToCloud(updated);
   };
 
   const deleteFromCurrentBill = async (id) => {
-    const updated = currentBill.filter(item => item.id !== id && item.barcode !== id);
-    setCurrentBill(updated);
-    await syncWebCartToCloud(updated);
+    const targetId = String(id);
+    let updatedCart;
+    setCurrentBill(prevBill => {
+      updatedCart = prevBill.filter(item => String(item.id) !== targetId && String(item.barcode) !== targetId);
+      return updatedCart;
+    });
+    if (updatedCart) {
+      await syncWebCartToCloud(updatedCart);
+    }
   };
 
   const clearCurrentBill = async () => {
     setCurrentBill([]);
+    setActiveResumedOrderId(null);
     await syncWebCartToCloud([]);
+  };
+
+  // Hold Bill Actions
+  const handleHoldOrder = () => {
+    if (!currentBill || currentBill.length === 0) {
+      alert("⚠️ Empty Cart: Cannot hold an empty bill. Please add items to the cart first.");
+      return;
+    }
+    const defaultName = isRestaurant 
+      ? `Table / Order #${heldOrders.length + 1}` 
+      : "";
+    setHoldCustomerName(defaultName);
+    setHoldCustomerPhone("");
+    setShowHoldModal(true);
+  };
+
+  const handleConfirmHoldOrder = async () => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!currentBill || currentBill.length === 0) {
+      setShowHoldModal(false);
+      return;
+    }
+
+    const holdId = new Date().getTime();
+    const finalHoldName = holdCustomerName.trim() || (isRestaurant ? `Table / Order #${heldOrders.length + 1}` : "Guest");
+    const finalHoldPhone = holdCustomerPhone.trim();
+
+    const newHold = {
+      id: holdId,
+      name: finalHoldName,
+      customerName: finalHoldName,
+      customerPhone: finalHoldPhone || "N/A",
+      items: [...currentBill],
+      total: totalBillAmount,
+      totalAmount: totalBillAmount,
+      totalQty: totalBillItemsCount,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      createdAt: serverTimestamp(),
+      source: "web_pos",
+      isRestaurant: isRestaurant,
+      appMode: appMode
+    };
+
+    // Update local state immediately for instant feedback
+    const updated = [newHold, ...heldOrders.filter(o => String(o.id) !== String(holdId))];
+    setHeldOrders(updated);
+    if (currentUid) {
+      localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(updated));
+      try {
+        await setDoc(doc(db, "users", currentUid, "held_orders", String(holdId)), newHold);
+      } catch (err) {
+        console.error("Failed to save held order to Firestore:", err);
+      }
+    }
+
+    // Clear active cart in UI and cloud
+    setCurrentBill([]);
+    setActiveResumedOrderId(null);
+    await syncWebCartToCloud([]);
+
+    setHoldCustomerName("");
+    setHoldCustomerPhone("");
+    setShowHoldModal(false);
+    setPopupModal({
+      show: true,
+      message: `Bill held successfully as "${finalHoldName}"! ⏸️`
+    });
+  };
+
+  const handleInitiateResumeOrder = (order) => {
+    if (currentBill && currentBill.length > 0) {
+      // Active cart has items, open conflict resolution modal
+      setHoldConflictModal({ show: true, pendingOrder: order });
+    } else {
+      handleExecuteResumeOrder(order, false);
+    }
+  };
+
+  const handleExecuteResumeOrder = async (order, holdCurrentFirst = false) => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+
+    if (holdCurrentFirst && currentBill.length > 0) {
+      // Hold current bill first before resuming
+      const autoHoldId = new Date().getTime();
+      const autoHoldName = isRestaurant ? `Table / Order #${heldOrders.length + 1}` : "Auto Held Order";
+      const autoHold = {
+        id: autoHoldId,
+        name: autoHoldName,
+        customerName: autoHoldName,
+        customerPhone: "N/A",
+        items: [...currentBill],
+        total: totalBillAmount,
+        totalAmount: totalBillAmount,
+        totalQty: totalBillItemsCount,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        createdAt: serverTimestamp(),
+        source: "web_pos",
+        isRestaurant: isRestaurant,
+        appMode: appMode
+      };
+      if (currentUid) {
+        try {
+          await setDoc(doc(db, "users", currentUid, "held_orders", String(autoHoldId)), autoHold);
+        } catch (e) {
+          console.warn("Could not auto-hold current bill:", e);
+        }
+      }
+    }
+
+    const restoredItems = order.items || [];
+    setCurrentBill(restoredItems);
+    await syncWebCartToCloud(restoredItems);
+
+    if (order.customerName && order.customerName !== "Guest" && !order.customerName.startsWith("Table / Order #")) {
+      setCustomerName(order.customerName);
+    }
+    if (order.customerPhone && order.customerPhone !== "N/A") {
+      setCustomerPhone(order.customerPhone);
+    }
+
+    setActiveResumedOrderId(order.id);
+
+    // Remove resumed order from held orders so it doesn't stay duplicated in held list
+    if (currentUid) {
+      try {
+        await deleteDoc(doc(db, "users", currentUid, "held_orders", String(order.id)));
+      } catch (err) {
+        console.warn("Could not delete resumed held order doc:", err);
+      }
+      const updated = heldOrders.filter(o => String(o.id) !== String(order.id));
+      setHeldOrders(updated);
+      localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(updated));
+    }
+
+    setShowResumeModal(false);
+    setHoldConflictModal({ show: false, pendingOrder: null });
+    setPopupModal({
+      show: true,
+      message: `Order "${order.name || order.customerName || 'Held Order'}" restored to cart! ⏵`
+    });
+  };
+
+  const handleDeleteHeldOrder = async (orderId, orderName) => {
+    const ok = window.confirm(`Are you sure you want to delete the held bill for "${orderName || 'Guest'}"? This action will not affect past completed sales.`);
+    if (!ok) return;
+
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (currentUid) {
+      try {
+        await deleteDoc(doc(db, "users", currentUid, "held_orders", String(orderId)));
+      } catch (e) {
+        console.error("Failed to delete held order:", e);
+      }
+      const updated = heldOrders.filter(o => String(o.id) !== String(orderId));
+      setHeldOrders(updated);
+      localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(updated));
+    }
+
+    if (activeResumedOrderId === orderId) {
+      setActiveResumedOrderId(null);
+    }
   };
 
   const handleAssignProductToSlot = async (slotNum, product) => {
@@ -397,46 +666,68 @@ export default function Dashboard() {
     const modeKey = isRestaurant ? "restaurant" : (isGlobalMode ? "global" : "local");
     const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
 
-    const updated = {
-      ...speedDialSlots,
-      [slotNum]: product ? {
-        id: product.id || product.barcode || String(Date.now()),
-        barcode: product.barcode || "",
-        name: product.itemName || product.name || "Item",
-        itemName: product.itemName || product.name || "Item",
-        price: Number(product.salesPrice ?? product.price ?? 0),
-        salesPrice: Number(product.salesPrice ?? product.price ?? 0),
-        image: product.image || product.imageUrl || "",
-        imageUrl: product.image || product.imageUrl || "",
-        purchasePrice: Number(product.purchasePrice || 0),
-        taxPercent: product.taxPercent || 0,
-        category: product.category || "General"
-      } : null
-    };
+    const normalizedProduct = product ? {
+      id: String(product.id || product.barcode || new Date().getTime()),
+      barcode: product.barcode ? String(product.barcode) : "",
+      name: product.itemName || product.name || "Item",
+      itemName: product.itemName || product.name || "Item",
+      price: Number(product.salesPrice ?? product.price ?? 0),
+      salesPrice: Number(product.salesPrice ?? product.price ?? 0),
+      image: product.image || product.imageUrl || "",
+      imageUrl: product.image || product.imageUrl || "",
+      purchasePrice: Number(product.purchasePrice || 0),
+      taxPercent: product.taxPercent || 0,
+      category: product.category || "General"
+    } : null;
 
-    if (!product) {
-      delete updated[slotNum];
-    }
+    let updatedSlots;
+    setSpeedDialSlots(prev => {
+      const next = { ...prev };
+      if (normalizedProduct) {
+        next[slotNum] = normalizedProduct;
+      } else {
+        delete next[slotNum];
+      }
+      updatedSlots = next;
+      if (currentUid) {
+        localStorage.setItem(speedDialStorageKey, JSON.stringify(next));
+      }
+      return next;
+    });
 
-    setSpeedDialSlots(updated);
-    localStorage.setItem(speedDialStorageKey, JSON.stringify(updated));
-
-    if (currentUid) {
+    let firestoreError = null;
+    if (currentUid && updatedSlots !== undefined) {
       try {
         await updateDoc(doc(db, "users", currentUid), {
-          [`speedDialSlots.${modeKey}`]: updated
+          [`speedDialSlots.${modeKey}`]: updatedSlots
         });
-      } catch (e) {
-        console.warn("Could not sync speed dial to Firestore:", e);
+      } catch {
+        try {
+          await setDoc(doc(db, "users", currentUid), {
+            speedDialSlots: {
+              [modeKey]: updatedSlots
+            }
+          }, { merge: true });
+        } catch (setErr) {
+          console.error("Could not sync speed dial to Firestore:", setErr);
+          firestoreError = setErr;
+        }
       }
     }
 
-    setPopupModal({
-      show: true,
-      message: product 
-        ? `Slot #${slotNum} assigned to "${product.itemName || product.name}"! ⚡` 
-        : `Slot #${slotNum} cleared successfully!`
-    });
+    if (firestoreError) {
+      setPopupModal({
+        show: true,
+        message: `Slot #${slotNum} saved locally, but cloud sync failed (${firestoreError.message || 'offline'}).`
+      });
+    } else {
+      setPopupModal({
+        show: true,
+        message: product 
+          ? `Slot #${slotNum} assigned to "${product.itemName || product.name}"! ⚡` 
+          : `Slot #${slotNum} cleared successfully!`
+      });
+    }
     setIsConfiguringSpeedDial(false);
   };
 
@@ -463,21 +754,59 @@ export default function Dashboard() {
   // Physical Keyboard Shortcut (Press 1 - 8 to quickly add assigned item to cart)
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (activeTab !== "sales" || isCheckoutModalOpen || isModalOpen || isConfiguringSpeedDial) return;
-      const targetTag = e.target.tagName?.toLowerCase();
-      if (targetTag === "input" || targetTag === "textarea" || e.target.isContentEditable) {
+      if (activeTab !== "sales") return;
+      if (
+        isCheckoutModalOpen || 
+        isModalOpen || 
+        isConfiguringSpeedDial || 
+        showHoldModal || 
+        showResumeModal || 
+        holdConflictModal.show || 
+        selectedOrderDetails || 
+        popupModal.show
+      ) {
         return;
       }
-      const num = parseInt(e.key, 10);
-      if (num >= 1 && num <= 8) {
-        e.preventDefault();
-        handleSpeedDialClick(num);
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      const target = e.target;
+      if (
+        target && (
+          target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable ||
+          target.closest?.("input, textarea, select, [contenteditable='true']")
+        )
+      ) {
+        return;
+      }
+
+      if (e.key >= "1" && e.key <= "8") {
+        const slotNum = Number(e.key);
+        const assignedItem = speedDialSlotsRef.current[slotNum];
+        if (assignedItem && (assignedItem.name || assignedItem.itemName)) {
+          e.preventDefault();
+          addToCurrentBill(assignedItem);
+          setRecentlyTappedSlot(slotNum);
+          setTimeout(() => setRecentlyTappedSlot(null), 300);
+        }
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeTab, isCheckoutModalOpen, isModalOpen, isConfiguringSpeedDial, speedDialSlots]);
+  }, [
+    activeTab, 
+    isCheckoutModalOpen, 
+    isModalOpen, 
+    isConfiguringSpeedDial, 
+    showHoldModal, 
+    showResumeModal, 
+    holdConflictModal.show, 
+    selectedOrderDetails, 
+    popupModal.show
+  ]);
 
   const handleFinalCheckoutSubmit = async (e) => {
     e.preventDefault();
@@ -532,12 +861,26 @@ export default function Dashboard() {
             timestamp: Date.now()
           }
         });
+
+        // 3. Clean up active resumed held order if this sale finalized a held bill
+        if (activeResumedOrderId) {
+          try {
+            await deleteDoc(doc(db, "users", currentUid, "held_orders", String(activeResumedOrderId)));
+          } catch (e) {
+            console.warn("Could not delete finalized resumed held order:", e);
+          }
+          const updated = heldOrders.filter(o => String(o.id) !== String(activeResumedOrderId));
+          setHeldOrders(updated);
+          localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(updated));
+          setActiveResumedOrderId(null);
+        }
       }
 
       setIsCheckoutModalOpen(false);
       setCustomerName("");
       setCustomerPhone("");
       setCurrentBill([]);
+      setActiveResumedOrderId(null);
       setPopupModal({ show: true, message: "Payment Successful & Order Recorded! 🎉" });
     } catch (err) {
       console.error("Checkout error:", err);
@@ -860,6 +1203,33 @@ export default function Dashboard() {
           <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
             📋 Orders ({ordersList.length})
           </button>
+          <button 
+            type="button"
+            onClick={() => setShowResumeModal(true)} 
+            style={{ 
+              ...styles.navBtn, 
+              backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "transparent", 
+              color: heldOrders.length > 0 ? "#b45309" : "#64748b",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px"
+            }}
+            title="View Pending Held Bills"
+          >
+            <span>⏸️ Held</span>
+            {heldOrders.length > 0 && (
+              <span style={{
+                backgroundColor: "#d97706",
+                color: "#ffffff",
+                borderRadius: "10px",
+                padding: "1px 7px",
+                fontSize: "11px",
+                fontWeight: "800"
+              }}>
+                {heldOrders.length}
+              </span>
+            )}
+          </button>
 
           {/* Profile Trigger Button */}
           <button 
@@ -1012,7 +1382,59 @@ export default function Dashboard() {
                     {isRestaurant ? "RESTAURANT POS" : isGlobalMode ? "🌐 GLOBAL POS" : "🏪 LOCAL POS"}
                   </span>
                 </div>
-                <button onClick={clearCurrentBill} style={styles.clearCartBtn}>CLEAR CART ✕</button>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <button 
+                    type="button"
+                    onClick={() => setShowResumeModal(true)} 
+                    style={{
+                      backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "#f8fafc",
+                      border: heldOrders.length > 0 ? "1.5px solid #fde68a" : "1.5px solid #e2e8f0",
+                      color: heldOrders.length > 0 ? "#b45309" : "#64748b",
+                      padding: "4px 10px",
+                      borderRadius: "8px",
+                      fontWeight: "700",
+                      fontSize: "12px",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "5px"
+                    }}
+                    title="View Held Bills"
+                  >
+                    <span>⏸️ HELD</span>
+                    {heldOrders.length > 0 && (
+                      <span style={{
+                        backgroundColor: "#d97706",
+                        color: "#fff",
+                        borderRadius: "10px",
+                        padding: "0 6px",
+                        fontSize: "10.5px",
+                        fontWeight: "800"
+                      }}>
+                        {heldOrders.length}
+                      </span>
+                    )}
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={handleHoldOrder} 
+                    disabled={currentBill.length === 0}
+                    style={{
+                      backgroundColor: currentBill.length === 0 ? "#f8fafc" : "#fff7ed",
+                      border: currentBill.length === 0 ? "1.5px solid #e2e8f0" : "1.5px solid #fed7aa",
+                      color: currentBill.length === 0 ? "#94a3b8" : "#ea580c",
+                      padding: "4px 10px",
+                      borderRadius: "8px",
+                      fontWeight: "700",
+                      fontSize: "12px",
+                      cursor: currentBill.length === 0 ? "not-allowed" : "pointer"
+                    }}
+                    title="Hold Current Bill"
+                  >
+                    ⏸️ HOLD
+                  </button>
+                  <button onClick={clearCurrentBill} style={styles.clearCartBtn}>CLEAR ✕</button>
+                </div>
               </div>
 
               <div style={styles.posBillItemsList}>
@@ -1058,13 +1480,52 @@ export default function Dashboard() {
                   <span>Total / மொத்தம்:</span>
                   <span style={styles.posTotalPrice}>₹{totalBillAmount}.00</span>
                 </div>
-                <button 
-                  style={{ ...styles.posCheckoutBtn, opacity: currentBill.length === 0 ? 0.5 : 1 }} 
-                  disabled={currentBill.length === 0}
-                  onClick={() => setIsCheckoutModalOpen(true)}
-                >
-                  CONTINUE தொடரவும் →
-                </button>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
+                  <button 
+                    type="button"
+                    style={{ 
+                      flex: 1, 
+                      padding: "14px 10px", 
+                      backgroundColor: currentBill.length === 0 ? "#f8fafc" : "#fff7ed", 
+                      color: currentBill.length === 0 ? "#94a3b8" : "#ea580c", 
+                      border: currentBill.length === 0 ? "1.5px solid #e2e8f0" : "1.5px solid #fed7aa", 
+                      borderRadius: "12px", 
+                      fontWeight: "800", 
+                      fontSize: "13.5px", 
+                      cursor: currentBill.length === 0 ? "not-allowed" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: "6px"
+                    }}
+                    disabled={currentBill.length === 0}
+                    onClick={handleHoldOrder}
+                    title="Place active bill on hold"
+                  >
+                    <span>⏸️</span>
+                    <span>Hold / நிறுத்திவை</span>
+                  </button>
+                  <button 
+                    style={{ 
+                      flex: 2, 
+                      padding: "14px 16px", 
+                      backgroundColor: "#2563eb", 
+                      color: "#fff", 
+                      border: "none", 
+                      borderRadius: "12px", 
+                      fontWeight: "800", 
+                      fontSize: "15px", 
+                      cursor: currentBill.length === 0 ? "not-allowed" : "pointer", 
+                      textAlign: "center", 
+                      boxShadow: currentBill.length === 0 ? "none" : "0 4px 14px rgba(37, 99, 235, 0.28)",
+                      opacity: currentBill.length === 0 ? 0.5 : 1
+                    }} 
+                    disabled={currentBill.length === 0}
+                    onClick={() => setIsCheckoutModalOpen(true)}
+                  >
+                    CONTINUE தொடரவும் →
+                  </button>
+                </div>
 
                 {/* SPEED DIAL SECTION (1 - 8 FAST SELLING PRODUCTS) */}
                 <div style={styles.speedDialSection}>
@@ -1338,7 +1799,15 @@ export default function Dashboard() {
 
                     return (
                       <div key={item.id} style={styles.productCard}>
-                        <div style={styles.imageWrapper}>
+                        {/* Interactive Image Area: Click image adds to cart */}
+                        <div 
+                          style={{
+                            ...styles.imageWrapper,
+                            cursor: "pointer"
+                          }}
+                          onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })}
+                          title={`Click image to add "${itemName}" to bill`}
+                        >
                           <img 
                             src={imageVal} 
                             alt={itemName} 
@@ -1346,8 +1815,16 @@ export default function Dashboard() {
                             onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
                           />
                           <span style={styles.stockBadge}>{typeof stock === "number" ? `Stock: ${stock}` : stock}</span>
+                          {/* Redesigned Red Circular Quantity Badge with Micro-Animation */}
                           {itemQtyInBill > 0 && (
-                            <span style={styles.inCartBadge}>✓ {itemQtyInBill}</span>
+                            <span 
+                              key={itemQtyInBill}
+                              className="animate-badge-pop"
+                              style={styles.inCartBadge}
+                              title={`${itemQtyInBill} in current cart`}
+                            >
+                              {itemQtyInBill}
+                            </span>
                           )}
                         </div>
                         <div style={styles.productDetails}>
@@ -1355,15 +1832,23 @@ export default function Dashboard() {
                           <p style={styles.productCategory}>₹{priceVal}</p>
                           {itemQtyInBill === 0 ? (
                             <button 
-                              onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} 
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                addToCurrentBill({ ...item, name: itemName, price: priceVal });
+                              }} 
                               style={styles.addBillBtn}
                             >
                               {isRestaurant ? "+ Add to Order" : "+ Add to POS Bill"}
                             </button>
                           ) : (
-                            <div style={styles.posCardQtyControl}>
+                            <div style={styles.posCardQtyControl} onClick={(e) => e.stopPropagation()}>
                               <button 
-                                onClick={() => removeFromCurrentBill(item.id || item.barcode)} 
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removeFromCurrentBill(item.id || item.barcode);
+                                }} 
                                 style={styles.posCardQtyBtn}
                                 title="Decrease"
                               >
@@ -1371,7 +1856,11 @@ export default function Dashboard() {
                               </button>
                               <span style={styles.posCardQtyVal}>{itemQtyInBill}</span>
                               <button 
-                                onClick={() => addToCurrentBill({ ...item, name: itemName, price: priceVal })} 
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  addToCurrentBill({ ...item, name: itemName, price: priceVal });
+                                }} 
                                 style={styles.posCardQtyBtn}
                                 title="Add more"
                               >
@@ -1664,6 +2153,327 @@ export default function Dashboard() {
           );
         })()}
       </div>
+
+      {/* HOLD ORDER MODAL */}
+      {showHoldModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowHoldModal(false)}>
+          <div style={{ ...styles.modalBox, maxWidth: "460px" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "20px" }}>⏸️</span>
+                <h3 style={{ margin: 0, color: "#0f172a", fontSize: "18px", fontWeight: "800" }}>
+                  Hold Current Bill / பில் நிறுத்திவை
+                </h3>
+              </div>
+              <button onClick={() => setShowHoldModal(false)} style={{ background: "transparent", border: "none", fontSize: "16px", cursor: "pointer", fontWeight: "800" }}>✕</button>
+            </div>
+
+            <div style={{ backgroundColor: "#fff7ed", padding: "12px 16px", borderRadius: "10px", border: "1px solid #fed7aa", display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+              <span style={{ fontSize: "13.5px", fontWeight: "700", color: "#9a3412" }}>
+                Bill Summary: {totalBillItemsCount} items
+              </span>
+              <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>
+                ₹{totalBillAmount}.00
+              </span>
+            </div>
+
+            <form onSubmit={(e) => { e.preventDefault(); handleConfirmHoldOrder(); }} style={styles.modalForm}>
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>
+                  {isRestaurant ? "Table Number / Order Name / Customer" : "Customer Name / Note (Optional)"}
+                </label>
+                <input 
+                  type="text" 
+                  placeholder={isRestaurant ? "e.g. Table 4 / Ramesh / Order #2" : "e.g. Ramesh / Guest"} 
+                  value={holdCustomerName} 
+                  onChange={(e) => setHoldCustomerName(e.target.value)} 
+                  style={styles.modalInput} 
+                  autoFocus
+                />
+              </div>
+
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Customer Phone (Optional)</label>
+                <input 
+                  type="tel" 
+                  placeholder="10-digit mobile number" 
+                  value={holdCustomerPhone} 
+                  onChange={(e) => setHoldCustomerPhone(e.target.value)} 
+                  style={styles.modalInput} 
+                />
+              </div>
+
+              <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#64748b", lineHeight: "1.4" }}>
+                Holding this bill clears the active cart so you can serve the next customer. You can restore this bill anytime from the <strong>Held Bills</strong> button.
+              </p>
+
+              <div style={styles.modalBtns}>
+                <button type="submit" style={{ ...styles.saveModalBtn, backgroundColor: "#ea580c" }}>
+                  Confirm Hold ⏸️
+                </button>
+                <button type="button" onClick={() => setShowHoldModal(false)} style={styles.cancelModalBtn}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* HELD BILLS LIST MODAL */}
+      {showResumeModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowResumeModal(false)}>
+          <div style={{ ...styles.modalBox, maxWidth: "620px", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px", borderBottom: "1px solid #f1f5f9", paddingBottom: "12px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "22px" }}>⏸️</span>
+                <h3 style={{ margin: 0, color: "#0f172a", fontSize: "18px", fontWeight: "800" }}>
+                  Pending Held Bills / நிலுவை பில்கள்
+                </h3>
+                <span style={{
+                  backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "#f1f5f9",
+                  color: heldOrders.length > 0 ? "#b45309" : "#64748b",
+                  padding: "2px 8px",
+                  borderRadius: "12px",
+                  fontSize: "12px",
+                  fontWeight: "800"
+                }}>
+                  {heldOrders.length} {heldOrders.length === 1 ? "Bill" : "Bills"}
+                </span>
+              </div>
+              <button onClick={() => setShowResumeModal(false)} style={{ background: "transparent", border: "none", fontSize: "16px", cursor: "pointer", fontWeight: "800" }}>✕</button>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", minHeight: "160px", paddingRight: "4px" }}>
+              {heldOrders.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "40px 20px", color: "#64748b" }}>
+                  <span style={{ fontSize: "40px", display: "block", marginBottom: "10px" }}>🧾</span>
+                  <h4 style={{ margin: "0 0 6px 0", color: "#0f172a", fontSize: "16px" }}>No bills on hold!</h4>
+                  <p style={{ margin: 0, fontSize: "13px" }}>Bills placed on hold during checkout will appear here.</p>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                  {heldOrders.map((order) => {
+                    const itemCount = (order.items || []).reduce((sum, itm) => sum + (itm.qty || 1), 0);
+                    const orderTotal = Number(order.totalAmount || order.total || 0);
+
+                    return (
+                      <div 
+                        key={order.id} 
+                        style={{
+                          backgroundColor: "#f8fafc",
+                          border: "1.5px solid #e2e8f0",
+                          borderRadius: "12px",
+                          padding: "14px 16px",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "10px",
+                          transition: "border-color 0.2s"
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "10px" }}>
+                          <div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                              <h4 style={{ margin: 0, fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>
+                                {order.name || order.customerName || "Guest"}
+                              </h4>
+                              {order.customerPhone && order.customerPhone !== "N/A" && (
+                                <span style={{ fontSize: "11px", color: "#64748b", backgroundColor: "#fff", border: "1px solid #e2e8f0", padding: "1px 6px", borderRadius: "6px" }}>
+                                  📞 {order.customerPhone}
+                                </span>
+                              )}
+                              <span style={{ fontSize: "11px", color: "#64748b" }}>
+                                🕒 {order.timestamp || "Recently"}
+                              </span>
+                            </div>
+                            <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#64748b" }}>
+                              {itemCount} {itemCount === 1 ? "item" : "items"} in bill
+                            </p>
+                          </div>
+
+                          <div style={{ textAlign: "right" }}>
+                            <div style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>
+                              ₹{orderTotal}.00
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Items preview pills */}
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", backgroundColor: "#ffffff", padding: "8px 10px", borderRadius: "8px", border: "1px solid #f1f5f9" }}>
+                          {(order.items || []).slice(0, 5).map((itm, idx) => (
+                            <span 
+                              key={idx} 
+                              style={{ 
+                                fontSize: "11px", 
+                                color: "#334155", 
+                                backgroundColor: "#f1f5f9", 
+                                padding: "2px 8px", 
+                                borderRadius: "6px",
+                                fontWeight: "600"
+                              }}
+                            >
+                              {itm.name || itm.itemName} × {itm.qty || 1}
+                            </span>
+                          ))}
+                          {(order.items || []).length > 5 && (
+                            <span style={{ fontSize: "11px", color: "#64748b", padding: "2px 4px" }}>
+                              +{((order.items || []).length - 5)} more
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Action buttons */}
+                        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "2px" }}>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteHeldOrder(order.id, order.name || order.customerName)}
+                            style={{
+                              padding: "7px 12px",
+                              backgroundColor: "#fee2e2",
+                              color: "#dc2626",
+                              border: "none",
+                              borderRadius: "8px",
+                              fontWeight: "700",
+                              fontSize: "12px",
+                              cursor: "pointer",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "4px"
+                            }}
+                          >
+                            <span>🗑️</span>
+                            <span>Delete / நீக்கு</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleInitiateResumeOrder(order)}
+                            style={{
+                              padding: "7px 16px",
+                              backgroundColor: "#2563eb",
+                              color: "#ffffff",
+                              border: "none",
+                              borderRadius: "8px",
+                              fontWeight: "800",
+                              fontSize: "12px",
+                              cursor: "pointer",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "4px",
+                              boxShadow: "0 2px 8px rgba(37, 99, 235, 0.25)"
+                            }}
+                          >
+                            <span>⏵</span>
+                            <span>Restore to Cart / தொடர்க</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: "12px", marginTop: "14px", display: "flex", justifyContent: "flex-end" }}>
+              <button 
+                type="button" 
+                onClick={() => setShowResumeModal(false)} 
+                style={{ padding: "8px 20px", backgroundColor: "#f1f5f9", color: "#334155", border: "1px solid #cbd5e1", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CONFLICT RESOLUTION MODAL */}
+      {holdConflictModal.show && holdConflictModal.pendingOrder && (
+        <div style={styles.modalOverlay} onClick={() => setHoldConflictModal({ show: false, pendingOrder: null })}>
+          <div style={{ ...styles.modalBox, maxWidth: "440px" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px" }}>
+              <span style={{ fontSize: "24px" }}>⚠️</span>
+              <h3 style={{ margin: 0, color: "#0f172a", fontSize: "17px", fontWeight: "800" }}>
+                Active Cart Already Has Items
+              </h3>
+            </div>
+            
+            <p style={{ margin: "0 0 16px 0", fontSize: "13.5px", color: "#475569", lineHeight: "1.5" }}>
+              You currently have <strong>{totalBillItemsCount} item(s) (₹{totalBillAmount}.00)</strong> in the active cart. What would you like to do before restoring <strong>"{holdConflictModal.pendingOrder.name || holdConflictModal.pendingOrder.customerName || 'Held Bill'}"</strong>?
+            </p>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+              <button
+                type="button"
+                onClick={() => handleExecuteResumeOrder(holdConflictModal.pendingOrder, true)}
+                style={{
+                  padding: "12px 14px",
+                  backgroundColor: "#fff7ed",
+                  color: "#ea580c",
+                  border: "1.5px solid #fed7aa",
+                  borderRadius: "10px",
+                  fontWeight: "800",
+                  fontSize: "13.5px",
+                  cursor: "pointer",
+                  textAlign: "left",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px"
+                }}
+              >
+                <span>⏸️</span>
+                <div>
+                  <div style={{ fontWeight: "800" }}>Hold Current Bill & Restore</div>
+                  <div style={{ fontSize: "11px", color: "#9a3412", fontWeight: "500" }}>Saves current cart items as a new held bill first</div>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleExecuteResumeOrder(holdConflictModal.pendingOrder, false)}
+                style={{
+                  padding: "12px 14px",
+                  backgroundColor: "#fef2f2",
+                  color: "#dc2626",
+                  border: "1.5px solid #fecaca",
+                  borderRadius: "10px",
+                  fontWeight: "800",
+                  fontSize: "13.5px",
+                  cursor: "pointer",
+                  textAlign: "left",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px"
+                }}
+              >
+                <span>🗑️</span>
+                <div>
+                  <div style={{ fontWeight: "800" }}>Discard Current Cart & Restore</div>
+                  <div style={{ fontSize: "11px", color: "#b91c1c", fontWeight: "500" }}>Replaces current cart with the held bill</div>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setHoldConflictModal({ show: false, pendingOrder: null })}
+                style={{
+                  padding: "10px 14px",
+                  backgroundColor: "#f1f5f9",
+                  color: "#475569",
+                  border: "1px solid #cbd5e1",
+                  borderRadius: "10px",
+                  fontWeight: "700",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  textAlign: "center",
+                  marginTop: "4px"
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* CHECKOUT MODAL */}
       {isCheckoutModalOpen && (
@@ -2421,13 +3231,24 @@ const styles = {
     position: "absolute",
     top: "8px",
     right: "8px",
-    backgroundColor: "#fc8019",
+    backgroundColor: "#dc2626",
     color: "#ffffff",
-    padding: "2px 8px",
-    borderRadius: "10px",
-    fontSize: "11px",
+    minWidth: "28px",
+    height: "28px",
+    borderRadius: "14px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: "13px",
     fontWeight: "800",
-    boxShadow: "0 2px 6px rgba(0,0,0,0.2)"
+    boxShadow: "0 3px 8px rgba(220, 38, 38, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25)",
+    border: "2px solid #ffffff",
+    padding: "0 4px",
+    boxSizing: "border-box",
+    lineHeight: "1",
+    zIndex: 2,
+    pointerEvents: "none",
+    userSelect: "none"
   },
 
   sectionTitle: { fontSize: "18px", fontWeight: "800", color: "#0f172a", marginBottom: "14px" },
