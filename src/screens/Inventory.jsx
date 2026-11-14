@@ -1,11 +1,11 @@
-// src/screens/Inventory.jsx
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
+import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 
 export default function Inventory() {
   const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => Boolean(localStorage.getItem("uid")));
   const [searchQuery, setSearchQuery] = useState("");
   const [modalVisible, setModalVisible] = useState(false);
   
@@ -14,7 +14,7 @@ export default function Inventory() {
   const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
 
   // Shop Mode: Local vs Global
-  const [appMode, setAppMode] = useState(() => localStorage.getItem("app_mode") || "local");
+  const [appMode] = useState(() => localStorage.getItem("app_mode") || "local");
   const isGlobalMode = appMode === "global";
 
   // Form states for Add/Edit
@@ -29,7 +29,6 @@ export default function Inventory() {
   useEffect(() => {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) {
-      setLoading(false);
       return;
     }
 
@@ -137,7 +136,17 @@ export default function Inventory() {
         // Update existing item
         await updateDoc(doc(db, "users", currentUid, colName, currentItemId), productData);
       } else {
-        // Add new item
+        // Add new item - verify subscription limit
+        const uDoc = await getDoc(doc(db, "users", currentUid));
+        const sub = resolveUserSubscription(uDoc.exists() ? uDoc.data() : {});
+        if (!canAddInventoryItem(items.length, sub.plan, sub.isExpired)) {
+          alert(
+            sub.isExpired
+              ? "Your subscription has expired. Please renew your plan to add new inventory items."
+              : `Your ${sub.plan} plan limit (${sub.limits.inventoryLimit} items) has been reached. Please upgrade to Pro for unlimited items.`
+          );
+          return;
+        }
         await addDoc(targetRef, productData);
       }
 

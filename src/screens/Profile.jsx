@@ -1,5 +1,3 @@
-// src/screens/Profile.jsx
-import React from "react";
 import { doc, setDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { signOut } from "firebase/auth";

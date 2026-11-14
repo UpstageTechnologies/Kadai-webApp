@@ -1,5 +1,4 @@
-// src/screens/Login.jsx
-import React, { useState } from "react";
+import { useState } from "react";
 import { signInWithEmailAndPassword } from "firebase/auth";
 import { doc, getDoc } from "firebase/firestore";
 import { auth, db } from "../utils/firebase";

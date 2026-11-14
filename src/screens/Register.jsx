@@ -1,8 +1,8 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { createUserWithEmailAndPassword } from "firebase/auth";
 import { auth, db } from "../utils/firebase";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { useNavigate, Link } from "react-router-dom";
+import { Link } from "react-router-dom";
 
 export default function Register() {
   const [shopName, setShopName] = useState("");
@@ -12,7 +12,6 @@ export default function Register() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
 
   const handleRegister = async (e) => {
     e.preventDefault();

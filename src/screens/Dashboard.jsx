@@ -5,12 +5,14 @@ import { db, auth } from "../utils/firebase";
 import { signOut } from "firebase/auth";
 import Profile from "./Profile";
 import Settings from "./Settings";
+import Subscription from "./Subscription";
+import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 
-export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState("sales");
+export default function Dashboard({ initialTab = "sales" }) {
+  const [activeTab, setActiveTab] = useState(initialTab);
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState(["All"]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => Boolean(localStorage.getItem("uid")));
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("All");
   
@@ -22,6 +24,7 @@ export default function Dashboard() {
   const [appMode, setAppMode] = useState(() => localStorage.getItem("app_mode") || "local");
   const isGlobalMode = appMode === "global";
   const [rawUserData, setRawUserData] = useState(null);
+  const userSubscription = resolveUserSubscription(rawUserData);
 
   // Shop Mode Dropdown State and Dynamic Coordinates
   const [shopModeDropdownOpen, setShopModeDropdownOpen] = useState(false);
@@ -229,69 +232,64 @@ export default function Dashboard() {
 
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) {
-      setLoading(false);
       return;
     }
 
-    const fetchUserData = async () => {
-      try {
-        const userDocRef = doc(db, "users", currentUid);
-        const userSnap = await getDoc(userDocRef);
-        if (userSnap.exists()) {
-          const data = userSnap.data();
-          setRawUserData(data);
-          const sType = (data.shopType || data.shop_type || data.businessType || "").trim();
-          if (sType) {
-            setShopType(sType);
-            localStorage.setItem("shop_type", sType);
-          }
-          const isRest = sType.toLowerCase() === "restaurant";
-          const activeStoreName = isGlobalMode
-            ? (data.global_shopName || data.globalStoreName || data.shopName || data.storeName || "Global Shop")
-            : (data.local_shopName || data.localStoreName || data.shopName || data.storeName || (isRest ? "Restaurant POS" : "Local Shop"));
+    const userDocRef = doc(db, "users", currentUid);
+    const unsubscribeUser = onSnapshot(userDocRef, (userSnap) => {
+      if (userSnap.exists()) {
+        const data = userSnap.data();
+        setRawUserData(data);
+        const sType = (data.shopType || data.shop_type || data.businessType || "").trim();
+        if (sType) {
+          setShopType(sType);
+          localStorage.setItem("shop_type", sType);
+        }
+        const isRest = sType.toLowerCase() === "restaurant";
+        const activeStoreName = isGlobalMode
+          ? (data.global_shopName || data.globalStoreName || data.shopName || data.storeName || "Global Shop")
+          : (data.local_shopName || data.localStoreName || data.shopName || data.storeName || (isRest ? "Restaurant POS" : "Local Shop"));
 
-          setUserProfile({
-            name: data.name || auth.currentUser?.displayName || (isRest ? "Restaurant Manager" : "Store Owner"),
-            email: data.email || auth.currentUser?.email || "",
-            phone: data.phone || "",
-            storeName: activeStoreName,
-            profileImage: (isGlobalMode ? data.global_shopLogo : data.local_shopLogo) || data.profileImage || data.shopLogo || ""
-          });
-          if (data.settings) {
-            setStoreSettings(data.settings);
-          }
+        setUserProfile({
+          name: data.name || auth.currentUser?.displayName || (isRest ? "Restaurant Manager" : "Store Owner"),
+          email: data.email || auth.currentUser?.email || "",
+          phone: data.phone || "",
+          storeName: activeStoreName,
+          profileImage: (isGlobalMode ? data.global_shopLogo : data.local_shopLogo) || data.profileImage || data.shopLogo || ""
+        });
+        if (data.settings) {
+          setStoreSettings(data.settings);
+        }
 
-          const modeKey = isRest ? "restaurant" : (isGlobalMode ? "global" : "local");
-          const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
-          if (data.speedDialSlots?.[modeKey]) {
-            setSpeedDialSlots(data.speedDialSlots[modeKey]);
-            localStorage.setItem(speedDialStorageKey, JSON.stringify(data.speedDialSlots[modeKey]));
-          } else {
-            const savedSlots = localStorage.getItem(speedDialStorageKey);
-            if (savedSlots) {
-              try { 
-                setSpeedDialSlots(JSON.parse(savedSlots)); 
-              } catch (err) {
-                console.warn("Could not parse speed dial slots:", err);
-              }
-            }
-          }
-
-          // Load local cached held orders for immediate availability
-          const savedHeld = localStorage.getItem(`held_orders_${currentUid}`);
-          if (savedHeld) {
+        const modeKey = isRest ? "restaurant" : (isGlobalMode ? "global" : "local");
+        const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
+        if (data.speedDialSlots?.[modeKey]) {
+          setSpeedDialSlots(data.speedDialSlots[modeKey]);
+          localStorage.setItem(speedDialStorageKey, JSON.stringify(data.speedDialSlots[modeKey]));
+        } else {
+          const savedSlots = localStorage.getItem(speedDialStorageKey);
+          if (savedSlots) {
             try { 
-              setHeldOrders(JSON.parse(savedHeld)); 
+              setSpeedDialSlots(JSON.parse(savedSlots)); 
             } catch (err) {
-              console.warn("Could not parse saved held orders:", err);
+              console.warn("Could not parse speed dial slots:", err);
             }
           }
         }
-      } catch (err) {
-        console.error("Error fetching user profile:", err);
+
+        // Load local cached held orders for immediate availability
+        const savedHeld = localStorage.getItem(`held_orders_${currentUid}`);
+        if (savedHeld) {
+          try { 
+            setHeldOrders(JSON.parse(savedHeld)); 
+          } catch (err) {
+            console.warn("Could not parse saved held orders:", err);
+          }
+        }
       }
-    };
-    fetchUserData();
+    }, (err) => {
+      console.error("Error subscribing to user profile:", err);
+    });
 
     // 1. Items Sync (Listens to restaurant_menu for Restaurant, global_inventory for Global, inventory for Local)
     const collectionName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
@@ -376,6 +374,7 @@ export default function Dashboard() {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
       window.removeEventListener("resize", () => setProfileDropdownOpen(false));
+      unsubscribeUser();
       unsubscribeInventory();
       unsubscribeOrders();
       unsubscribeActiveCart();
@@ -957,6 +956,16 @@ export default function Dashboard() {
   };
 
   const openAddModal = () => {
+    if (!canAddInventoryItem(products.length, userSubscription.plan, userSubscription.isExpired)) {
+      const limit = userSubscription.limits.inventoryLimit;
+      const msg = userSubscription.isExpired
+        ? "Your subscription has expired. Please renew your plan to add new inventory items."
+        : `Your ${userSubscription.plan} plan limit of ${limit} items has been reached. Please upgrade to Pro for unlimited items.`;
+      if (window.confirm(`${msg}\n\nWould you like to upgrade your subscription now?`)) {
+        setActiveTab("subscription");
+      }
+      return;
+    }
     setIsEditing(false);
     setEditId(null);
     setName("");
@@ -985,6 +994,16 @@ export default function Dashboard() {
     try {
       const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
       if (!currentUid) return;
+
+      if (!isEditing && !canAddInventoryItem(products.length, userSubscription.plan, userSubscription.isExpired)) {
+        const limit = userSubscription.limits.inventoryLimit;
+        alert(
+          userSubscription.isExpired
+            ? "Your subscription has expired. Please renew to add new items."
+            : `Your ${userSubscription.plan} plan limit (${limit} items) has been reached. Upgrade to Pro for unlimited items.`
+        );
+        return;
+      }
 
       const targetCol = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
       const productData = {
@@ -1173,6 +1192,30 @@ export default function Dashboard() {
                 }}>
                   {isRestaurant ? "RESTAURANT" : isGlobalMode ? "GLOBAL SHOP" : "LOCAL SHOP"}
                 </span>
+                <span 
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveTab("subscription");
+                  }}
+                  style={{
+                    backgroundColor: userSubscription.plan === "Pro" ? "#fef3c7" : userSubscription.plan === "Premium" ? "#ecfdf5" : "#e0e7ff",
+                    color: userSubscription.plan === "Pro" ? "#b45309" : userSubscription.plan === "Premium" ? "#047857" : "#4338ca",
+                    border: `1px solid ${userSubscription.plan === "Pro" ? "#fde68a" : userSubscription.plan === "Premium" ? "#a7f3d0" : "#c7d2fe"}`,
+                    fontSize: "9.5px",
+                    fontWeight: "800",
+                    padding: "1.5px 7px",
+                    borderRadius: "10px",
+                    letterSpacing: "0.5px",
+                    cursor: "pointer",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "3px"
+                  }}
+                  title={`Active Plan: ${userSubscription.plan} (${userSubscription.remainingDays} days remaining). Click to manage subscription.`}
+                >
+                  👑 {userSubscription.plan.toUpperCase()}
+                  {userSubscription.isExpired && " (EXPIRED)"}
+                </span>
               </div>
             </div>
           </div>
@@ -1202,6 +1245,30 @@ export default function Dashboard() {
           </button>
           <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
             📋 Orders ({ordersList.length})
+          </button>
+          <button 
+            onClick={() => setActiveTab("subscription")} 
+            style={{ 
+              ...styles.navBtn, 
+              backgroundColor: activeTab === "subscription" ? "#ffedd5" : "transparent", 
+              color: activeTab === "subscription" ? "#fc8019" : "#64748b",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px"
+            }}
+          >
+            <span>👑 Plans</span>
+            <span style={{
+              backgroundColor: userSubscription.plan === "Pro" ? "#f59e0b" : userSubscription.plan === "Premium" ? "#10b981" : "#6366f1",
+              color: "#ffffff",
+              borderRadius: "6px",
+              padding: "1px 6px",
+              fontSize: "10px",
+              fontWeight: "800",
+              letterSpacing: "0.5px"
+            }}>
+              {userSubscription.plan.toUpperCase()}
+            </span>
           </button>
           <button 
             type="button"
@@ -1343,6 +1410,13 @@ export default function Dashboard() {
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "settings" ? "#fff7ed" : "transparent", color: activeTab === "settings" ? "#fc8019" : "#334155" }}
           >
             ⚙️ Settings
+          </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("subscription"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "subscription" ? "#fff7ed" : "transparent", color: activeTab === "subscription" ? "#fc8019" : "#334155" }}
+          >
+            👑 Subscription & Plans
           </button>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <button 
@@ -1897,6 +1971,21 @@ export default function Dashboard() {
             storeSettings={storeSettings} 
             setStoreSettings={setStoreSettings} 
             setPopupModal={setPopupModal} 
+          />
+        )}
+
+        {/* SUBSCRIPTION PAGE TAB */}
+        {activeTab === "subscription" && (
+          <Subscription 
+            onBack={() => setActiveTab("sales")}
+            onSubscriptionUpdated={async () => {
+              const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+              if (currentUid) {
+                const snap = await getDoc(doc(db, "users", currentUid));
+                if (snap.exists()) setRawUserData(snap.data());
+              }
+            }}
+            inventoryCount={products.length}
           />
         )}
 
