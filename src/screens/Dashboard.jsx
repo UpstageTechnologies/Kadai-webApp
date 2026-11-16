@@ -7,6 +7,7 @@ import Profile from "./Profile";
 import Settings from "./Settings";
 import Subscription from "./Subscription";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
+import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 
 export default function Dashboard({ initialTab = "sales" }) {
   const [activeTab, setActiveTab] = useState(initialTab);
@@ -86,6 +87,18 @@ export default function Dashboard({ initialTab = "sales" }) {
   // User Profile & Settings States
   const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store", profileImage: "" });
   const [storeSettings, setStoreSettings] = useState({ upiId: "kadaippro@okaxis", allowCash: true, allowUpi: true, allowCard: true });
+  const [printSettings, setPrintSettings] = useState(() => {
+    try {
+      const currentUid = localStorage.getItem("uid") || "";
+      if (currentUid) {
+        const saved = localStorage.getItem(`kadai_print_settings_${currentUid}`);
+        if (saved) return normalizePrintSettings(JSON.parse(saved));
+      }
+    } catch (e) {
+      console.warn("Could not load local cached print settings:", e);
+    }
+    return getDefaultPrintSettings();
+  });
 
   // Checkout Modal State
   const [isCheckoutModalOpen, setIsCheckoutModalOpen] = useState(false);
@@ -259,6 +272,15 @@ export default function Dashboard({ initialTab = "sales" }) {
         });
         if (data.settings) {
           setStoreSettings(data.settings);
+        }
+        if (data.printSettings || data.settings?.print) {
+          const loadedPrint = normalizePrintSettings(data.printSettings || data.settings?.print);
+          setPrintSettings(loadedPrint);
+          try {
+            localStorage.setItem(`kadai_print_settings_${currentUid}`, JSON.stringify(loadedPrint));
+          } catch (storageErr) {
+            console.warn("Could not cache print settings locally:", storageErr);
+          }
         }
 
         const modeKey = isRest ? "restaurant" : (isGlobalMode ? "global" : "local");
@@ -875,75 +897,90 @@ export default function Dashboard({ initialTab = "sales" }) {
         }
       }
 
+      const completedOrderData = {
+        id: bNo || "ORD-PENDING",
+        billNo: bNo,
+        billDate: bDate,
+        createdAt: new Date(),
+        items: [...currentBill],
+        totalAmount: totalAmt,
+        total: totalAmt,
+        customerName: customerName.trim() || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
+        customerPhone: customerPhone.trim() || "N/A",
+        paymentMethod: paymentMethod,
+        paymentMode: paymentMethod.toUpperCase(),
+      };
+
       setIsCheckoutModalOpen(false);
       setCustomerName("");
       setCustomerPhone("");
       setCurrentBill([]);
       setActiveResumedOrderId(null);
-      setPopupModal({ show: true, message: "Payment Successful & Order Recorded! 🎉" });
+      setPopupModal({ 
+        show: true, 
+        message: "Payment Successful & Order Recorded! 🎉",
+        lastOrder: completedOrderData 
+      });
     } catch (err) {
       console.error("Checkout error:", err);
       alert("Checkout failed: " + err.message);
     }
   };
 
-  const handlePrintBill = (order) => {
-    const printWindow = window.open('', '_blank', 'width=400,height=600');
-    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : new Date().toLocaleString();
-    const itemsHtml = (order.items || []).map(i => `
-      <tr>
-        <td style="padding: 4px 0;">${i.name || i.itemName}</td>
-        <td style="text-align: center; padding: 4px 0;">${i.qty}</td>
-        <td style="text-align: right; padding: 4px 0;">₹${(i.price || i.salesPrice || 0) * i.qty}</td>
-      </tr>
-    `).join('');
+  const handlePrintBill = (order, docType = "posReceipt") => {
+    if (!order) return;
+    try {
+      const orderDate = order.createdAt?.toDate 
+        ? order.createdAt.toDate().toLocaleString("en-IN") 
+        : (order.createdAt ? new Date(order.createdAt).toLocaleString("en-IN") : new Date().toLocaleString("en-IN"));
 
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>Invoice - Kadai Pro</title>
-          <style>
-            body { font-family: monospace; padding: 20px; color: #000; width: 300px; margin: 0 auto; }
-            h2, p { text-align: center; margin: 5px 0; }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
-            th { border-bottom: 1px dashed #000; padding-bottom: 4px; text-align: left; }
-            .total { border-top: 1px dashed #000; margin-top: 10px; padding-top: 8px; font-weight: bold; display: flex; justify-content: space-between; }
-          </style>
-        </head>
-        <body>
-          <h2>${userProfile.storeName}</h2>
-          <p>Store Billing Receipt</p>
-          <p style="font-size: 11px; color: #555;">Admin / Billed By: ${userProfile.name || "Store Owner"}</p>
-          <p style="font-size: 11px; color: #555;">Customer: ${order.customerName || "Walk-in"}</p>
-          <p style="font-size: 11px; color: #555;">Payment: ${order.paymentMethod || order.paymentMode || "Cash"}</p>
-          <p style="font-size: 11px; color: #555;">Date: ${orderDate}</p>
-          <hr style="border: 0; border-top: 1px dashed #000;" />
-          <table>
-            <thead>
-              <tr>
-                <th>Item</th>
-                <th style="text-align: center;">Qty</th>
-                <th style="text-align: right;">Amt</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${itemsHtml}
-            </tbody>
-          </table>
-          <div class="total">
-            <span>TOTAL:</span>
-            <span>₹${order.totalAmount || order.total || 0}</span>
-          </div>
-          <p style="margin-top: 20px; font-size: 11px; text-align: center;">*** Thank You Come Again ***</p>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
-    printWindow.focus();
-    setTimeout(() => {
-      printWindow.print();
-      printWindow.close();
-    }, 500);
+      const rawItems = order.items || [];
+      const subtotal = rawItems.reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
+      const totalAmount = Number(order.totalAmount || order.total || subtotal);
+
+      const docData = {
+        id: order.id || order.billNo || "ORD-SALE",
+        billNo: order.billNo || (order.id ? "#" + String(order.id).slice(-6).toUpperCase() : "B-SALE"),
+        orderDate: orderDate,
+        docTitle: docType === "quotation" ? "QUOTATION" : docType === "salesInvoice" ? "TAX INVOICE" : docType === "purchaseInvoice" ? "PURCHASE INVOICE" : "STORE RECEIPT",
+        paymentMethod: order.paymentMethod || order.paymentMode || "Cash",
+        customerName: order.customerName || "Walk-in Customer",
+        customerPhone: order.customerPhone || "",
+        customerAddress: order.customerAddress || "",
+        customerGst: order.customerGst || "",
+        billedBy: order.billedBy || userProfile.name || "Store Admin",
+        storeName: userProfile.storeName || "Kadai Store",
+        storeAddress: userProfile.address || rawUserData?.address?.fullAddress || "",
+        storePhone: userProfile.phone || rawUserData?.phone || "",
+        storeEmail: userProfile.email || rawUserData?.email || "",
+        storeGst: userProfile.gst || userProfile.gstin || rawUserData?.gstin || rawUserData?.gst || "",
+        storeLogo: userProfile.profileImage || "",
+        upiId: storeSettings.upiId || "",
+        items: rawItems.map(i => ({
+          name: i.name || i.itemName || "Item",
+          itemName: i.name || i.itemName || "Item",
+          brand: i.brand || "",
+          hsn: i.hsn || "",
+          qty: Number(i.qty || 1),
+          price: Number(i.price || i.salesPrice || 0),
+          salesPrice: Number(i.price || i.salesPrice || 0),
+          discount: Number(i.discount || 0),
+          total: (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)),
+        })),
+        subtotal: subtotal,
+        discountTotal: Number(order.discountTotal || 0),
+        taxTotal: Number(order.taxTotal || 0),
+        totalAmount: totalAmount,
+        total: totalAmount,
+        totalItems: rawItems.length,
+        totalQuantity: rawItems.reduce((acc, i) => acc + (Number(i.qty) || 1), 0),
+      };
+
+      executePrint(docData, printSettings, docType);
+    } catch (err) {
+      console.error("Print bill error:", err);
+      alert("Could not trigger print: " + err.message);
+    }
   };
 
   const handleImageChange = (e) => {
@@ -1970,6 +2007,8 @@ export default function Dashboard({ initialTab = "sales" }) {
             setUserProfile={setUserProfile} 
             storeSettings={storeSettings} 
             setStoreSettings={setStoreSettings} 
+            printSettings={printSettings}
+            setPrintSettings={setPrintSettings}
             setPopupModal={setPopupModal} 
           />
         )}
@@ -2232,7 +2271,24 @@ export default function Dashboard({ initialTab = "sales" }) {
                           <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>Customer: {order.customerName || "Walk-in"} | Payment: {order.paymentMethod || order.paymentMode || "Cash"}</p>
                           <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount || order.total}</strong></p>
                         </div>
-                        <button onClick={(e) => { e.stopPropagation(); handlePrintBill(order); }} style={styles.printBillBtn}>🖨️ Print Bill</button>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
+                          <button 
+                            type="button"
+                            onClick={() => handlePrintBill(order, "posReceipt")} 
+                            style={styles.printBillBtn}
+                            title="Print Thermal Receipt"
+                          >
+                            🧾 Receipt
+                          </button>
+                          <button 
+                            type="button"
+                            onClick={() => handlePrintBill(order, "salesInvoice")} 
+                            style={{ ...styles.printBillBtn, backgroundColor: "#0f172a", color: "#ffffff", borderColor: "#0f172a" }}
+                            title="Print A4 / Sheet Tax Invoice"
+                          >
+                            📄 Invoice
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -2695,8 +2751,27 @@ export default function Dashboard({ initialTab = "sales" }) {
               <span style={{ color: "#fc8019" }}>₹{selectedOrderDetails.totalAmount || selectedOrderDetails.total}</span>
             </div>
             <div style={{ display: "flex", gap: "8px", marginTop: "16px" }}>
-              <button onClick={() => handlePrintBill(selectedOrderDetails)} style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}>Print Receipt</button>
-              <button onClick={() => setSelectedOrderDetails(null)} style={{ flex: 1, padding: "10px", backgroundColor: "#e2e8f0", color: "#334155", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}>Close</button>
+              <button 
+                type="button" 
+                onClick={() => handlePrintBill(selectedOrderDetails, "posReceipt")} 
+                style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+              >
+                🧾 Print Receipt
+              </button>
+              <button 
+                type="button" 
+                onClick={() => handlePrintBill(selectedOrderDetails, "salesInvoice")} 
+                style={{ flex: 1, padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+              >
+                📄 A4 Invoice
+              </button>
+              <button 
+                type="button" 
+                onClick={() => setSelectedOrderDetails(null)} 
+                style={{ padding: "10px 14px", backgroundColor: "#e2e8f0", color: "#334155", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>
@@ -2717,9 +2792,29 @@ export default function Dashboard({ initialTab = "sales" }) {
             <h3 style={{ margin: "0 0 8px 0", color: "#0f172a", fontSize: "20px", fontWeight: "800" }}>
               {popupModal.message.includes("Payment") ? "Payment Successful!" : "Success!"}
             </h3>
-            <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "24px", lineHeight: "1.4" }}>{popupModal.message}</p>
+            <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "16px", lineHeight: "1.4" }}>{popupModal.message}</p>
             
+            {popupModal.lastOrder && (
+              <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
+                <button
+                  type="button"
+                  onClick={() => handlePrintBill(popupModal.lastOrder, "posReceipt")}
+                  style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                >
+                  🧾 Print Receipt
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePrintBill(popupModal.lastOrder, "salesInvoice")}
+                  style={{ flex: 1, padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                >
+                  📄 A4 Invoice
+                </button>
+              </div>
+            )}
+
             <button 
+              type="button"
               onClick={() => setPopupModal({ show: false, message: "" })} 
               style={{ width: "100%", padding: "12px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "10px", fontWeight: "800", fontSize: "15px", cursor: "pointer", boxShadow: "0 4px 12px rgba(22, 163, 74, 0.3)" }}
             >
