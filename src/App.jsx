@@ -5,6 +5,8 @@ import { auth } from "./utils/firebase";
 import Login from "./screens/Login";
 import Register from "./screens/Register";
 import Dashboard from "./screens/Dashboard";
+import WaiterOrder from "./screens/WaiterOrder";
+import KitchenDisplay from "./screens/KitchenDisplay";
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(() => !!localStorage.getItem("uid"));
@@ -16,8 +18,10 @@ export default function App() {
         localStorage.setItem("uid", user.uid);
         setIsAuthenticated(true);
       } else {
-        // If no user from Firebase and no local token, mark unauthenticated
-        if (!localStorage.getItem("uid")) {
+        // If no user from Firebase Auth, keep authenticated if staff logged in with uid in localStorage
+        if (localStorage.getItem("uid")) {
+          setIsAuthenticated(true);
+        } else {
           setIsAuthenticated(false);
         }
       }
@@ -26,6 +30,13 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  const getHomeRedirect = () => {
+    const staffRole = (localStorage.getItem("staff_role") || "").toLowerCase();
+    if (staffRole === "waiter") return "/waiter";
+    if (staffRole === "kitchen") return "/kitchen";
+    return "/dashboard";
+  };
 
   if (loading && !localStorage.getItem("uid")) {
     return (
@@ -41,11 +52,14 @@ export default function App() {
   return (
     <Router>
       <Routes>
-        <Route path="/login" element={!isAuthenticated ? <Login /> : <Navigate to="/dashboard" replace />} />
-        <Route path="/register" element={!isAuthenticated ? <Register /> : <Navigate to="/dashboard" replace />} />
+        <Route path="/login" element={!isAuthenticated ? <Login /> : <Navigate to={getHomeRedirect()} replace />} />
+        <Route path="/register" element={!isAuthenticated ? <Register /> : <Navigate to={getHomeRedirect()} replace />} />
         <Route path="/dashboard" element={isAuthenticated ? <Dashboard key="dash" initialTab="sales" /> : <Navigate to="/login" replace />} />
         <Route path="/subscription" element={isAuthenticated ? <Dashboard key="sub" initialTab="subscription" /> : <Navigate to="/login" replace />} />
-        <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/login"} replace />} />
+        <Route path="/staff" element={isAuthenticated ? <Dashboard key="staff" initialTab="staff" /> : <Navigate to="/login" replace />} />
+        <Route path="/waiter" element={isAuthenticated ? <WaiterOrder /> : <Navigate to="/login" replace />} />
+        <Route path="/kitchen" element={isAuthenticated ? <KitchenDisplay /> : <Navigate to="/login" replace />} />
+        <Route path="*" element={<Navigate to={isAuthenticated ? getHomeRedirect() : "/login"} replace />} />
       </Routes>
     </Router>
   );

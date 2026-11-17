@@ -6,6 +6,7 @@ import { signOut } from "firebase/auth";
 import Profile from "./Profile";
 import Settings from "./Settings";
 import Subscription from "./Subscription";
+import StaffManagement from "./StaffManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 
@@ -111,6 +112,18 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   // View Bill Details Modal State (Receipt Popup)
   const [selectedOrderDetails, setSelectedOrderDetails] = useState(null);
+
+  // Restaurant Table Orders & KOT States
+  const [kitchenOrders, setKitchenOrders] = useState([]);
+  const [showTableOrdersModal, setShowTableOrdersModal] = useState(false);
+  const [tableOrderTab, setTableOrderTab] = useState("served"); // "served" | "kitchen" | "all"
+  const [activeTableOrderId, setActiveTableOrderId] = useState(null);
+  const [activeTableOrderInfo, setActiveTableOrderInfo] = useState(null);
+  const [sendKotWithCheckout, setSendKotWithCheckout] = useState(true);
+  const [checkoutOrderType, setCheckoutOrderType] = useState("dine-in"); // "dine-in" | "parcel"
+  const [showDirectParcelModal, setShowDirectParcelModal] = useState(false);
+  const [directParcelName, setDirectParcelName] = useState("");
+  const [directParcelPhone, setDirectParcelPhone] = useState("");
 
   // Modal States for Add & Edit Inventory
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -392,6 +405,19 @@ export default function Dashboard({ initialTab = "sales" }) {
       console.warn("Held orders sync listener notice:", err);
     });
 
+    // 5. Real-time Kitchen Orders (KOT & Live Table Orders) Sync
+    const kitchenOrdersRef = collection(db, "users", currentUid, "kitchen_orders");
+    const unsubscribeKitchenOrders = onSnapshot(kitchenOrdersRef, (snapshot) => {
+      const list = snapshot.docs.map(docSnap => ({
+        id: docSnap.id,
+        ...docSnap.data()
+      }));
+      list.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
+      setKitchenOrders(list);
+    }, (err) => {
+      console.warn("Kitchen orders sync listener notice:", err);
+    });
+
     return () => {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
@@ -401,8 +427,186 @@ export default function Dashboard({ initialTab = "sales" }) {
       unsubscribeOrders();
       unsubscribeActiveCart();
       unsubscribeHeldOrders();
+      unsubscribeKitchenOrders();
     };
   }, [isRestaurant, appMode]);
+
+  // Derived Kitchen & Table Orders
+  const activeKitchenOrders = kitchenOrders.filter((o) => o.status !== "completed");
+  const servedTableOrders = activeKitchenOrders.filter((o) => o.status === "served" || o.readyForBilling === true);
+  const cookingTableOrders = activeKitchenOrders.filter((o) => o.status === "pending" || o.status === "preparing" || o.status === "ready");
+
+  const getOrderElapsedMinutes = (createdAtMs) => {
+    if (!createdAtMs) return "Just now";
+    const diff = Math.floor((Date.now() - createdAtMs) / 60000);
+    if (diff <= 0) return "Just now";
+    if (diff === 1) return "1 min ago";
+    if (diff < 60) return `${diff}m ago`;
+    return `${Math.floor(diff / 60)}h ${diff % 60}m ago`;
+  };
+
+  // 1. Load Table order items into current billing register with full prices & amounts
+  const handleLoadTableOrderToBill = (order) => {
+    if (currentBill.length > 0) {
+      if (!window.confirm(`Cart already has ${currentBill.length} item(s). Replace with items from ${order.tableNo}?`)) {
+        return;
+      }
+    }
+
+    const formattedItems = (order.items || []).map((item, idx) => ({
+      id: item.foodId || item.id || `kot_item_${idx}`,
+      barcode: item.foodId || item.id || `kot_item_${idx}`,
+      name: item.name || "Food Item",
+      itemName: item.name || "Food Item",
+      price: Number(item.price || item.salesPrice || 0),
+      salesPrice: Number(item.price || item.salesPrice || 0),
+      purchasePrice: Number(item.purchasePrice || 0),
+      portion: item.portion || "Standard",
+      qty: Number(item.qty || 1),
+      notes: item.notes || "",
+      image: item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
+      imageUrl: item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
+    }));
+
+    setCurrentBill(formattedItems);
+    setCustomerName(order.customerName || order.tableNo);
+    if (order.customerPhone) setCustomerPhone(order.customerPhone);
+    setActiveTableOrderId(order.id);
+    setActiveTableOrderInfo({
+      id: order.id,
+      tableNo: order.tableNo,
+      orderNumber: order.orderNumber,
+      waiterName: order.waiterName,
+      createdAtMs: order.createdAtMs,
+    });
+    setShowTableOrdersModal(false);
+    setIsCheckoutModalOpen(true);
+    syncWebCartToCloud(formattedItems);
+  };
+
+  // 2. Print Pre-Bill / Table Slip (with full amounts) before formal checkout
+  const handlePrintPreBill = (order) => {
+    if (!order) return;
+    const subtotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
+    const preBillData = {
+      ...order,
+      billNo: `PRE-${order.orderNumber || "BILL"}`,
+      docTitle: "PRE-BILL / TABLE SLIP",
+      paymentMethod: "Pending (Pre-Bill)",
+      customerName: order.tableNo,
+      items: order.items || [],
+      totalAmount: order.totalAmount || subtotal,
+      total: order.totalAmount || subtotal,
+      createdAt: order.createdAtMs ? new Date(order.createdAtMs) : new Date(),
+    };
+    handlePrintBill(preBillData, "posReceipt");
+  };
+
+  // 3. Mark Table Order Completed
+  const handleMarkOrderCompleted = async (orderId) => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!currentUid || !orderId) return;
+    try {
+      await updateDoc(doc(db, "users", currentUid, "kitchen_orders", orderId), {
+        status: "completed",
+        billedAt: serverTimestamp(),
+        billedAtMs: Date.now(),
+        readyForBilling: false,
+      });
+      try {
+        await updateDoc(doc(db, "kitchen_orders", orderId), {
+          status: "completed",
+          billedAt: serverTimestamp(),
+          billedAtMs: Date.now(),
+          readyForBilling: false,
+        });
+      } catch (_) {}
+      if (activeTableOrderId === orderId) {
+        setActiveTableOrderId(null);
+        setActiveTableOrderInfo(null);
+      }
+    } catch (err) {
+      console.error("Error marking order completed:", err);
+    }
+  };
+
+  // 4. Send Direct Parcel KOT to Kitchen & Packing Staff
+  const handleSendDirectParcelToKitchen = async () => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!currentUid) {
+      alert("Store connection missing.");
+      return;
+    }
+    if (currentBill.length === 0) {
+      alert("Please add food items to cart before sending parcel to kitchen.");
+      return;
+    }
+
+    const finalCustomer = (directParcelName || customerName || "Walk-in").trim();
+    const finalPhone = (directParcelPhone || customerPhone || "").trim();
+    const tableName = `🥡 PARCEL: ${finalCustomer}`;
+    const nowMs = Date.now();
+    const kotNumber = `KOT-${nowMs.toString().slice(-4)}`;
+
+    const sanitizedItems = currentBill.map((item) => ({
+      foodId: String(item.id || item.barcode || ""),
+      name: String(item.name || item.itemName || "Item").trim(),
+      portion: String(item.portion || "Standard").trim(),
+      price: Number(item.salesPrice || item.price || 0),
+      purchasePrice: Number(item.purchasePrice || 0),
+      qty: Math.max(1, Number(item.qty) || 1),
+      notes: String(item.notes || "").trim(),
+    }));
+
+    const safeTotalAmount = sanitizedItems.reduce((acc, i) => acc + i.price * i.qty, 0);
+    const safeTotalQty = sanitizedItems.reduce((acc, i) => acc + i.qty, 0);
+
+    const kotPayload = {
+      orderNumber: kotNumber,
+      tableNo: tableName,
+      waiterId: "COUNTER",
+      waiterName: "Counter Staff",
+      items: sanitizedItems, // In Kitchen Display & KOT print slips, prices/amounts are strictly NOT shown!
+      orderNotes: `Takeaway / Parcel for ${finalCustomer} ${finalPhone ? `(${finalPhone})` : ""}`,
+      orderType: "parcel",
+      customerName: finalCustomer,
+      customerPhone: finalPhone,
+      status: "pending",
+      readyForBilling: true,
+      totalAmount: safeTotalAmount,
+      totalItems: safeTotalQty,
+      masterUid: String(currentUid),
+      createdAtMs: nowMs,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    try {
+      const docRef = await addDoc(collection(db, "users", currentUid, "kitchen_orders"), kotPayload);
+      try {
+        await setDoc(doc(db, "kitchen_orders", docRef.id), {
+          ...kotPayload,
+          id: docRef.id,
+        });
+      } catch (_) {}
+
+      setActiveTableOrderId(docRef.id);
+      setActiveTableOrderInfo({
+        id: docRef.id,
+        tableNo: tableName,
+        orderNumber: kotNumber,
+        waiterName: "Counter Staff",
+      });
+      setCustomerName(finalCustomer);
+      if (finalPhone) setCustomerPhone(finalPhone);
+      setShowDirectParcelModal(false);
+
+      alert(`✅ Parcel KOT ${kotNumber} sent to Kitchen & Packing Staff! 🥡\nPacking staff will prepare food while you collect payment and print the customer bill.`);
+    } catch (err) {
+      console.error("Error creating direct parcel KOT:", err);
+      alert("Failed to send parcel order to kitchen: " + err.message);
+    }
+  };
 
   const handleLogout = async () => {
     try {
@@ -518,6 +722,8 @@ export default function Dashboard({ initialTab = "sales" }) {
   const clearCurrentBill = async () => {
     setCurrentBill([]);
     setActiveResumedOrderId(null);
+    setActiveTableOrderId(null);
+    setActiveTableOrderInfo(null);
     await syncWebCartToCloud([]);
   };
 
@@ -784,7 +990,9 @@ export default function Dashboard({ initialTab = "sales" }) {
         showResumeModal || 
         holdConflictModal.show || 
         selectedOrderDetails || 
-        popupModal.show
+        popupModal.show ||
+        showTableOrdersModal ||
+        showDirectParcelModal
       ) {
         return;
       }
@@ -826,7 +1034,9 @@ export default function Dashboard({ initialTab = "sales" }) {
     showResumeModal, 
     holdConflictModal.show, 
     selectedOrderDetails, 
-    popupModal.show
+    popupModal.show,
+    showTableOrdersModal,
+    showDirectParcelModal
   ]);
 
   const handleFinalCheckoutSubmit = async (e) => {
@@ -846,11 +1056,26 @@ export default function Dashboard({ initialTab = "sales" }) {
       const bNo = `${datePrefix}-${sequenceNum}`;
       const bDate = now.toLocaleDateString("en-GB");
       
+      const sanitizedBillItems = currentBill.map((i) => ({
+        id: String(i.id || i.barcode || ""),
+        barcode: String(i.barcode || i.id || ""),
+        name: String(i.name || i.itemName || "Item"),
+        itemName: String(i.name || i.itemName || "Item"),
+        price: Number(i.salesPrice || i.price || 0),
+        salesPrice: Number(i.salesPrice || i.price || 0),
+        purchasePrice: Number(i.purchasePrice || 0),
+        qty: Math.max(1, Number(i.qty) || 1),
+        portion: String(i.portion || "Standard"),
+        notes: String(i.notes || ""),
+        image: String(i.image || i.imageUrl || ""),
+        imageUrl: String(i.image || i.imageUrl || ""),
+      }));
+
       const saleRecord = {
         billNo: bNo,
         invoiceId: bNo,
         billDate: bDate,
-        items: currentBill,
+        items: sanitizedBillItems,
         total: totalAmt,
         totalAmount: totalAmt,
         profit: totalProfit,
@@ -870,18 +1095,22 @@ export default function Dashboard({ initialTab = "sales" }) {
         await addDoc(collection(db, "users", currentUid, "sales"), saleRecord);
 
         // 2. Transmit confirmation event to Mobile App
-        const cartRef = doc(db, "users", currentUid, "active_cart", "current");
-        await setDoc(cartRef, {
-          items: [],
-          updatedAt: serverTimestamp(),
-          lastConfirmedSale: {
-            billNo: bNo,
-            billDate: bDate,
-            items: currentBill,
-            total: totalAmt,
-            timestamp: Date.now()
-          }
-        });
+        try {
+          const cartRef = doc(db, "users", currentUid, "active_cart", "current");
+          await setDoc(cartRef, {
+            items: [],
+            updatedAt: serverTimestamp(),
+            lastConfirmedSale: {
+              billNo: bNo,
+              billDate: bDate,
+              items: sanitizedBillItems,
+              total: totalAmt,
+              timestamp: Date.now()
+            }
+          });
+        } catch (cartErr) {
+          console.warn("Active cart sync notice:", cartErr);
+        }
 
         // 3. Clean up active resumed held order if this sale finalized a held bill
         if (activeResumedOrderId) {
@@ -894,6 +1123,73 @@ export default function Dashboard({ initialTab = "sales" }) {
           setHeldOrders(updated);
           localStorage.setItem(`held_orders_${currentUid}`, JSON.stringify(updated));
           setActiveResumedOrderId(null);
+        }
+
+        // 4. Update and complete Table/KOT order if loaded
+        if (activeTableOrderId) {
+          try {
+            await updateDoc(doc(db, "users", currentUid, "kitchen_orders", activeTableOrderId), {
+              status: "completed",
+              billedAt: serverTimestamp(),
+              billedAtMs: Date.now(),
+              billNo: bNo,
+              readyForBilling: false,
+              finalAmount: totalAmt,
+            });
+            try {
+              await updateDoc(doc(db, "kitchen_orders", activeTableOrderId), {
+                status: "completed",
+                billedAt: serverTimestamp(),
+                billedAtMs: Date.now(),
+                billNo: bNo,
+                readyForBilling: false,
+                finalAmount: totalAmt,
+              });
+            } catch (_) {}
+          } catch (tErr) {
+            console.warn("Could not mark table KOT order completed:", tErr);
+          }
+        } else if (isRestaurant && sendKotWithCheckout) {
+          // If a direct restaurant sale was made at counter with KOT dispatch
+          try {
+            const isParcelOrder = checkoutOrderType === "parcel" || (customerName && customerName.toLowerCase().includes("parcel"));
+            const kotNum = `KOT-${Date.now().toString().slice(-4)}`;
+            const sanitizedKotItems = currentBill.map((item) => ({
+              foodId: String(item.id || item.barcode || ""),
+              name: String(item.name || item.itemName || "Item").trim(),
+              portion: String(item.portion || "Standard").trim(),
+              price: Number(item.salesPrice || item.price || 0),
+              purchasePrice: Number(item.purchasePrice || 0),
+              qty: Math.max(1, Number(item.qty) || 1),
+              notes: String(item.notes || "").trim(),
+            }));
+
+            const directKotPayload = {
+              orderNumber: kotNum,
+              tableNo: isParcelOrder ? `🥡 PARCEL: ${customerName.trim() || "Walk-in"}` : `Counter Table (${customerName.trim() || "Walk-in"})`,
+              waiterId: "COUNTER",
+              waiterName: "Counter Billing",
+              items: sanitizedKotItems,
+              orderNotes: `Direct bill: ${bNo}`,
+              orderType: isParcelOrder ? "parcel" : "dine-in",
+              customerName: customerName.trim() || "Walk-in Customer",
+              customerPhone: customerPhone.trim() || "",
+              status: "completed",
+              readyForBilling: false,
+              totalAmount: totalAmt,
+              totalItems: currentBill.reduce((sum, i) => sum + (Number(i.qty) || 1), 0),
+              masterUid: String(currentUid),
+              billNo: bNo,
+              billedAtMs: Date.now(),
+              createdAtMs: Date.now(),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            };
+
+            await addDoc(collection(db, "users", currentUid, "kitchen_orders"), directKotPayload);
+          } catch (kErr) {
+            console.warn("Could not record direct restaurant KOT:", kErr);
+          }
         }
       }
 
@@ -916,11 +1212,20 @@ export default function Dashboard({ initialTab = "sales" }) {
       setCustomerPhone("");
       setCurrentBill([]);
       setActiveResumedOrderId(null);
+      setActiveTableOrderId(null);
+      setActiveTableOrderInfo(null);
       setPopupModal({ 
         show: true, 
         message: "Payment Successful & Order Recorded! 🎉",
         lastOrder: completedOrderData 
       });
+
+      // Automatically execute print receipt for customer
+      try {
+        handlePrintBill(completedOrderData, "posReceipt");
+      } catch (pErr) {
+        console.warn("Auto-print receipt notice:", pErr);
+      }
     } catch (err) {
       console.error("Checkout error:", err);
       alert("Checkout failed: " + err.message);
@@ -1284,6 +1589,49 @@ export default function Dashboard({ initialTab = "sales" }) {
             📋 Orders ({ordersList.length})
           </button>
           <button 
+            onClick={() => setActiveTab("staff")} 
+            style={{ 
+              ...styles.navBtn, 
+              backgroundColor: activeTab === "staff" ? "#ffedd5" : "transparent", 
+              color: activeTab === "staff" ? "#fc8019" : "#64748b" 
+            }}
+          >
+            👥 Staff
+          </button>
+          {isRestaurant && (
+            <button 
+              type="button"
+              onClick={() => {
+                setTableOrderTab("served");
+                setShowTableOrdersModal(true);
+              }} 
+              style={{ 
+                ...styles.navBtn, 
+                backgroundColor: servedTableOrders.length > 0 ? "#dcfce7" : "transparent", 
+                color: servedTableOrders.length > 0 ? "#15803d" : "#64748b",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                fontWeight: servedTableOrders.length > 0 ? "800" : "600"
+              }}
+              title="Live Restaurant Table & KOT Orders"
+            >
+              <span>🍽️ Tables</span>
+              {activeKitchenOrders.length > 0 && (
+                <span style={{
+                  backgroundColor: servedTableOrders.length > 0 ? "#16a34a" : "#64748b",
+                  color: "#ffffff",
+                  borderRadius: "10px",
+                  padding: "1px 7px",
+                  fontSize: "11px",
+                  fontWeight: "800"
+                }}>
+                  {servedTableOrders.length > 0 ? `🔔 ${servedTableOrders.length}` : activeKitchenOrders.length}
+                </span>
+              )}
+            </button>
+          )}
+          <button 
             onClick={() => setActiveTab("subscription")} 
             style={{ 
               ...styles.navBtn, 
@@ -1455,6 +1803,32 @@ export default function Dashboard({ initialTab = "sales" }) {
           >
             👑 Subscription & Plans
           </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("staff"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "staff" ? "#fff7ed" : "transparent", color: activeTab === "staff" ? "#fc8019" : "#334155" }}
+          >
+            👥 Staff Accounts & Roles
+          </button>
+          <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
+          <a 
+            href="/waiter"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ ...styles.dropdownItem, textDecoration: "none", color: "#0284c7", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+          >
+            <span>🍽️ Open Waiter Portal</span>
+            <span style={{ fontSize: "11px" }}>↗</span>
+          </a>
+          <a 
+            href="/kitchen"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ ...styles.dropdownItem, textDecoration: "none", color: "#ea580c", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+          >
+            <span>👨‍🍳 Open Kitchen Display (KDS)</span>
+            <span style={{ fontSize: "11px" }}>↗</span>
+          </a>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <button 
             type="button"
@@ -1494,6 +1868,43 @@ export default function Dashboard({ initialTab = "sales" }) {
                   </span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  {isRestaurant && (
+                    <button 
+                      type="button"
+                      onClick={() => {
+                        setTableOrderTab(servedTableOrders.length > 0 ? "served" : "kitchen");
+                        setShowTableOrdersModal(true);
+                      }} 
+                      style={{
+                        backgroundColor: servedTableOrders.length > 0 ? "#dcfce7" : "#f1f5f9",
+                        border: servedTableOrders.length > 0 ? "1.5px solid #86efac" : "1.5px solid #cbd5e1",
+                        color: servedTableOrders.length > 0 ? "#15803d" : "#475569",
+                        padding: "4px 10px",
+                        borderRadius: "8px",
+                        fontWeight: "800",
+                        fontSize: "12px",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "5px"
+                      }}
+                      title="View Live Table Orders & KOT"
+                    >
+                      <span>🍽️ TABLES</span>
+                      {activeKitchenOrders.length > 0 && (
+                        <span style={{
+                          backgroundColor: servedTableOrders.length > 0 ? "#16a34a" : "#64748b",
+                          color: "#fff",
+                          borderRadius: "10px",
+                          padding: "0 6px",
+                          fontSize: "10.5px",
+                          fontWeight: "800"
+                        }}>
+                          {servedTableOrders.length > 0 ? `🔔 ${servedTableOrders.length}` : activeKitchenOrders.length}
+                        </span>
+                      )}
+                    </button>
+                  )}
                   <button 
                     type="button"
                     onClick={() => setShowResumeModal(true)} 
@@ -1548,6 +1959,50 @@ export default function Dashboard({ initialTab = "sales" }) {
                 </div>
               </div>
 
+              {/* Active Table Order Link Banner */}
+              {activeTableOrderId && activeTableOrderInfo && (
+                <div style={{
+                  backgroundColor: "#eff6ff",
+                  borderBottom: "1.5px solid #bfdbfe",
+                  padding: "8px 12px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "16px" }}>🍽️</span>
+                    <div>
+                      <div style={{ fontSize: "12.5px", fontWeight: "800", color: "#1e40af" }}>
+                        Billing Active: {activeTableOrderInfo.tableNo}
+                      </div>
+                      <div style={{ fontSize: "11px", color: "#3b82f6" }}>
+                        Waiter: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm("Unlink table order from current cart? (Items will stay)")) {
+                        setActiveTableOrderId(null);
+                        setActiveTableOrderInfo(null);
+                      }
+                    }}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "#64748b",
+                      cursor: "pointer",
+                      fontSize: "11px",
+                      fontWeight: "700",
+                      padding: "3px 6px"
+                    }}
+                  >
+                    Unlink ✕
+                  </button>
+                </div>
+              )}
+
               <div style={styles.posBillItemsList}>
                 {currentBill.length === 0 ? (
                   <div style={styles.posEmptyBox}>
@@ -1591,6 +2046,36 @@ export default function Dashboard({ initialTab = "sales" }) {
                   <span>Total / மொத்தம்:</span>
                   <span style={styles.posTotalPrice}>₹{totalBillAmount}.00</span>
                 </div>
+                {isRestaurant && (
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      setDirectParcelName(customerName || "");
+                      setShowDirectParcelModal(true);
+                    }}
+                    disabled={currentBill.length === 0}
+                    style={{ 
+                      width: "100%", 
+                      padding: "10px", 
+                      marginBottom: "10px",
+                      backgroundColor: currentBill.length === 0 ? "#f8fafc" : "#ffedd5", 
+                      color: currentBill.length === 0 ? "#94a3b8" : "#c2410c", 
+                      border: currentBill.length === 0 ? "1.5px solid #e2e8f0" : "1.5px solid #fdba74", 
+                      borderRadius: "10px", 
+                      fontWeight: "800", 
+                      fontSize: "13px", 
+                      cursor: currentBill.length === 0 ? "not-allowed" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: "6px"
+                    }}
+                    title="Send KOT to Kitchen & Packing Staff (No amounts shown to kitchen)"
+                  >
+                    <span>🥡</span>
+                    <span>Send Parcel to Kitchen / Packing (KOT)</span>
+                  </button>
+                )}
                 <div style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
                   <button 
                     type="button"
@@ -1744,6 +2229,57 @@ export default function Dashboard({ initialTab = "sales" }) {
 
             {/* RIGHT SIDE: Products Grid Matching Image 2 */}
             <div style={styles.posRightPane}>
+              {/* LIVE TABLE ORDERS SERVED BANNER (RESTAURANT MODE) */}
+              {isRestaurant && servedTableOrders.length > 0 && (
+                <div 
+                  onClick={() => {
+                    setTableOrderTab("served");
+                    setShowTableOrdersModal(true);
+                  }}
+                  style={{
+                    backgroundColor: "#ecfdf5",
+                    border: "1.5px solid #6ee7b7",
+                    borderRadius: "14px",
+                    padding: "12px 18px",
+                    marginBottom: "16px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    cursor: "pointer",
+                    boxShadow: "0 4px 14px rgba(16, 185, 129, 0.15)",
+                    transition: "all 0.2s ease"
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                    <div style={{ width: "38px", height: "38px", borderRadius: "10px", backgroundColor: "#10b981", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "20px" }}>
+                      🔔
+                    </div>
+                    <div>
+                      <div style={{ fontWeight: "800", color: "#065f46", fontSize: "14px" }}>
+                        {servedTableOrders.length} Table Order{servedTableOrders.length > 1 ? "s" : ""} Served — Ready to Bill! 🧾
+                      </div>
+                      <div style={{ fontSize: "12px", color: "#047857" }}>
+                        {servedTableOrders.map(o => o.tableNo).join(", ")} • Waiter marked food served. Click to load bill with amounts & print!
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{
+                    backgroundColor: "#059669",
+                    color: "#ffffff",
+                    padding: "8px 16px",
+                    borderRadius: "10px",
+                    fontWeight: "800",
+                    fontSize: "12.5px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px"
+                  }}>
+                    <span>Bill Tables ({servedTableOrders.length})</span>
+                    <span>→</span>
+                  </div>
+                </div>
+              )}
+
               {/* Top Compact Stat Cards Row & Welcome Banner on Right Side */}
               <div style={styles.salesStatsBanner}>
                 {/* Top Row: Welcome & Subtitle + Timeframe Selector */}
@@ -2026,6 +2562,11 @@ export default function Dashboard({ initialTab = "sales" }) {
             }}
             inventoryCount={products.length}
           />
+        )}
+
+        {/* STAFF MANAGEMENT TAB */}
+        {activeTab === "staff" && (
+          <StaffManagement onBack={() => setActiveTab("sales")} />
         )}
 
         {/* TAB 2: DASHBOARD */}
@@ -2635,6 +3176,76 @@ export default function Dashboard({ initialTab = "sales" }) {
                 <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>₹{totalBillAmount}.00</span>
               </div>
 
+              {/* Restaurant Mode Table / Parcel Indicator & Option */}
+              {isRestaurant && (
+                <div style={{ backgroundColor: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "10px", padding: "10px 12px" }}>
+                  {activeTableOrderId && activeTableOrderInfo ? (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <div>
+                        <div style={{ fontSize: "12.5px", fontWeight: "800", color: "#166534" }}>
+                          🍽️ Table Order: {activeTableOrderInfo.tableNo}
+                        </div>
+                        <div style={{ fontSize: "11px", color: "#15803d" }}>
+                          Waiter: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
+                        </div>
+                      </div>
+                      <span style={{ fontSize: "11px", fontWeight: "800", backgroundColor: "#16a34a", color: "#fff", padding: "2px 8px", borderRadius: "8px" }}>
+                        Active Table
+                      </span>
+                    </div>
+                  ) : (
+                    <div>
+                      <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+                        <button
+                          type="button"
+                          onClick={() => setCheckoutOrderType("dine-in")}
+                          style={{
+                            flex: 1,
+                            padding: "6px 10px",
+                            borderRadius: "8px",
+                            border: "none",
+                            fontWeight: "700",
+                            fontSize: "12px",
+                            cursor: "pointer",
+                            backgroundColor: checkoutOrderType === "dine-in" ? "#16a34a" : "#ffffff",
+                            color: checkoutOrderType === "dine-in" ? "#ffffff" : "#475569",
+                          }}
+                        >
+                          🍽️ Dine-in Table
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCheckoutOrderType("parcel")}
+                          style={{
+                            flex: 1,
+                            padding: "6px 10px",
+                            borderRadius: "8px",
+                            border: "none",
+                            fontWeight: "700",
+                            fontSize: "12px",
+                            cursor: "pointer",
+                            backgroundColor: checkoutOrderType === "parcel" ? "#ea580c" : "#ffffff",
+                            color: checkoutOrderType === "parcel" ? "#ffffff" : "#475569",
+                          }}
+                        >
+                          🥡 Parcel / Takeaway
+                        </button>
+                      </div>
+
+                      <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "#166534", fontWeight: "600", cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={sendKotWithCheckout}
+                          onChange={(e) => setSendKotWithCheckout(e.target.checked)}
+                          style={{ accentColor: "#16a34a" }}
+                        />
+                        <span>Send KOT to Kitchen / Packing Staff (No amounts shown)</span>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
                 <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
                   <label style={styles.label}>Customer Name (Optional)</label>
@@ -2726,6 +3337,444 @@ export default function Dashboard({ initialTab = "sales" }) {
                 <button type="button" onClick={() => setIsCheckoutModalOpen(false)} style={styles.cancelModalBtn}>Cancel</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* RESTAURANT LIVE TABLE ORDERS MODAL */}
+      {showTableOrdersModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowTableOrdersModal(false)}>
+          <div 
+            style={{ 
+              ...styles.modalBox, 
+              maxWidth: "820px", 
+              maxHeight: "90vh", 
+              display: "flex", 
+              flexDirection: "column",
+              padding: "24px"
+            }} 
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px", borderBottom: "1.5px solid #f1f5f9", paddingBottom: "12px" }}>
+              <div>
+                <h3 style={{ margin: 0, color: "#0f172a", fontSize: "20px", fontWeight: "800", display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span>🍽️</span>
+                  <span>Restaurant Table & KOT Orders</span>
+                </h3>
+                <p style={{ margin: "4px 0 0 0", fontSize: "13px", color: "#64748b" }}>
+                  Live orders from Waiters & Kitchen. Ready orders can be loaded with full prices into the billing register.
+                </p>
+              </div>
+              <button 
+                type="button" 
+                onClick={() => setShowTableOrdersModal(false)} 
+                style={{ background: "transparent", border: "none", fontSize: "20px", cursor: "pointer", color: "#64748b", fontWeight: "800", padding: "4px 8px" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Filter Tabs */}
+            <div style={{ display: "flex", gap: "8px", marginBottom: "16px", backgroundColor: "#f1f5f9", padding: "4px", borderRadius: "12px" }}>
+              <button
+                type="button"
+                onClick={() => setTableOrderTab("served")}
+                style={{
+                  flex: 1,
+                  padding: "10px 14px",
+                  borderRadius: "9px",
+                  border: "none",
+                  fontWeight: "800",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  backgroundColor: tableOrderTab === "served" ? "#ffffff" : "transparent",
+                  color: tableOrderTab === "served" ? "#15803d" : "#64748b",
+                  boxShadow: tableOrderTab === "served" ? "0 2px 6px rgba(0,0,0,0.06)" : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "6px"
+                }}
+              >
+                <span>🔔 Ready to Bill</span>
+                <span style={{ backgroundColor: "#dcfce7", color: "#166534", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
+                  {servedTableOrders.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTableOrderTab("kitchen")}
+                style={{
+                  flex: 1,
+                  padding: "10px 14px",
+                  borderRadius: "9px",
+                  border: "none",
+                  fontWeight: "800",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  backgroundColor: tableOrderTab === "kitchen" ? "#ffffff" : "transparent",
+                  color: tableOrderTab === "kitchen" ? "#ea580c" : "#64748b",
+                  boxShadow: tableOrderTab === "kitchen" ? "0 2px 6px rgba(0,0,0,0.06)" : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "6px"
+                }}
+              >
+                <span>🍳 In Kitchen</span>
+                <span style={{ backgroundColor: "#ffedd5", color: "#c2410c", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
+                  {cookingTableOrders.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTableOrderTab("all")}
+                style={{
+                  flex: 1,
+                  padding: "10px 14px",
+                  borderRadius: "9px",
+                  border: "none",
+                  fontWeight: "800",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  backgroundColor: tableOrderTab === "all" ? "#ffffff" : "transparent",
+                  color: tableOrderTab === "all" ? "#0284c7" : "#64748b",
+                  boxShadow: tableOrderTab === "all" ? "0 2px 6px rgba(0,0,0,0.06)" : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "6px"
+                }}
+              >
+                <span>📋 All Orders</span>
+                <span style={{ backgroundColor: "#e0f2fe", color: "#0369a1", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
+                  {activeKitchenOrders.length}
+                </span>
+              </button>
+            </div>
+
+            {/* Orders Scrollable List */}
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px", paddingRight: "4px" }}>
+              {(() => {
+                const displayList = tableOrderTab === "served"
+                  ? servedTableOrders
+                  : tableOrderTab === "kitchen"
+                  ? cookingTableOrders
+                  : activeKitchenOrders;
+
+                if (displayList.length === 0) {
+                  return (
+                    <div style={{ textAlign: "center", padding: "50px 20px", color: "#94a3b8" }}>
+                      <div style={{ fontSize: "42px", marginBottom: "8px" }}>
+                        {tableOrderTab === "served" ? "🔔" : "🍳"}
+                      </div>
+                      <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155" }}>
+                        {tableOrderTab === "served" ? "No table orders waiting for billing" : "No active orders in kitchen"}
+                      </div>
+                      <p style={{ margin: "4px 0 0 0", fontSize: "13px" }}>
+                        {tableOrderTab === "served" ? "When a waiter marks a table order as 'Served', it appears here ready for checkout!" : "New KOT orders from waiters or counter will appear here in real-time."}
+                      </p>
+                    </div>
+                  );
+                }
+
+                return displayList.map((order) => {
+                  const isServed = order.status === "served" || order.readyForBilling === true;
+                  const isReady = order.status === "ready";
+                  const isPreparing = order.status === "preparing";
+                  const isParcel = order.orderType === "parcel" || (order.tableNo && order.tableNo.toLowerCase().includes("parcel"));
+                  const orderTotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
+
+                  return (
+                    <div
+                      key={order.id}
+                      style={{
+                        backgroundColor: isServed ? "#f0fdf4" : "#ffffff",
+                        border: isServed ? "2px solid #86efac" : "1.5px solid #e2e8f0",
+                        borderRadius: "16px",
+                        padding: "16px",
+                        boxShadow: isServed ? "0 4px 12px rgba(34, 197, 94, 0.12)" : "0 2px 6px rgba(0,0,0,0.04)"
+                      }}
+                    >
+                      {/* Card Header Row */}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
+                        <div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                            <span style={{ fontSize: "18px", fontWeight: "900", color: "#0f172a" }}>
+                              {order.tableNo}
+                            </span>
+                            <span style={{
+                              fontSize: "11px",
+                              fontWeight: "800",
+                              padding: "2px 8px",
+                              borderRadius: "10px",
+                              backgroundColor: isParcel ? "#fef3c7" : "#e0f2fe",
+                              color: isParcel ? "#b45309" : "#0369a1"
+                            }}>
+                              {isParcel ? "🥡 PARCEL" : "🍽️ DINE-IN"}
+                            </span>
+                            <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "600" }}>
+                              #{order.orderNumber || "KOT"}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: "12px", color: "#64748b", marginTop: "3px" }}>
+                            Waiter: <b style={{ color: "#334155" }}>{order.waiterName || "Staff"}</b> • Ordered: {getOrderElapsedMinutes(order.createdAtMs)}
+                          </div>
+                          {order.orderNotes && (
+                            <div style={{ fontSize: "12px", color: "#d97706", fontStyle: "italic", marginTop: "2px" }}>
+                              📝 Note: {order.orderNotes}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Status Badge */}
+                        <div>
+                          {isServed ? (
+                            <span style={{ backgroundColor: "#16a34a", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              ✓ SERVED (Ready to Bill)
+                            </span>
+                          ) : isReady ? (
+                            <span style={{ backgroundColor: "#0284c7", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              🔔 FOOD READY
+                            </span>
+                          ) : isPreparing ? (
+                            <span style={{ backgroundColor: "#f59e0b", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              🍳 COOKING
+                            </span>
+                          ) : (
+                            <span style={{ backgroundColor: "#94a3b8", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              ⏳ PENDING
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Item Details Table WITH PRICES & AMOUNTS (Counter View) */}
+                      <div style={{ backgroundColor: isServed ? "#ffffff" : "#f8fafc", borderRadius: "10px", padding: "10px 12px", border: "1px solid #e2e8f0", margin: "10px 0" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+                          <thead>
+                            <tr style={{ borderBottom: "1px solid #cbd5e1", color: "#64748b", textAlign: "left" }}>
+                              <th style={{ padding: "4px 0", fontWeight: "700" }}>Item Description</th>
+                              <th style={{ padding: "4px 0", textAlign: "center", fontWeight: "700", width: "60px" }}>Qty</th>
+                              <th style={{ padding: "4px 0", textAlign: "right", fontWeight: "700", width: "80px" }}>Price</th>
+                              <th style={{ padding: "4px 0", textAlign: "right", fontWeight: "700", width: "90px" }}>Amount</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(order.items || []).map((item, iIdx) => {
+                              const iPrice = Number(item.price || item.salesPrice || 0);
+                              const iQty = Number(item.qty || 1);
+                              return (
+                                <tr key={iIdx} style={{ borderBottom: "1px dashed #f1f5f9" }}>
+                                  <td style={{ padding: "6px 0", color: "#0f172a", fontWeight: "600" }}>
+                                    {item.name || item.itemName}
+                                    {item.portion && item.portion !== "Standard" && (
+                                      <span style={{ fontSize: "11px", color: "#64748b", marginLeft: "6px" }}>({item.portion})</span>
+                                    )}
+                                    {item.notes ? <div style={{ fontSize: "11px", color: "#f59e0b" }}>↳ {item.notes}</div> : null}
+                                  </td>
+                                  <td style={{ padding: "6px 0", textAlign: "center", fontWeight: "800", color: "#0f172a" }}>
+                                    {iQty}
+                                  </td>
+                                  <td style={{ padding: "6px 0", textAlign: "right", color: "#64748b" }}>
+                                    ₹{iPrice}
+                                  </td>
+                                  <td style={{ padding: "6px 0", textAlign: "right", fontWeight: "800", color: "#0f172a" }}>
+                                    ₹{iPrice * iQty}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                          <tfoot>
+                            <tr style={{ borderTop: "1.5px solid #cbd5e1" }}>
+                              <td colSpan={2} style={{ padding: "8px 0", fontWeight: "800", color: "#0f172a", fontSize: "14px" }}>
+                                Total: {(order.items || []).reduce((s, i) => s + (Number(i.qty) || 1), 0)} items
+                              </td>
+                              <td style={{ padding: "8px 0", textAlign: "right", fontWeight: "700", color: "#64748b" }}>
+                                Subtotal:
+                              </td>
+                              <td style={{ padding: "8px 0", textAlign: "right", fontWeight: "900", color: "#16a34a", fontSize: "16px" }}>
+                                ₹{orderTotal}.00
+                              </td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+
+                      {/* Card Action Buttons */}
+                      <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", flexWrap: "wrap", marginTop: "10px" }}>
+                        <button
+                          type="button"
+                          onClick={() => handlePrintPreBill(order)}
+                          style={{
+                            padding: "8px 14px",
+                            backgroundColor: "#f8fafc",
+                            border: "1.5px solid #cbd5e1",
+                            borderRadius: "10px",
+                            color: "#334155",
+                            fontWeight: "700",
+                            fontSize: "12.5px",
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "5px"
+                          }}
+                          title="Print Table Slip with amounts before checkout"
+                        >
+                          <span>🖨️</span>
+                          <span>Print Table Slip</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleLoadTableOrderToBill(order)}
+                          style={{
+                            padding: "8px 18px",
+                            backgroundColor: "#16a34a",
+                            border: "none",
+                            borderRadius: "10px",
+                            color: "#ffffff",
+                            fontWeight: "800",
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: "0 2px 8px rgba(22, 163, 74, 0.28)"
+                          }}
+                        >
+                          <span>🧾</span>
+                          <span>Load into Bill & Print Receipt →</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (window.confirm(`Mark ${order.tableNo} order as completed?`)) {
+                              handleMarkOrderCompleted(order.id);
+                            }
+                          }}
+                          style={{
+                            padding: "8px 12px",
+                            backgroundColor: "transparent",
+                            border: "1px solid #e2e8f0",
+                            borderRadius: "10px",
+                            color: "#94a3b8",
+                            fontWeight: "600",
+                            fontSize: "12px",
+                            cursor: "pointer"
+                          }}
+                          title="Close / archive this order"
+                        >
+                          Archive ✕
+                        </button>
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DIRECT PARCEL ORDER MODAL */}
+      {showDirectParcelModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowDirectParcelModal(false)}>
+          <div style={{ ...styles.modalBox, maxWidth: "460px" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+              <h3 style={{ margin: 0, color: "#c2410c", fontSize: "18px", fontWeight: "800", display: "flex", alignItems: "center", gap: "6px" }}>
+                <span>🥡</span>
+                <span>Send Parcel to Kitchen & Packing</span>
+              </h3>
+              <button 
+                type="button" 
+                onClick={() => setShowDirectParcelModal(false)} 
+                style={{ background: "transparent", border: "none", fontSize: "16px", cursor: "pointer", fontWeight: "800", color: "#64748b" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <p style={{ margin: "0 0 14px 0", fontSize: "13px", color: "#64748b", lineHeight: "1.4" }}>
+              Sends a Kitchen Order Ticket (KOT) directly to the kitchen display & packing staff <b>without displaying amounts</b>. You can collect payment from the customer and hand over the printed bill.
+            </p>
+
+            <div style={{ backgroundColor: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "10px", padding: "10px 12px", marginBottom: "14px" }}>
+              <div style={{ fontSize: "12.5px", fontWeight: "800", color: "#9a3412", marginBottom: "4px" }}>
+                Selected Food Items ({currentBill.reduce((s, i) => s + (Number(i.qty) || 1), 0)} items):
+              </div>
+              <div style={{ fontSize: "12px", color: "#c2410c" }}>
+                {currentBill.map((i) => `${i.name || i.itemName} (x${i.qty})`).join(", ")}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Customer Name (for Parcel label) *</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Ramesh / Parcel 1"
+                  value={directParcelName}
+                  onChange={(e) => setDirectParcelName(e.target.value)}
+                  style={styles.modalInput}
+                  autoFocus
+                />
+              </div>
+
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Customer Mobile (Optional)</label>
+                <input
+                  type="tel"
+                  placeholder="10-digit mobile number"
+                  value={directParcelPhone}
+                  onChange={(e) => setDirectParcelPhone(e.target.value)}
+                  style={styles.modalInput}
+                />
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", marginTop: "8px" }}>
+                <button
+                  type="button"
+                  onClick={handleSendDirectParcelToKitchen}
+                  style={{
+                    flex: 2,
+                    padding: "12px",
+                    backgroundColor: "#ea580c",
+                    color: "#ffffff",
+                    border: "none",
+                    borderRadius: "10px",
+                    fontWeight: "800",
+                    fontSize: "14px",
+                    cursor: "pointer",
+                    boxShadow: "0 4px 12px rgba(234, 88, 12, 0.3)"
+                  }}
+                >
+                  🥡 Send to Kitchen & Packing Staff
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowDirectParcelModal(false)}
+                  style={{
+                    flex: 1,
+                    padding: "12px",
+                    backgroundColor: "#f1f5f9",
+                    color: "#64748b",
+                    border: "none",
+                    borderRadius: "10px",
+                    fontWeight: "700",
+                    fontSize: "13px",
+                    cursor: "pointer"
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
