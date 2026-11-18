@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
@@ -9,6 +9,7 @@ import Subscription from "./Subscription";
 import StaffManagement from "./StaffManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
+import { getOrderClassification, playNotificationSound } from "../utils/restaurantOrderService";
 
 export default function Dashboard({ initialTab = "sales" }) {
   const [activeTab, setActiveTab] = useState(initialTab);
@@ -120,10 +121,15 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [activeTableOrderId, setActiveTableOrderId] = useState(null);
   const [activeTableOrderInfo, setActiveTableOrderInfo] = useState(null);
   const [sendKotWithCheckout, setSendKotWithCheckout] = useState(true);
-  const [checkoutOrderType, setCheckoutOrderType] = useState("dine-in"); // "dine-in" | "parcel"
+  const [checkoutOrderType, setCheckoutOrderType] = useState("counter"); // "counter" | "dine-in" | "parcel"
   const [showDirectParcelModal, setShowDirectParcelModal] = useState(false);
   const [directParcelName, setDirectParcelName] = useState("");
   const [directParcelPhone, setDirectParcelPhone] = useState("");
+
+  // Real-time Counter Notification States
+  const [counterToast, setCounterToast] = useState(null);
+  const notifiedServedOrdersRef = useRef(new Set());
+  const isFirstKitchenSyncRef = useRef(true);
 
   // Modal States for Add & Edit Inventory
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -132,18 +138,65 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   const [name, setName] = useState("");
   const [category, setCategory] = useState("General");
+  const [showCustomCategory, setShowCustomCategory] = useState(false);
   const [price, setPrice] = useState("");
   const [qty, setQty] = useState("");
   const [brand, setBrand] = useState("");
   const [image, setImage] = useState("");
 
+  // Web Image Search Modal States
+  const [webImageModalOpen, setWebImageModalOpen] = useState(false);
+  const [webImageQuery, setWebImageQuery] = useState("");
+  const [webImageResults, setWebImageResults] = useState([]);
+  const [webImageLoading, setWebImageLoading] = useState(false);
+
+  const RESTAURANT_CATEGORIES = useMemo(() => [
+    "Starters",
+    "Main Course",
+    "Breads & Roti",
+    "Rice & Biryani",
+    "Beverages",
+    "Desserts",
+    "Snacks & Chaat",
+    "Combos & Thali",
+    "Breakfast / Tiffin"
+  ], []);
+
+  const RETAIL_CATEGORIES = useMemo(() => [
+    "General",
+    "Grocery & Staples",
+    "Snacks & Munchies",
+    "Beverages",
+    "Dairy & Bakery",
+    "Personal Care",
+    "Household Essentials"
+  ], []);
+
+  const availableCategories = useMemo(() => {
+    const baseList = isRestaurant ? RESTAURANT_CATEGORIES : RETAIL_CATEGORIES;
+    const catSet = new Set(baseList);
+    products.forEach((p) => {
+      const c = p.category;
+      if (c && typeof c === "string" && c.trim()) {
+        catSet.add(c.trim());
+      }
+    });
+    return Array.from(catSet);
+  }, [isRestaurant, products, RESTAURANT_CATEGORIES, RETAIL_CATEGORIES]);
+
   const toggleProfileDropdown = (e) => {
     e.stopPropagation();
     if (!profileDropdownOpen && profileBtnRef.current) {
       const rect = profileBtnRef.current.getBoundingClientRect();
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+      // Collision handling: properly align to right side of Profile button and clamp within viewport
+      let rightOffset = viewportWidth - rect.right;
+      if (rightOffset < 12) {
+        rightOffset = 12;
+      }
       setMenuCoords({
-        top: rect.bottom + 8,
-        right: window.innerWidth - rect.right
+        top: Math.min(rect.bottom + 8, window.innerHeight - 150),
+        right: rightOffset
       });
       setProfileDropdownOpen(true);
       setShopModeDropdownOpen(false);
@@ -414,6 +467,46 @@ export default function Dashboard({ initialTab = "sales" }) {
       }));
       list.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
       setKitchenOrders(list);
+
+      // Real-time table-specific notifications to Counter
+      if (isFirstKitchenSyncRef.current) {
+        snapshot.docs.forEach((d) => {
+          const data = d.data();
+          if (data.status === "served" || data.status === "completed") {
+            notifiedServedOrdersRef.current.add(d.id);
+          }
+        });
+        isFirstKitchenSyncRef.current = false;
+      } else {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === "added" || change.type === "modified") {
+            const o = { id: change.doc.id, ...change.doc.data() };
+            const classification = getOrderClassification(o);
+
+            // Waiter marked table order completed & sent to counter
+            if (classification.isTable && o.status === "served" && !notifiedServedOrdersRef.current.has(o.id)) {
+              notifiedServedOrdersRef.current.add(o.id);
+              playNotificationSound("orderServed");
+              setCounterToast({
+                id: o.id,
+                message: `Table ${classification.tableNo} – Order Completed. Bill is Ready at Counter.`,
+                order: o,
+              });
+            }
+
+            // Kitchen marked parcel food ready & packed
+            if (classification.isParcel && o.status === "ready" && !notifiedServedOrdersRef.current.has(o.id + "_parcel_ready")) {
+              notifiedServedOrdersRef.current.add(o.id + "_parcel_ready");
+              playNotificationSound("foodReady");
+              setCounterToast({
+                id: o.id,
+                message: `Food Ready & Packed – PARCEL (${classification.customerName}). Ready to Bill!`,
+                order: o,
+              });
+            }
+          }
+        });
+      }
     }, (err) => {
       console.warn("Kitchen orders sync listener notice:", err);
     });
@@ -433,8 +526,26 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   // Derived Kitchen & Table Orders
   const activeKitchenOrders = kitchenOrders.filter((o) => o.status !== "completed");
-  const servedTableOrders = activeKitchenOrders.filter((o) => o.status === "served" || o.readyForBilling === true);
-  const cookingTableOrders = activeKitchenOrders.filter((o) => o.status === "pending" || o.status === "preparing" || o.status === "ready");
+  
+  // Ready to Bill Orders:
+  // - Table orders: ONLY when waiter completed and marked as "served"
+  // - Parcel orders: ONLY when kitchen marked Food Ready ("ready" or "served")
+  // Never when status is "pending" or "preparing"!
+  const servedTableOrders = activeKitchenOrders.filter((o) => {
+    if (o.status === "completed") return false;
+    const classification = getOrderClassification(o);
+    if (classification.isParcel) {
+      return o.status === "ready" || o.status === "served";
+    }
+    if (classification.isTable) {
+      return o.status === "served";
+    }
+    return o.status === "served" || o.status === "ready";
+  });
+
+  const cookingTableOrders = activeKitchenOrders.filter((o) => {
+    return !servedTableOrders.some((s) => s.id === o.id);
+  });
 
   const getOrderElapsedMinutes = (createdAtMs) => {
     if (!createdAtMs) return "Just now";
@@ -447,8 +558,15 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   // 1. Load Table order items into current billing register with full prices & amounts
   const handleLoadTableOrderToBill = (order) => {
+    const classification = getOrderClassification(order);
+    const orderDisplay = classification.isParcel
+      ? `PARCEL (${classification.customerName})`
+      : classification.isTable
+      ? classification.tableNo
+      : "Counter Order";
+
     if (currentBill.length > 0) {
-      if (!window.confirm(`Cart already has ${currentBill.length} item(s). Replace with items from ${order.tableNo}?`)) {
+      if (!window.confirm(`Cart already has ${currentBill.length} item(s). Replace with items from ${orderDisplay}?`)) {
         return;
       }
     }
@@ -469,12 +587,15 @@ export default function Dashboard({ initialTab = "sales" }) {
     }));
 
     setCurrentBill(formattedItems);
-    setCustomerName(order.customerName || order.tableNo);
+    setCustomerName(classification.customerName || (classification.isTable ? classification.tableNo : "Walk-in Customer"));
     if (order.customerPhone) setCustomerPhone(order.customerPhone);
     setActiveTableOrderId(order.id);
     setActiveTableOrderInfo({
       id: order.id,
-      tableNo: order.tableNo,
+      tableNo: classification.isTable ? classification.tableNo : null,
+      isParcel: classification.isParcel,
+      isTable: classification.isTable,
+      customerName: classification.customerName,
       orderNumber: order.orderNumber,
       waiterName: order.waiterName,
       createdAtMs: order.createdAtMs,
@@ -487,13 +608,18 @@ export default function Dashboard({ initialTab = "sales" }) {
   // 2. Print Pre-Bill / Table Slip (with full amounts) before formal checkout
   const handlePrintPreBill = (order) => {
     if (!order) return;
+    const classification = getOrderClassification(order);
     const subtotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
     const preBillData = {
       ...order,
       billNo: `PRE-${order.orderNumber || "BILL"}`,
-      docTitle: "PRE-BILL / TABLE SLIP",
+      docTitle: classification.isParcel ? "PARCEL PACKING SLIP" : classification.isTable ? "PRE-BILL / TABLE SLIP" : "ORDER SLIP",
       paymentMethod: "Pending (Pre-Bill)",
-      customerName: order.tableNo,
+      customerName: classification.isParcel
+        ? `PARCEL (${classification.customerName})`
+        : classification.isTable
+        ? classification.tableNo
+        : (classification.customerName || "Walk-in Customer"),
       items: order.items || [],
       totalAmount: order.totalAmount || subtotal,
       total: order.totalAmount || subtotal,
@@ -542,9 +668,8 @@ export default function Dashboard({ initialTab = "sales" }) {
       return;
     }
 
-    const finalCustomer = (directParcelName || customerName || "Walk-in").trim();
+    const finalCustomer = (directParcelName || customerName || "Walk-in Customer").trim();
     const finalPhone = (directParcelPhone || customerPhone || "").trim();
-    const tableName = `🥡 PARCEL: ${finalCustomer}`;
     const nowMs = Date.now();
     const kotNumber = `KOT-${nowMs.toString().slice(-4)}`;
 
@@ -563,7 +688,7 @@ export default function Dashboard({ initialTab = "sales" }) {
 
     const kotPayload = {
       orderNumber: kotNumber,
-      tableNo: tableName,
+      tableNo: null,
       waiterId: "COUNTER",
       waiterName: "Counter Staff",
       items: sanitizedItems, // In Kitchen Display & KOT print slips, prices/amounts are strictly NOT shown!
@@ -572,7 +697,7 @@ export default function Dashboard({ initialTab = "sales" }) {
       customerName: finalCustomer,
       customerPhone: finalPhone,
       status: "pending",
-      readyForBilling: true,
+      readyForBilling: false,
       totalAmount: safeTotalAmount,
       totalItems: safeTotalQty,
       masterUid: String(currentUid),
@@ -593,7 +718,9 @@ export default function Dashboard({ initialTab = "sales" }) {
       setActiveTableOrderId(docRef.id);
       setActiveTableOrderInfo({
         id: docRef.id,
-        tableNo: tableName,
+        tableNo: null,
+        isParcel: true,
+        customerName: finalCustomer,
         orderNumber: kotNumber,
         waiterName: "Counter Staff",
       });
@@ -601,7 +728,7 @@ export default function Dashboard({ initialTab = "sales" }) {
       if (finalPhone) setCustomerPhone(finalPhone);
       setShowDirectParcelModal(false);
 
-      alert(`✅ Parcel KOT ${kotNumber} sent to Kitchen & Packing Staff! 🥡\nPacking staff will prepare food while you collect payment and print the customer bill.`);
+      alert(`✅ Parcel KOT ${kotNumber} for "${finalCustomer}" sent to Kitchen & Packing Staff! 🥡\nStatus is Preparing. Once food is ready, packing staff marks it Ready.`);
     } catch (err) {
       console.error("Error creating direct parcel KOT:", err);
       alert("Failed to send parcel order to kitchen: " + err.message);
@@ -1071,6 +1198,16 @@ export default function Dashboard({ initialTab = "sales" }) {
         imageUrl: String(i.image || i.imageUrl || ""),
       }));
 
+      const saleOrderType = activeTableOrderId
+        ? (activeTableOrderInfo?.isParcel ? "parcel" : "table")
+        : (checkoutOrderType === "parcel" || (customerName && customerName.toLowerCase().includes("parcel")))
+        ? "parcel"
+        : (checkoutOrderType === "dine-in" && activeTableOrderInfo?.tableNo)
+        ? "table"
+        : "counter";
+
+      const saleTableNo = activeTableOrderId && activeTableOrderInfo?.isTable ? activeTableOrderInfo.tableNo : null;
+
       const saleRecord = {
         billNo: bNo,
         invoiceId: bNo,
@@ -1079,8 +1216,10 @@ export default function Dashboard({ initialTab = "sales" }) {
         total: totalAmt,
         totalAmount: totalAmt,
         profit: totalProfit,
-        customerName: customerName.trim() || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
+        customerName: customerName.trim() || (saleTableNo ? saleTableNo : "Walk-in Customer"),
         customerPhone: customerPhone.trim() || "N/A",
+        orderType: saleOrderType,
+        tableNo: saleTableNo,
         paymentMode: paymentMethod.toUpperCase(),
         paymentMethod: paymentMethod,
         isGlobalMode: isGlobalMode,
@@ -1166,12 +1305,12 @@ export default function Dashboard({ initialTab = "sales" }) {
 
             const directKotPayload = {
               orderNumber: kotNum,
-              tableNo: isParcelOrder ? `🥡 PARCEL: ${customerName.trim() || "Walk-in"}` : `Counter Table (${customerName.trim() || "Walk-in"})`,
+              tableNo: null,
               waiterId: "COUNTER",
               waiterName: "Counter Billing",
               items: sanitizedKotItems,
               orderNotes: `Direct bill: ${bNo}`,
-              orderType: isParcelOrder ? "parcel" : "dine-in",
+              orderType: isParcelOrder ? "parcel" : "counter",
               customerName: customerName.trim() || "Walk-in Customer",
               customerPhone: customerPhone.trim() || "",
               status: "completed",
@@ -1288,11 +1427,55 @@ export default function Dashboard({ initialTab = "sales" }) {
     }
   };
 
+  const convertToWhiteStudioBackground = (imageUrl) => {
+    return new Promise((resolve) => {
+      if (!imageUrl) return resolve("");
+      const img = new window.Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          const size = 600;
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext("2d");
+
+          // Fill clean, pure white studio background
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fillRect(0, 0, size, size);
+
+          // Calculate aspect ratio preserving center placement with 6% padding
+          const pad = size * 0.06;
+          const maxW = size - (pad * 2);
+          const maxH = size - (pad * 2);
+          const nw = img.naturalWidth || img.width || size;
+          const nh = img.naturalHeight || img.height || size;
+          const scale = Math.min(maxW / nw, maxH / nh);
+          const drawW = nw * scale;
+          const drawH = nh * scale;
+          const drawX = (size - drawW) / 2;
+          const drawY = (size - drawH) / 2;
+
+          ctx.drawImage(img, drawX, drawY, drawW, drawH);
+          const studioWhiteUrl = canvas.toDataURL("image/jpeg", 0.92);
+          resolve(studioWhiteUrl);
+        } catch (err) {
+          resolve(imageUrl);
+        }
+      };
+      img.onerror = () => resolve(imageUrl);
+      img.src = imageUrl;
+    });
+  };
+
   const handleImageChange = (e) => {
     const file = e.target.files[0];
     if (file) {
       const reader = new FileReader();
-      reader.onloadend = () => setImage(reader.result);
+      reader.onloadend = async () => {
+        const whiteBg = await convertToWhiteStudioBackground(reader.result);
+        setImage(whiteBg);
+      };
       reader.readAsDataURL(file);
     }
   };
@@ -1311,7 +1494,9 @@ export default function Dashboard({ initialTab = "sales" }) {
     setIsEditing(false);
     setEditId(null);
     setName("");
-    setCategory(isRestaurant ? "Main Course" : "General");
+    const defaultCat = isRestaurant ? "Main Course" : "General";
+    setCategory(defaultCat);
+    setShowCustomCategory(false);
     setPrice("");
     setQty(isRestaurant ? "100" : "");
     setBrand("");
@@ -1323,12 +1508,113 @@ export default function Dashboard({ initialTab = "sales" }) {
     setIsEditing(true);
     setEditId(item.id);
     setName(item.itemName || item.name || "");
-    setCategory(item.category || (isRestaurant ? "Main Course" : "General"));
+    const itemCat = item.category || (isRestaurant ? "Main Course" : "General");
+    setCategory(itemCat);
+    const existingList = isRestaurant ? RESTAURANT_CATEGORIES : RETAIL_CATEGORIES;
+    setShowCustomCategory(!existingList.includes(itemCat));
     setPrice(String(item.salesPrice ?? item.price ?? ""));
     setQty(String(item.quantity ?? "0"));
     setBrand(item.brand || "");
     setImage(item.image || item.imageUrl || "");
     setIsModalOpen(true);
+  };
+
+  const searchWebImages = async (searchTerm) => {
+    const term = (searchTerm !== undefined ? searchTerm : webImageQuery || name || "").trim();
+    if (!term) return;
+    setWebImageLoading(true);
+    try {
+      const cleanTerm = term
+        .replace(/\b\d+(\.\d+)?\s*(g|gm|gms|kg|ml|l|ltr|pcs|pack|pk)\b/gi, "")
+        .replace(/[^\w\s]/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim() || term;
+
+      const direct = [];
+
+      // 1. TheMealDB (curated restaurant-grade food dish photos)
+      try {
+        const mealRes = await fetch(`https://www.themealdb.com/api/json/v1/1/search.php?s=${encodeURIComponent(cleanTerm)}`);
+        const mealData = await mealRes.json();
+        mealData?.meals?.forEach((m) => {
+          if (m.strMealThumb && !direct.includes(m.strMealThumb)) {
+            direct.push(m.strMealThumb);
+          }
+        });
+      } catch (e) {
+        console.error("MealDB search error:", e);
+      }
+
+      // 2. Wikipedia Food Articles (official dish images)
+      try {
+        const wikiArticleUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(cleanTerm + " food")}&gsrlimit=12&prop=pageimages&pithumbsize=600&format=json&origin=*`;
+        const wikiArtRes = await fetch(wikiArticleUrl);
+        const wikiArtData = await wikiArtRes.json();
+        if (wikiArtData?.query?.pages) {
+          Object.values(wikiArtData.query.pages).forEach((p) => {
+            const src = p.thumbnail?.source;
+            if (src && !src.endsWith(".svg.png") && !src.includes("logo") && !direct.includes(src)) {
+              direct.push(src);
+            }
+          });
+        }
+      } catch (e) {
+        console.error("Wiki articles error:", e);
+      }
+
+      // 3. Open Food Facts (real product packaging & foods)
+      try {
+        const offUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(cleanTerm)}&search_simple=1&action=process&json=1&page_size=10`;
+        const offRes = await fetch(offUrl);
+        const offData = await offRes.json();
+        offData?.products?.forEach((p) => {
+          if (p.image_url && !direct.includes(p.image_url)) {
+            direct.push(p.image_url);
+          }
+        });
+      } catch (e) {
+        console.error("Open Food Facts error:", e);
+      }
+
+      // 4. Wikimedia Commons (Strictly filtered for food dishes, excluding buildings/streets)
+      try {
+        const encoded = encodeURIComponent(cleanTerm + " food dish meal");
+        const wikiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encoded}&gsrnamespace=6&gsrlimit=25&prop=imageinfo&iiprop=url&iiurlwidth=500&format=json&origin=*`;
+        const wikiRes = await fetch(wikiUrl);
+        const wikiData = await wikiRes.json();
+        const badWords = ["magdeburg", "building", "street", "house", "road", "fence", "station", "church", "monument", "statue", "park", "town", "city", "germany", "graveyard", "cemetery", "car", "vehicle", "portrait", "castle", "burg bei", "convent", "architecture", "facade", "sidewalk", "hall", "plaza", "avenue", "sign", "map", "flag", "diagram", "chart"];
+        if (wikiData?.query?.pages) {
+          Object.values(wikiData.query.pages).forEach((page) => {
+            const title = (page.title || "").toLowerCase();
+            const isBad = badWords.some((w) => title.includes(w)) || title.endsWith(".pdf") || title.endsWith(".tif") || title.endsWith(".svg") || title.endsWith(".djvu");
+            if (!isBad && page.imageinfo?.[0]) {
+              const u = page.imageinfo[0].thumburl || page.imageinfo[0].url;
+              if (u && !direct.includes(u)) {
+                direct.push(u);
+              }
+            }
+          });
+        }
+      } catch (e) {
+        console.error("Wikimedia error:", e);
+      }
+
+      setWebImageResults(direct);
+    } catch (e) {
+      console.error("Web image search error:", e);
+    } finally {
+      setWebImageLoading(false);
+    }
+  };
+
+  const handleOpenWebImageSearch = () => {
+    const defaultQuery = name.trim() || (category && category !== "Main Course" && category !== "General" ? category.trim() : "") || "";
+    setWebImageQuery(defaultQuery);
+    setWebImageResults([]);
+    setWebImageModalOpen(true);
+    if (defaultQuery) {
+      searchWebImages(defaultQuery);
+    }
   };
 
   const handleSaveProduct = async (e) => {
@@ -1632,30 +1918,6 @@ export default function Dashboard({ initialTab = "sales" }) {
             </button>
           )}
           <button 
-            onClick={() => setActiveTab("subscription")} 
-            style={{ 
-              ...styles.navBtn, 
-              backgroundColor: activeTab === "subscription" ? "#ffedd5" : "transparent", 
-              color: activeTab === "subscription" ? "#fc8019" : "#64748b",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px"
-            }}
-          >
-            <span>👑 Plans</span>
-            <span style={{
-              backgroundColor: userSubscription.plan === "Pro" ? "#f59e0b" : userSubscription.plan === "Premium" ? "#10b981" : "#6366f1",
-              color: "#ffffff",
-              borderRadius: "6px",
-              padding: "1px 6px",
-              fontSize: "10px",
-              fontWeight: "800",
-              letterSpacing: "0.5px"
-            }}>
-              {userSubscription.plan.toUpperCase()}
-            </span>
-          </button>
-          <button 
             type="button"
             onClick={() => setShowResumeModal(true)} 
             style={{ 
@@ -1778,7 +2040,9 @@ export default function Dashboard({ initialTab = "sales" }) {
           style={{
             ...styles.portalDropdownMenu,
             top: `${menuCoords.top}px`,
-            right: `${menuCoords.right}px`
+            right: `${menuCoords.right}px`,
+            maxWidth: "calc(100vw - 24px)",
+            boxSizing: "border-box"
           }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -1799,9 +2063,31 @@ export default function Dashboard({ initialTab = "sales" }) {
           <button 
             type="button"
             onClick={() => { setActiveTab("subscription"); setProfileDropdownOpen(false); }}
-            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "subscription" ? "#fff7ed" : "transparent", color: activeTab === "subscription" ? "#fc8019" : "#334155" }}
+            style={{ 
+              ...styles.dropdownItem, 
+              backgroundColor: activeTab === "subscription" ? "#fff7ed" : "transparent", 
+              color: activeTab === "subscription" ? "#fc8019" : "#334155",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "10px"
+            }}
           >
-            👑 Subscription & Plans
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span>👑</span>
+              <span>Subscription & Plans</span>
+            </div>
+            <span style={{
+              backgroundColor: userSubscription.plan === "Pro" ? "#f59e0b" : userSubscription.plan === "Premium" ? "#10b981" : "#6366f1",
+              color: "#ffffff",
+              borderRadius: "6px",
+              padding: "1px 6px",
+              fontSize: "10px",
+              fontWeight: "800",
+              letterSpacing: "0.5px"
+            }}>
+              {userSubscription.plan.toUpperCase()}
+            </span>
           </button>
           <button 
             type="button"
@@ -1970,13 +2256,13 @@ export default function Dashboard({ initialTab = "sales" }) {
                   justifyContent: "space-between",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <span style={{ fontSize: "16px" }}>🍽️</span>
+                    <span style={{ fontSize: "16px" }}>{activeTableOrderInfo.isParcel ? "🥡" : "🍽️"}</span>
                     <div>
                       <div style={{ fontSize: "12.5px", fontWeight: "800", color: "#1e40af" }}>
-                        Billing Active: {activeTableOrderInfo.tableNo}
+                        Billing Active: {activeTableOrderInfo.isParcel ? `PARCEL (${activeTableOrderInfo.customerName || "Takeaway"})` : activeTableOrderInfo.tableNo ? activeTableOrderInfo.tableNo : "Counter Order"}
                       </div>
                       <div style={{ fontSize: "11px", color: "#3b82f6" }}>
-                        Waiter: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
+                        Staff: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
                       </div>
                     </div>
                   </div>
@@ -2229,56 +2515,76 @@ export default function Dashboard({ initialTab = "sales" }) {
 
             {/* RIGHT SIDE: Products Grid Matching Image 2 */}
             <div style={styles.posRightPane}>
-              {/* LIVE TABLE ORDERS SERVED BANNER (RESTAURANT MODE) */}
-              {isRestaurant && servedTableOrders.length > 0 && (
-                <div 
-                  onClick={() => {
-                    setTableOrderTab("served");
-                    setShowTableOrdersModal(true);
-                  }}
-                  style={{
-                    backgroundColor: "#ecfdf5",
-                    border: "1.5px solid #6ee7b7",
-                    borderRadius: "14px",
-                    padding: "12px 18px",
-                    marginBottom: "16px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    cursor: "pointer",
-                    boxShadow: "0 4px 14px rgba(16, 185, 129, 0.15)",
-                    transition: "all 0.2s ease"
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                    <div style={{ width: "38px", height: "38px", borderRadius: "10px", backgroundColor: "#10b981", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "20px" }}>
-                      🔔
+              {/* LIVE TABLE & PARCEL ORDERS READY FOR BILLING BANNER */}
+              {isRestaurant && servedTableOrders.length > 0 && (() => {
+                const tableOrdersList = servedTableOrders.filter((o) => getOrderClassification(o).isTable);
+                const parcelOrdersList = servedTableOrders.filter((o) => getOrderClassification(o).isParcel);
+                const bannerTitle =
+                  tableOrdersList.length > 0 && parcelOrdersList.length > 0
+                    ? `${servedTableOrders.length} Orders Ready to Bill (${tableOrdersList.length} Tables, ${parcelOrdersList.length} Parcels) 🧾`
+                    : tableOrdersList.length > 0
+                    ? `${tableOrdersList.length} Table Order${tableOrdersList.length > 1 ? "s" : ""} Served — Ready to Bill! 🧾`
+                    : `${parcelOrdersList.length} Parcel Order${parcelOrdersList.length > 1 ? "s" : ""} Ready & Packed! 🥡`;
+
+                const namesSummary = servedTableOrders
+                  .map((o) => {
+                    const c = getOrderClassification(o);
+                    return c.isParcel ? `🥡 PARCEL: ${c.customerName}` : `🍽️ ${c.tableNo}`;
+                  })
+                  .join(", ");
+
+                return (
+                  <div
+                    onClick={() => {
+                      setTableOrderTab("served");
+                      setShowTableOrdersModal(true);
+                    }}
+                    style={{
+                      backgroundColor: "#ecfdf5",
+                      border: "1.5px solid #6ee7b7",
+                      borderRadius: "14px",
+                      padding: "12px 18px",
+                      marginBottom: "16px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      cursor: "pointer",
+                      boxShadow: "0 4px 14px rgba(16, 185, 129, 0.15)",
+                      transition: "all 0.2s ease",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                      <div style={{ width: "38px", height: "38px", borderRadius: "10px", backgroundColor: "#10b981", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "20px" }}>
+                        🔔
+                      </div>
+                      <div>
+                        <div style={{ fontWeight: "800", color: "#065f46", fontSize: "14px" }}>
+                          {bannerTitle}
+                        </div>
+                        <div style={{ fontSize: "12px", color: "#047857" }}>
+                          {namesSummary} • Ready for counter billing. Click to load bill with amounts & print!
+                        </div>
+                      </div>
                     </div>
-                    <div>
-                      <div style={{ fontWeight: "800", color: "#065f46", fontSize: "14px" }}>
-                        {servedTableOrders.length} Table Order{servedTableOrders.length > 1 ? "s" : ""} Served — Ready to Bill! 🧾
-                      </div>
-                      <div style={{ fontSize: "12px", color: "#047857" }}>
-                        {servedTableOrders.map(o => o.tableNo).join(", ")} • Waiter marked food served. Click to load bill with amounts & print!
-                      </div>
+                    <div
+                      style={{
+                        backgroundColor: "#059669",
+                        color: "#ffffff",
+                        padding: "8px 16px",
+                        borderRadius: "10px",
+                        fontWeight: "800",
+                        fontSize: "12.5px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                      }}
+                    >
+                      <span>Bill Orders ({servedTableOrders.length})</span>
+                      <span>→</span>
                     </div>
                   </div>
-                  <div style={{
-                    backgroundColor: "#059669",
-                    color: "#ffffff",
-                    padding: "8px 16px",
-                    borderRadius: "10px",
-                    fontWeight: "800",
-                    fontSize: "12.5px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px"
-                  }}>
-                    <span>Bill Tables ({servedTableOrders.length})</span>
-                    <span>→</span>
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* Top Compact Stat Cards Row & Welcome Banner on Right Side */}
               <div style={styles.salesStatsBanner}>
@@ -2790,10 +3096,11 @@ export default function Dashboard({ initialTab = "sales" }) {
                 <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
                   {displayedOrders.map((order, idx) => {
                     const isOrdGlobal = order.isGlobalMode === true || order.appMode === "global";
+                    const classification = getOrderClassification(order);
                     return (
                       <div key={order.id || idx} onClick={() => setSelectedOrderDetails(order)} style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", flexWrap: "wrap", gap: "10px" }}>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px", flexWrap: "wrap" }}>
                             <h4 style={{ margin: 0, fontSize: "16px" }}>Order ID: #{order.id.slice(-6).toUpperCase()}</h4>
                             <span style={{
                               display: "inline-flex",
@@ -2808,8 +3115,36 @@ export default function Dashboard({ initialTab = "sales" }) {
                             }}>
                               {isOrdGlobal ? "🌐 Global" : "🏪 Local"}
                             </span>
+                            {classification.isTable && (
+                              <span style={{
+                                fontSize: "10px",
+                                fontWeight: "800",
+                                padding: "2px 8px",
+                                borderRadius: "10px",
+                                backgroundColor: "#e0f2fe",
+                                color: "#0369a1"
+                              }}>
+                                🍽️ {classification.tableNo}
+                              </span>
+                            )}
+                            {classification.isParcel && (
+                              <span style={{
+                                fontSize: "10px",
+                                fontWeight: "800",
+                                padding: "2px 8px",
+                                borderRadius: "10px",
+                                backgroundColor: "#fef3c7",
+                                color: "#b45309"
+                              }}>
+                                🥡 PARCEL
+                              </span>
+                            )}
                           </div>
-                          <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>Customer: {order.customerName || "Walk-in"} | Payment: {order.paymentMethod || order.paymentMode || "Cash"}</p>
+                          <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>
+                            Customer: {order.customerName || "Walk-in"}
+                            {classification.isTable ? ` | Table: ${classification.tableNo}` : classification.isParcel ? ` | PARCEL` : ""}
+                            {" | Payment: " + (order.paymentMethod || order.paymentMode || "Cash")}
+                          </p>
                           <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount || order.total}</strong></p>
                         </div>
                         <div style={{ display: "flex", gap: "6px", alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
@@ -3183,14 +3518,14 @@ export default function Dashboard({ initialTab = "sales" }) {
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <div>
                         <div style={{ fontSize: "12.5px", fontWeight: "800", color: "#166534" }}>
-                          🍽️ Table Order: {activeTableOrderInfo.tableNo}
+                          {activeTableOrderInfo.isParcel ? `🥡 Parcel Order: ${activeTableOrderInfo.customerName || "Takeaway"}` : activeTableOrderInfo.tableNo ? `🍽️ Table Order: ${activeTableOrderInfo.tableNo}` : "Counter Walk-in Order"}
                         </div>
                         <div style={{ fontSize: "11px", color: "#15803d" }}>
-                          Waiter: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
+                          Staff: {activeTableOrderInfo.waiterName || "Staff"} • #{activeTableOrderInfo.orderNumber || "KOT"}
                         </div>
                       </div>
                       <span style={{ fontSize: "11px", fontWeight: "800", backgroundColor: "#16a34a", color: "#fff", padding: "2px 8px", borderRadius: "8px" }}>
-                        Active Table
+                        {activeTableOrderInfo.isParcel ? "PARCEL" : activeTableOrderInfo.tableNo ? "Active Table" : "Counter"}
                       </span>
                     </div>
                   ) : (
@@ -3198,7 +3533,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                       <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
                         <button
                           type="button"
-                          onClick={() => setCheckoutOrderType("dine-in")}
+                          onClick={() => setCheckoutOrderType("counter")}
                           style={{
                             flex: 1,
                             padding: "6px 10px",
@@ -3207,11 +3542,11 @@ export default function Dashboard({ initialTab = "sales" }) {
                             fontWeight: "700",
                             fontSize: "12px",
                             cursor: "pointer",
-                            backgroundColor: checkoutOrderType === "dine-in" ? "#16a34a" : "#ffffff",
-                            color: checkoutOrderType === "dine-in" ? "#ffffff" : "#475569",
+                            backgroundColor: checkoutOrderType === "counter" ? "#2563eb" : "#ffffff",
+                            color: checkoutOrderType === "counter" ? "#ffffff" : "#475569",
                           }}
                         >
-                          🍽️ Dine-in Table
+                          ⚡ Counter / Walk-in
                         </button>
                         <button
                           type="button"
@@ -3482,46 +3817,53 @@ export default function Dashboard({ initialTab = "sales" }) {
                 }
 
                 return displayList.map((order) => {
-                  const isServed = order.status === "served" || order.readyForBilling === true;
+                  const classification = getOrderClassification(order);
+                  const isParcel = classification.isParcel;
+                  const isServed = order.status === "served";
                   const isReady = order.status === "ready";
                   const isPreparing = order.status === "preparing";
-                  const isParcel = order.orderType === "parcel" || (order.tableNo && order.tableNo.toLowerCase().includes("parcel"));
                   const orderTotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
+
+                  const cardTitle = isParcel
+                    ? `PARCEL: ${classification.customerName}`
+                    : classification.isTable
+                    ? classification.tableNo
+                    : `Counter Order (${classification.customerName})`;
 
                   return (
                     <div
                       key={order.id}
                       style={{
-                        backgroundColor: isServed ? "#f0fdf4" : "#ffffff",
-                        border: isServed ? "2px solid #86efac" : "1.5px solid #e2e8f0",
+                        backgroundColor: (isServed || (isParcel && isReady)) ? "#f0fdf4" : "#ffffff",
+                        border: (isServed || (isParcel && isReady)) ? "2px solid #86efac" : "1.5px solid #e2e8f0",
                         borderRadius: "16px",
                         padding: "16px",
-                        boxShadow: isServed ? "0 4px 12px rgba(34, 197, 94, 0.12)" : "0 2px 6px rgba(0,0,0,0.04)"
+                        boxShadow: (isServed || (isParcel && isReady)) ? "0 4px 12px rgba(34, 197, 94, 0.12)" : "0 2px 6px rgba(0,0,0,0.04)"
                       }}
                     >
                       {/* Card Header Row */}
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
                         <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                             <span style={{ fontSize: "18px", fontWeight: "900", color: "#0f172a" }}>
-                              {order.tableNo}
+                              {cardTitle}
                             </span>
                             <span style={{
                               fontSize: "11px",
                               fontWeight: "800",
                               padding: "2px 8px",
                               borderRadius: "10px",
-                              backgroundColor: isParcel ? "#fef3c7" : "#e0f2fe",
-                              color: isParcel ? "#b45309" : "#0369a1"
+                              backgroundColor: isParcel ? "#fef3c7" : classification.isTable ? "#e0f2fe" : "#f1f5f9",
+                              color: isParcel ? "#b45309" : classification.isTable ? "#0369a1" : "#475569"
                             }}>
-                              {isParcel ? "🥡 PARCEL" : "🍽️ DINE-IN"}
+                              {isParcel ? "🥡 PARCEL" : classification.isTable ? "🍽️ DINE-IN" : "⚡ COUNTER"}
                             </span>
                             <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "600" }}>
                               #{order.orderNumber || "KOT"}
                             </span>
                           </div>
                           <div style={{ fontSize: "12px", color: "#64748b", marginTop: "3px" }}>
-                            Waiter: <b style={{ color: "#334155" }}>{order.waiterName || "Staff"}</b> • Ordered: {getOrderElapsedMinutes(order.createdAtMs)}
+                            Staff: <b style={{ color: "#334155" }}>{order.waiterName || "Counter"}</b> • Ordered: {getOrderElapsedMinutes(order.createdAtMs)}
                           </div>
                           {order.orderNotes && (
                             <div style={{ fontSize: "12px", color: "#d97706", fontStyle: "italic", marginTop: "2px" }}>
@@ -3537,8 +3879,8 @@ export default function Dashboard({ initialTab = "sales" }) {
                               ✓ SERVED (Ready to Bill)
                             </span>
                           ) : isReady ? (
-                            <span style={{ backgroundColor: "#0284c7", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
-                              🔔 FOOD READY
+                            <span style={{ backgroundColor: isParcel ? "#16a34a" : "#0284c7", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              {isParcel ? "✓ FOOD READY (Ready to Bill)" : "🔔 FOOD READY"}
                             </span>
                           ) : isPreparing ? (
                             <span style={{ backgroundColor: "#f59e0b", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
@@ -3654,7 +3996,8 @@ export default function Dashboard({ initialTab = "sales" }) {
                         <button
                           type="button"
                           onClick={() => {
-                            if (window.confirm(`Mark ${order.tableNo} order as completed?`)) {
+                            const confName = isParcel ? `PARCEL (${classification.customerName})` : (classification.tableNo || "Order");
+                            if (window.confirm(`Mark ${confName} as completed?`)) {
                               handleMarkOrderCompleted(order.id);
                             }
                           }}
@@ -3785,7 +4128,14 @@ export default function Dashboard({ initialTab = "sales" }) {
           <div style={{ ...styles.modalBox, maxWidth: "450px" }} onClick={e => e.stopPropagation()}>
             <h3 style={{ margin: 0, color: "#1e3a8a", textAlign: "center" }}>{userProfile.storeName} RECEIPT</h3>
             <p style={{ textAlign: "center", fontSize: "12px", color: "#64748b", margin: "4px 0 12px 0" }}>
-              Customer: {selectedOrderDetails.customerName || "Walk-in"} | Paid via: {selectedOrderDetails.paymentMethod || selectedOrderDetails.paymentMode || "Cash"}
+              Customer: {selectedOrderDetails.customerName || "Walk-in"}
+              {(() => {
+                const c = getOrderClassification(selectedOrderDetails);
+                if (c.isTable) return ` | Table: ${c.tableNo}`;
+                if (c.isParcel) return ` | PARCEL`;
+                return "";
+              })()}
+              {" | Paid via: " + (selectedOrderDetails.paymentMethod || selectedOrderDetails.paymentMode || "Cash")}
             </p>
             <div style={{ maxHeight: "220px", overflowY: "auto", margin: "10px 0", borderTop: "1px solid #eee", borderBottom: "1px solid #eee", padding: "10px 0" }}>
               {(selectedOrderDetails.items || []).map((item, i) => (
@@ -3823,6 +4173,70 @@ export default function Dashboard({ initialTab = "sales" }) {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* REAL-TIME COUNTER TOAST NOTIFICATION (Table Order Served & Parcel Food Ready) */}
+      {counterToast && (
+        <div
+          style={{
+            position: "fixed",
+            top: "16px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 999999,
+            backgroundColor: "#065f46",
+            color: "#ffffff",
+            padding: "12px 20px",
+            borderRadius: "14px",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            fontWeight: "800",
+            fontSize: "14px",
+            maxWidth: "92vw",
+            boxSizing: "border-box",
+          }}
+        >
+          <span style={{ fontSize: "20px" }}>🔔</span>
+          <span style={{ flex: 1 }}>{counterToast.message}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setCounterToast(null);
+              setTableOrderTab("served");
+              setShowTableOrdersModal(true);
+            }}
+            style={{
+              backgroundColor: "#ffffff",
+              color: "#065f46",
+              border: "none",
+              padding: "5px 12px",
+              borderRadius: "8px",
+              fontWeight: "800",
+              fontSize: "12px",
+              cursor: "pointer",
+            }}
+          >
+            Load Bill ↗
+          </button>
+          <button
+            type="button"
+            onClick={() => setCounterToast(null)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#a7f3d0",
+              cursor: "pointer",
+              fontSize: "18px",
+              fontWeight: "800",
+              padding: "0 4px",
+            }}
+            title="Dismiss notification"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -3877,24 +4291,75 @@ export default function Dashboard({ initialTab = "sales" }) {
       {isModalOpen && (
         <div style={styles.modalOverlay}>
           <div style={styles.modalBox}>
-            <h3>{isRestaurant ? (isEditing ? "Edit Food Item" : "Add New Food") : (isEditing ? "Edit Product" : "Add New Product")}</h3>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+              <h3 style={{ margin: 0 }}>
+                {isRestaurant ? (isEditing ? "Edit Food Item" : "Add New Food") : (isEditing ? "Edit Product" : "Add New Product")}
+              </h3>
+              <button
+                type="button"
+                onClick={handleOpenWebImageSearch}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "5px",
+                  backgroundColor: "#e0e7ff",
+                  color: "#4338ca",
+                  border: "none",
+                  borderRadius: "14px",
+                  padding: "5px 12px",
+                  fontSize: "12px",
+                  fontWeight: "800",
+                  cursor: "pointer",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.05)"
+                }}
+              >
+                <span>🔍</span> Search web
+              </button>
+            </div>
             <form onSubmit={handleSaveProduct} style={styles.modalForm}>
-              <input 
-                type="text" 
-                placeholder={isRestaurant ? "Food Name (e.g. Chicken Biryani, Dosa)" : "Product Name"} 
-                value={name} 
-                onChange={e => setName(e.target.value)} 
-                style={styles.modalInput} 
-                required 
-              />
-              <input 
-                type="text" 
-                placeholder={isRestaurant ? "Category (e.g. Starters, Main Course, Beverages)" : "Category"} 
-                value={category} 
-                onChange={e => setCategory(e.target.value)} 
-                style={styles.modalInput} 
-                required 
-              />
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <input 
+                  type="text" 
+                  placeholder={isRestaurant ? "Food Name (e.g. Chicken Biryani, Dosa)" : "Product Name"} 
+                  value={name} 
+                  onChange={e => setName(e.target.value)} 
+                  style={styles.modalInput} 
+                  required 
+                />
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <select
+                  value={showCustomCategory ? "__custom__" : category}
+                  onChange={(e) => {
+                    if (e.target.value === "__custom__") {
+                      setShowCustomCategory(true);
+                      setCategory("");
+                    } else {
+                      setShowCustomCategory(false);
+                      setCategory(e.target.value);
+                    }
+                  }}
+                  style={{ ...styles.modalInput, cursor: "pointer", backgroundColor: "#ffffff" }}
+                  required
+                >
+                  <option value="" disabled>-- Select Category --</option>
+                  {availableCategories.map((cat, idx) => (
+                    <option key={idx} value={cat}>{cat}</option>
+                  ))}
+                  <option value="__custom__">➕ + Add Custom Category...</option>
+                </select>
+                {showCustomCategory && (
+                  <input
+                    type="text"
+                    placeholder={isRestaurant ? "Type custom food category (e.g. Soups, Tandoori)" : "Type custom category..."}
+                    value={category}
+                    onChange={(e) => setCategory(e.target.value)}
+                    style={{ ...styles.modalInput, marginTop: "4px" }}
+                    autoFocus
+                    required
+                  />
+                )}
+              </div>
               <input 
                 type="number" 
                 placeholder="Sales Price (₹)" 
@@ -3921,12 +4386,232 @@ export default function Dashboard({ initialTab = "sales" }) {
               <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                 <label style={{ fontSize: "12px", fontWeight: "700" }}>{isRestaurant ? "Food Photo" : "Product Photo"}</label>
                 <input type="file" accept="image/*" onChange={handleImageChange} style={{ fontSize: "12px" }} />
+                {image && (
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px", marginTop: "4px", backgroundColor: "#ffffff", padding: "6px 10px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <img 
+                      src={image} 
+                      alt="Selected preview" 
+                      style={{ width: "42px", height: "42px", borderRadius: "8px", objectFit: "contain", backgroundColor: "#ffffff", border: "1.5px solid #6366f1" }} 
+                      onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
+                    />
+                    <div style={{ flex: 1, overflow: "hidden" }}>
+                      <div style={{ fontSize: "11px", color: "#16a34a", fontWeight: "700" }}>✓ Studio photo selected</div>
+                      <div style={{ fontSize: "10px", color: "#64748b", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>{image.substring(0, 42)}...</div>
+                    </div>
+                    <button 
+                      type="button" 
+                      onClick={() => setImage("")} 
+                      style={{ background: "none", border: "none", color: "#ef4444", fontSize: "11px", fontWeight: "700", cursor: "pointer" }}
+                    >
+                      ✕ Remove
+                    </button>
+                  </div>
+                )}
               </div>
               <div style={styles.modalBtns}>
                 <button type="submit" style={styles.saveModalBtn}>{isRestaurant ? "Save Food" : "Save Product"}</button>
                 <button type="button" onClick={() => setIsModalOpen(false)} style={styles.cancelModalBtn}>Cancel</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* WEB IMAGE SEARCH MODAL */}
+      {webImageModalOpen && (
+        <div 
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(15, 23, 42, 0.75)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100000,
+            padding: "16px"
+          }}
+          onClick={() => setWebImageModalOpen(false)}
+        >
+          <div 
+            style={{
+              backgroundColor: "#ffffff",
+              borderRadius: "16px",
+              width: "100%",
+              maxWidth: "640px",
+              maxHeight: "85vh",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1)"
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#f8fafc" }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "800", color: "#0f172a", display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span>🔍</span> {isRestaurant ? "Search Food Photos Online" : "Search Product Photos Online"}
+                </h3>
+                <p style={{ margin: "3px 0 0", fontSize: "12px", color: "#64748b" }}>
+                  Click any photo to instantly set it as your {isRestaurant ? "food" : "product"} photo
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setWebImageModalOpen(false)}
+                style={{
+                  background: "#f1f5f9",
+                  border: "none",
+                  borderRadius: "50%",
+                  width: "32px",
+                  height: "32px",
+                  fontSize: "14px",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "#64748b"
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Search Input Bar */}
+            <div style={{ padding: "14px 20px", borderBottom: "1px solid #f1f5f9", display: "flex", gap: "8px" }}>
+              <input
+                type="text"
+                placeholder={isRestaurant ? "e.g. Chicken Biryani, Paneer Butter Masala, Dosa..." : "e.g. Milk, Chocolate, Shampoo..."}
+                value={webImageQuery}
+                onChange={(e) => setWebImageQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    searchWebImages(webImageQuery);
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  padding: "10px 14px",
+                  borderRadius: "10px",
+                  border: "1.5px solid #cbd5e1",
+                  fontSize: "14px",
+                  outline: "none"
+                }}
+                autoFocus
+              />
+              <button
+                type="button"
+                onClick={() => searchWebImages(webImageQuery)}
+                disabled={webImageLoading}
+                style={{
+                  backgroundColor: "#4f46e5",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: "10px",
+                  padding: "0 18px",
+                  fontSize: "13px",
+                  fontWeight: "700",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px"
+                }}
+              >
+                {webImageLoading ? "Searching..." : "Search"}
+              </button>
+            </div>
+
+            {/* Images Grid */}
+            <div style={{ padding: "16px 20px", overflowY: "auto", flex: 1, minHeight: "260px" }}>
+              {webImageLoading ? (
+                <div style={{ textAlign: "center", padding: "40px 20px", color: "#64748b" }}>
+                  <div style={{ fontSize: "28px" }}>🔄</div>
+                  <div style={{ marginTop: "12px", fontSize: "14px", fontWeight: "600" }}>Searching high-quality photos on web...</div>
+                </div>
+              ) : webImageResults.length > 0 ? (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: "12px" }}>
+                  {webImageResults.map((imgUrl, idx) => (
+                    <div
+                      key={idx}
+                      onClick={async () => {
+                        setWebImageModalOpen(false);
+                        const whiteBg = await convertToWhiteStudioBackground(imgUrl);
+                        setImage(whiteBg);
+                      }}
+                      style={{
+                        position: "relative",
+                        aspectRatio: "1",
+                        borderRadius: "10px",
+                        overflow: "hidden",
+                        border: image === imgUrl ? "3px solid #4f46e5" : "1.5px solid #e2e8f0",
+                        cursor: "pointer",
+                        backgroundColor: "#ffffff",
+                        transition: "transform 0.15s, box-shadow 0.15s",
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.transform = "scale(1.03)";
+                        e.currentTarget.style.boxShadow = "0 6px 12px rgba(0,0,0,0.12)";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.transform = "scale(1)";
+                        e.currentTarget.style.boxShadow = "none";
+                      }}
+                    >
+                      <img
+                        src={imgUrl}
+                        alt={`Result ${idx}`}
+                        style={{ width: "100%", height: "100%", objectFit: "contain", backgroundColor: "#ffffff" }}
+                        loading="lazy"
+                        onError={(e) => { e.target.style.display = "none"; }}
+                      />
+                      {image === imgUrl && (
+                        <div style={{ position: "absolute", top: "6px", right: "6px", backgroundColor: "#4f46e5", color: "#fff", borderRadius: "50%", width: "20px", height: "20px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "11px", fontWeight: "800" }}>
+                          ✓
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ textAlign: "center", padding: "50px 20px", color: "#94a3b8" }}>
+                  <div style={{ fontSize: "42px", marginBottom: "8px" }}>🖼️</div>
+                  <div style={{ fontSize: "14px", fontWeight: "600", color: "#64748b" }}>
+                    {webImageQuery ? `No photos found for "${webImageQuery}". Try another keyword!` : "Type a dish name above and click Search."}
+                  </div>
+                  <div style={{ fontSize: "12px", marginTop: "6px" }}>
+                    Examples: "Biryani", "Masala Dosa", "Chicken Curry", "Fried Rice", "Parotta"
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{ padding: "12px 20px", borderTop: "1px solid #f1f5f9", display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#f8fafc" }}>
+              <span style={{ fontSize: "12px", color: "#64748b" }}>
+                {webImageResults.length > 0 ? `${webImageResults.length} photos found` : ""}
+              </span>
+              <button
+                type="button"
+                onClick={() => setWebImageModalOpen(false)}
+                style={{
+                  backgroundColor: "#f1f5f9",
+                  color: "#475569",
+                  border: "none",
+                  borderRadius: "8px",
+                  padding: "8px 16px",
+                  fontSize: "13px",
+                  fontWeight: "600",
+                  cursor: "pointer"
+                }}
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -4137,10 +4822,10 @@ const styles = {
   navLeftGroup: { display: "flex", alignItems: "center", gap: "16px", flexShrink: 0 },
   logoArea: { display: "flex", alignItems: "center", gap: "8px" },
   sidebarBrand: { fontSize: "16px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "6px 12px", borderRadius: "8px", width: "220px", gap: "6px" },
+  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "6px 12px", borderRadius: "8px", width: "220px", maxWidth: "220px", minWidth: "130px", flexShrink: 1, gap: "6px" },
   searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "12px", color: "#1e293b" },
   searchIcon: { fontSize: "14px" },
-  navLinks: { display: "flex", gap: "10px", alignItems: "center", flexShrink: 0 },
+  navLinks: { display: "flex", gap: "8px", alignItems: "center", flexShrink: 0 },
   navBtn: { padding: "7px 14px", border: "none", borderRadius: "8px", fontWeight: "700", fontSize: "13px", cursor: "pointer", whiteSpace: "nowrap" },
 
   speedDialSection: {
@@ -4228,6 +4913,8 @@ const styles = {
     display: "flex", 
     flexDirection: "column", 
     minWidth: "180px", 
+    maxWidth: "calc(100vw - 24px)",
+    boxSizing: "border-box",
     zIndex: 9999999, 
     padding: "6px" 
   },  

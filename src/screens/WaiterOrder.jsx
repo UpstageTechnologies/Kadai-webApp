@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { collection, onSnapshot, doc, addDoc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
+import { getOrderClassification, playNotificationSound } from "../utils/restaurantOrderService";
 
 const QUICK_TABLES = [
   "Table 1",
@@ -47,6 +48,11 @@ export default function WaiterOrder() {
   // Live KOTs
   const [kitchenOrders, setKitchenOrders] = useState([]);
 
+  // Waiter Real-time Table-Specific Food Ready Notification
+  const [waiterToast, setWaiterToast] = useState(null);
+  const isInitialLoadRef = useRef(true);
+  const notifiedReadyIdsRef = useRef(new Set());
+
   // Note dialog for food item
   const [editingItemNoteIndex, setEditingItemNoteIndex] = useState(null);
   const [itemNoteText, setItemNoteText] = useState("");
@@ -79,7 +85,7 @@ export default function WaiterOrder() {
     return () => unsub();
   }, [masterUid]);
 
-  // 2. Real-time Live Kitchen Orders for this restaurant
+  // 2. Real-time Live Kitchen Orders with Table-Specific Food Ready Notifications for this Waiter
   useEffect(() => {
     if (!masterUid) return;
 
@@ -91,10 +97,48 @@ export default function WaiterOrder() {
         .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
 
       setKitchenOrders(list);
+
+      // Trigger table-specific food ready notification ONLY on actual kitchen status transition to "ready"
+      if (isInitialLoadRef.current) {
+        snap.docs.forEach((d) => {
+          const data = d.data();
+          if (data.status === "ready" || data.status === "served") {
+            notifiedReadyIdsRef.current.add(d.id);
+          }
+        });
+        isInitialLoadRef.current = false;
+      } else {
+        snap.docChanges().forEach((change) => {
+          if (change.type === "added" || change.type === "modified") {
+            const o = { id: change.doc.id, ...change.doc.data() };
+            if (o.status === "ready" && !notifiedReadyIdsRef.current.has(o.id)) {
+              // Strictly verify order is assigned to THIS waiter
+              const isMyOrder =
+                (o.waiterId && String(o.waiterId) === String(waiterId)) ||
+                (o.waiterName && String(o.waiterName) === String(waiterName));
+
+              if (isMyOrder) {
+                notifiedReadyIdsRef.current.add(o.id);
+                playNotificationSound("foodReady");
+                const classification = getOrderClassification(o);
+                const tableText = classification.isParcel
+                  ? `PARCEL (${classification.customerName})`
+                  : classification.tableNo || "Table";
+
+                setWaiterToast({
+                  id: o.id,
+                  message: `Food Ready – ${tableText}. Please collect the order.`,
+                  tableNo: classification.isParcel ? "PARCEL" : classification.tableNo,
+                });
+              }
+            }
+          }
+        });
+      }
     });
 
     return () => unsub();
-  }, [masterUid]);
+  }, [masterUid, waiterId, waiterName]);
 
   // Cart actions
   const addToOrder = (food) => {
@@ -173,11 +217,16 @@ export default function WaiterOrder() {
       return;
     }
 
+    const isParcelOrder = isTakeaway;
     const finalTableName = isTakeaway
-      ? `🥡 PARCEL: ${takeawayCustomerName.trim() || "Walk-in"}`
+      ? null
       : isCustomMode
       ? customTable.trim() || "Custom Table"
       : selectedTable;
+
+    const finalCustomer = isTakeaway
+      ? takeawayCustomerName.trim() || "Walk-in Customer"
+      : finalTableName;
 
     setIsSendingKot(true);
 
@@ -200,13 +249,13 @@ export default function WaiterOrder() {
 
       const kotPayload = {
         orderNumber: kotNumber,
-        tableNo: String(finalTableName).trim(),
+        tableNo: isParcelOrder ? null : String(finalTableName).trim(),
         waiterId: String(waiterId),
         waiterName: String(waiterName),
         items: sanitizedItems,
         orderNotes: String(orderNotes || "").trim(),
-        orderType: isTakeaway ? "parcel" : "dine-in",
-        customerName: isTakeaway ? takeawayCustomerName.trim() || "Walk-in Customer" : finalTableName,
+        orderType: isParcelOrder ? "parcel" : "table",
+        customerName: finalCustomer,
         status: "pending", // "pending" -> "preparing" -> "ready" -> "served" -> "completed"
         readyForBilling: false,
         totalAmount: safeTotalAmount,
@@ -235,7 +284,8 @@ export default function WaiterOrder() {
       setOrderNotes("");
       setIsSendingKot(false);
 
-      alert(`✅ Order ${kotNumber} for ${finalTableName} sent to Kitchen successfully! 🍳\nKitchen staff has been notified.`);
+      const successTableDisplay = isParcelOrder ? `PARCEL (${finalCustomer})` : finalTableName;
+      alert(`✅ Order ${kotNumber} for ${successTableDisplay} sent to Kitchen successfully! 🍳\nKitchen staff has been notified.`);
       setActiveTab("live_kot");
     } catch (err) {
       console.error("Error sending KOT:", err);
@@ -245,7 +295,7 @@ export default function WaiterOrder() {
   };
 
   // 4. Waiter marks served & sends to counter for billing
-  const handleMarkServed = async (orderId, tableNo) => {
+  const handleMarkServed = async (orderId, tableDisplay) => {
     if (!masterUid || !orderId) return;
 
     try {
@@ -262,7 +312,7 @@ export default function WaiterOrder() {
         await updateDoc(doc(db, "kitchen_orders", orderId), updateData);
       } catch (_) {}
 
-      alert(`Dishes for "${tableNo}" marked as SERVED! ✓\nFull bill with amounts is now ready at the Counter for printing.`);
+      alert(`Dishes for "${tableDisplay}" marked as SERVED! ✓\nFull bill with amounts is now ready at the Counter for printing.`);
     } catch (err) {
       alert("Failed to update status: " + err.message);
     }
@@ -292,6 +342,69 @@ export default function WaiterOrder() {
 
   return (
     <div style={styles.container}>
+      {/* Real-time Table-Specific Food Ready Alert Banner */}
+      {waiterToast && (
+        <div
+          style={{
+            position: "fixed",
+            top: "16px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 999999,
+            backgroundColor: "#15803d",
+            color: "#ffffff",
+            padding: "12px 20px",
+            borderRadius: "14px",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            fontWeight: "800",
+            fontSize: "14px",
+            maxWidth: "92vw",
+            boxSizing: "border-box",
+          }}
+        >
+          <span style={{ fontSize: "20px" }}>🛎️</span>
+          <span style={{ flex: 1 }}>{waiterToast.message}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setWaiterToast(null);
+              setActiveTab("live_kot");
+            }}
+            style={{
+              backgroundColor: "#ffffff",
+              color: "#15803d",
+              border: "none",
+              padding: "5px 12px",
+              borderRadius: "8px",
+              fontWeight: "800",
+              fontSize: "12px",
+              cursor: "pointer",
+            }}
+          >
+            View Orders ↗
+          </button>
+          <button
+            type="button"
+            onClick={() => setWaiterToast(null)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#bbf7d0",
+              cursor: "pointer",
+              fontSize: "18px",
+              fontWeight: "800",
+              padding: "0 4px",
+            }}
+            title="Dismiss notification"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Top Navbar */}
       <header style={styles.navbar}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -523,10 +636,10 @@ export default function WaiterOrder() {
             <div style={styles.cartHeader}>
               <div>
                 <span style={{ fontSize: "11px", fontWeight: "700", color: "#64748b", textTransform: "uppercase" }}>
-                  Active Table:
+                  {isTakeaway ? "Order Type:" : "Active Table:"}
                 </span>
                 <h3 style={{ margin: "2px 0 0 0", fontSize: "18px", fontWeight: "800", color: "#0f172a" }}>
-                  {isTakeaway ? `🥡 ${takeawayCustomerName || "Parcel"}` : isCustomMode ? (customTable || "Custom Table") : selectedTable}
+                  {isTakeaway ? `🥡 PARCEL${takeawayCustomerName ? `: ${takeawayCustomerName}` : ""}` : isCustomMode ? (customTable || "Custom Table") : selectedTable}
                 </h3>
               </div>
               <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "700" }}>
@@ -638,6 +751,8 @@ export default function WaiterOrder() {
           ) : (
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: "14px" }}>
               {kitchenOrders.map((order) => {
+                const classification = getOrderClassification(order);
+                const isParcel = classification.isParcel;
                 const isReady = order.status === "ready";
                 const isServed = order.status === "served";
                 const isPreparing = order.status === "preparing";
@@ -647,14 +762,19 @@ export default function WaiterOrder() {
                     key={order.id}
                     style={{
                       ...styles.kotLiveCard,
-                      borderColor: isReady ? "#16a34a" : isServed ? "#0284c7" : isPreparing ? "#ea580c" : "#f59e0b",
+                      borderColor: isReady ? "#16a34a" : isServed ? "#0284c7" : isParcel ? "#ea580c" : isPreparing ? "#ea580c" : "#f59e0b",
                     }}
                   >
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
                       <div>
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                           <h4 style={{ margin: 0, fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>
-                            {order.tableNo}
+                            {isParcel ? "🥡 PARCEL" : classification.isTable ? `🍽️ ${classification.tableNo}` : "⚡ COUNTER"}
+                            {classification.customerName && classification.customerName !== classification.tableNo && (
+                              <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "700", marginLeft: "6px" }}>
+                                ({classification.customerName})
+                              </span>
+                            )}
                           </h4>
                           <span
                             style={{
@@ -693,7 +813,7 @@ export default function WaiterOrder() {
                       {!isServed ? (
                         <button
                           type="button"
-                          onClick={() => handleMarkServed(order.id, order.tableNo)}
+                          onClick={() => handleMarkServed(order.id, isParcel ? `PARCEL (${classification.customerName})` : (classification.tableNo || "Order"))}
                           style={{
                             ...styles.serveBtn,
                             backgroundColor: isReady ? "#16a34a" : "#0284c7",

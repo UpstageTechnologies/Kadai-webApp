@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
+import { getOrderClassification } from "../utils/restaurantOrderService";
 
 const getElapsedTime = (createdAtMs, timestamp) => {
   let date;
@@ -129,7 +130,8 @@ export default function KitchenDisplay() {
 
   // Print Kitchen Order Ticket (KOT) without amounts!
   const printKotTicket = (order) => {
-    const isParcel = order.orderType === "parcel" || (order.tableNo && order.tableNo.toLowerCase().includes("parcel"));
+    const classification = getOrderClassification(order);
+    const isParcel = classification.isParcel;
     const html = `
       <!DOCTYPE html>
       <html>
@@ -173,8 +175,9 @@ export default function KitchenDisplay() {
       <body>
         <div class="center bold">
           <div style="font-size: 14px;">KITCHEN ORDER TICKET (KOT)</div>
-          <div class="table-header">${order.tableNo}</div>
-          <div class="kot-badge">${isParcel ? "🥡 PARCEL PACKING" : "🍽️ DINE-IN"}</div>
+          <div class="table-header">${isParcel ? "PARCEL" : classification.isTable ? classification.tableNo : "COUNTER ORDER"}</div>
+          ${classification.customerName && classification.customerName !== classification.tableNo ? `<div style="font-size: 12px; margin-top: 2px;">Customer: ${classification.customerName}</div>` : ""}
+          <div class="kot-badge">${isParcel ? "🥡 PARCEL PACKING" : classification.isTable ? "🍽️ DINE-IN" : "⚡ WALK-IN"}</div>
         </div>
 
         <div class="divider"></div>
@@ -346,11 +349,12 @@ export default function KitchenDisplay() {
         ) : (
           <div style={styles.kdsGrid}>
             {filteredOrders.map((order) => {
+              const classification = getOrderClassification(order);
               const urgencyColor = getUrgencyColor(order.createdAtMs);
               const isPending = order.status === "pending";
               const isPreparing = order.status === "preparing";
               const isReady = order.status === "ready";
-              const isParcel = order.orderType === "parcel" || (order.tableNo && order.tableNo.toLowerCase().includes("parcel"));
+              const isParcel = classification.isParcel;
 
               return (
                 <div
@@ -367,8 +371,13 @@ export default function KitchenDisplay() {
                       <div>
                         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                           <span style={styles.tableBadge}>
-                            {isParcel ? `🥡 ${order.tableNo}` : `🍽️ ${order.tableNo}`}
+                            {isParcel ? "🥡 PARCEL" : classification.isTable ? `🍽️ ${classification.tableNo}` : "⚡ COUNTER"}
                           </span>
+                          {classification.customerName && classification.customerName !== classification.tableNo && (
+                            <span style={{ fontSize: "12px", color: isParcel ? "#fed7aa" : "#cbd5e1", fontWeight: "800" }}>
+                              ({classification.customerName})
+                            </span>
+                          )}
                           <span
                             style={{
                               ...styles.statusBadge,
@@ -479,7 +488,7 @@ export default function KitchenDisplay() {
                     {isReady && (
                       <div style={{ display: "flex", gap: "8px", width: "100%" }}>
                         <div style={styles.readyNotification}>
-                          ✓ Dish Ready! Waiting for Waiter/Counter to Deliver & Bill.
+                          ✓ Dish Ready! Real-time notification sent to {isParcel ? "Counter & Packing" : (order.waiterName ? `Waiter (${order.waiterName})` : "Waiter")}.
                         </div>
                       </div>
                     )}
