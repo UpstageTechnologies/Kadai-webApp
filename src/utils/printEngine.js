@@ -640,6 +640,14 @@ export const buildThermalReceiptHtml = (data, profile) => {
 
       <div class="dashed-divider"></div>
 
+      ${(data.tokenNumber || data.tokenNo) ? `
+        <div style="text-align: center; margin: 6px 0; padding: 4px 6px; border: 2px solid #000; border-radius: 4px;">
+          <div style="font-size: 10px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">ORDER TOKEN</div>
+          <div style="font-size: 26px; font-weight: 900; line-height: 1.1;">#${data.tokenNumber || data.tokenNo}</div>
+        </div>
+        <div class="dashed-divider"></div>
+      ` : ""}
+
       <div class="receipt-meta">
         <div class="flex-between">
           <span>Bill No: <strong>${data.billNo || data.id}</strong></span>
@@ -785,6 +793,11 @@ export const buildSheetInvoiceHtml = (data, profile) => {
 
         <div style="text-align: right;">
           <div style="font-size: 20px; font-weight: 800; color: #fc8019; letter-spacing: 0.5px;">${docTitle}</div>
+          ${(data.tokenNumber || data.tokenNo) ? `
+            <div style="display: inline-block; background-color: #0f172a; color: #ffffff; padding: 3px 10px; border-radius: 6px; font-size: 13px; font-weight: 800; margin: 4px 0;">
+              TOKEN #${data.tokenNumber || data.tokenNo}
+            </div>
+          ` : ""}
           <div style="font-size: 13px; font-weight: 700; color: #1e293b; margin-top: 4px;">Invoice #: ${data.billNo || data.id}</div>
           <div style="font-size: 12px; color: #64748b; margin-top: 2px;">Date: ${data.orderDate || new Date().toLocaleDateString("en-IN")}</div>
         </div>

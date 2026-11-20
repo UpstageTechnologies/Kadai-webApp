@@ -175,9 +175,15 @@ export default function KitchenDisplay() {
       <body>
         <div class="center bold">
           <div style="font-size: 14px;">KITCHEN ORDER TICKET (KOT)</div>
+          ${(order.tokenNumber || order.tokenNo) ? `
+            <div style="font-size: 24px; font-weight: 900; background-color: #000; color: #fff; padding: 4px 12px; margin: 6px auto; display: inline-block; border-radius: 4px; letter-spacing: 1px;">
+              TOKEN #${order.tokenNumber || order.tokenNo}
+            </div>
+          ` : ""}
           <div class="table-header">${isParcel ? "PARCEL" : classification.isTable ? classification.tableNo : "COUNTER ORDER"}</div>
           ${classification.customerName && classification.customerName !== classification.tableNo ? `<div style="font-size: 12px; margin-top: 2px;">Customer: ${classification.customerName}</div>` : ""}
           <div class="kot-badge">${isParcel ? "🥡 PARCEL PACKING" : classification.isTable ? "🍽️ DINE-IN" : "⚡ WALK-IN"}</div>
+          ${order.isPaid ? `<div style="font-size: 12px; font-weight: 800; color: #000; margin-top: 2px;">[PAID AT COUNTER]</div>` : ""}
         </div>
 
         <div class="divider"></div>
@@ -370,9 +376,35 @@ export default function KitchenDisplay() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                       <div>
                         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                          {(order.tokenNumber || order.tokenNo) && (
+                            <span style={{
+                              backgroundColor: "#ea580c",
+                              color: "#ffffff",
+                              fontSize: "13px",
+                              fontWeight: "900",
+                              padding: "2px 8px",
+                              borderRadius: "6px",
+                              letterSpacing: "0.5px"
+                            }}>
+                              TOKEN #{order.tokenNumber || order.tokenNo}
+                            </span>
+                          )}
                           <span style={styles.tableBadge}>
                             {isParcel ? "🥡 PARCEL" : classification.isTable ? `🍽️ ${classification.tableNo}` : "⚡ COUNTER"}
                           </span>
+                          {order.isPaid && (
+                            <span style={{
+                              backgroundColor: "#065f46",
+                              color: "#34d399",
+                              fontSize: "11px",
+                              fontWeight: "800",
+                              padding: "2px 6px",
+                              borderRadius: "6px",
+                              border: "1px solid #059669"
+                            }}>
+                              PAID ✅
+                            </span>
+                          )}
                           {classification.customerName && classification.customerName !== classification.tableNo && (
                             <span style={{ fontSize: "12px", color: isParcel ? "#fed7aa" : "#cbd5e1", fontWeight: "800" }}>
                               ({classification.customerName})
@@ -486,10 +518,24 @@ export default function KitchenDisplay() {
                     )}
 
                     {isReady && (
-                      <div style={{ display: "flex", gap: "8px", width: "100%" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}>
                         <div style={styles.readyNotification}>
-                          ✓ Dish Ready! Real-time notification sent to {isParcel ? "Counter & Packing" : (order.waiterName ? `Waiter (${order.waiterName})` : "Waiter")}.
+                          ✓ Dish Ready! Real-time notification sent to {(order.isPaid || order.billNo) ? "Counter for Customer Pickup (PAID ✅)" : isParcel ? "Counter & Packing" : (order.waiterName ? `Waiter (${order.waiterName})` : "Waiter")}.
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateStatus(order.id, (order.isPaid || order.billNo) ? "completed" : "served")}
+                          style={{
+                            ...styles.actionBtn,
+                            backgroundColor: "#059669",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            gap: "6px"
+                          }}
+                        >
+                          ✅ Food Picked Up / Handed Over
+                        </button>
                       </div>
                     )}
                   </div>

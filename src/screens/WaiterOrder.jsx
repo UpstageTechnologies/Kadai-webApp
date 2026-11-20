@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { collection, onSnapshot, doc, addDoc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
-import { getOrderClassification, playNotificationSound } from "../utils/restaurantOrderService";
+import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber } from "../utils/restaurantOrderService";
 
 const QUICK_TABLES = [
   "Table 1",
@@ -233,6 +233,7 @@ export default function WaiterOrder() {
     try {
       const nowMs = Date.now();
       const kotNumber = `KOT-${nowMs.toString().slice(-4)}`;
+      const nextTokenNo = getNextDailyTokenNumber({ kitchenOrders, uid: masterUid });
 
       const sanitizedItems = orderItems.map((item) => ({
         foodId: String(item.id || item.foodId || ""),
@@ -249,6 +250,8 @@ export default function WaiterOrder() {
 
       const kotPayload = {
         orderNumber: kotNumber,
+        tokenNumber: nextTokenNo,
+        tokenNo: nextTokenNo,
         tableNo: isParcelOrder ? null : String(finalTableName).trim(),
         waiterId: String(waiterId),
         waiterName: String(waiterName),
@@ -285,7 +288,7 @@ export default function WaiterOrder() {
       setIsSendingKot(false);
 
       const successTableDisplay = isParcelOrder ? `PARCEL (${finalCustomer})` : finalTableName;
-      alert(`✅ Order ${kotNumber} for ${successTableDisplay} sent to Kitchen successfully! 🍳\nKitchen staff has been notified.`);
+      alert(`✅ Order ${kotNumber} (Token #${nextTokenNo}) for ${successTableDisplay} sent to Kitchen successfully! 🍳\nKitchen staff has been notified.`);
       setActiveTab("live_kot");
     } catch (err) {
       console.error("Error sending KOT:", err);

@@ -7,9 +7,13 @@ import Profile from "./Profile";
 import Settings from "./Settings";
 import Subscription from "./Subscription";
 import StaffManagement from "./StaffManagement";
+import OnlineOrders from "./OnlineOrders";
+import RecipeManagement from "./RecipeManagement";
+import WasteManagement from "./WasteManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
-import { getOrderClassification, playNotificationSound } from "../utils/restaurantOrderService";
+import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
+import { subscribeWasteRecords, calculateWasteStats } from "../utils/wasteService";
 
 export default function Dashboard({ initialTab = "sales" }) {
   const [activeTab, setActiveTab] = useState(initialTab);
@@ -18,6 +22,11 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [loading, setLoading] = useState(() => Boolean(localStorage.getItem("uid")));
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("All");
+
+  // Hamburger Drawer & Centered Search Bar States
+  const [hamburgerOpen, setHamburgerOpen] = useState(false);
+  const [searchFocused, setSearchFocused] = useState(false);
+  const searchInputRef = useRef(null);
   
   // Restaurant Mode Detection
   const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
@@ -70,6 +79,7 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   const [currentBill, setCurrentBill] = useState([]);
   const [ordersList, setOrdersList] = useState([]);
+  const [wasteRecords, setWasteRecords] = useState([]);
   const [statsTimeframe, setStatsTimeframe] = useState("all");
 
   // Hold Bill Feature States
@@ -107,6 +117,7 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("Cash");
+  const [sendWhatsAppBill, setSendWhatsAppBill] = useState(false);
 
   // Success Animated Popup Modal State
   const [popupModal, setPopupModal] = useState({ show: false, message: "" });
@@ -130,6 +141,19 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [counterToast, setCounterToast] = useState(null);
   const notifiedServedOrdersRef = useRef(new Set());
   const isFirstKitchenSyncRef = useRef(true);
+
+  // Real-time Online Orders & Delivery States
+  const [onlineOrdersList, setOnlineOrdersList] = useState([]);
+  const [deliveryStaffList, setDeliveryStaffList] = useState([]);
+  const [doorDeliveryEnabled, setDoorDeliveryEnabled] = useState(true);
+  const [onlineOrderToast, setOnlineOrderToast] = useState(null);
+  const knownOnlineOrderIdsRef = useRef(new Set());
+  const isFirstOnlineOrdersSyncRef = useRef(true);
+
+  // Store Owner Live Sales & Online Notifications Feed
+  const [ownerNotifications, setOwnerNotifications] = useState([]);
+  const [ownerNotifDropdownOpen, setOwnerNotifDropdownOpen] = useState(false);
+  const ownerNotifBtnRef = useRef(null);
 
   // Modal States for Add & Edit Inventory
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -279,6 +303,21 @@ export default function Dashboard({ initialTab = "sales" }) {
       setShopModeDropdownOpen(false);
     });
 
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") {
+        setHamburgerOpen(false);
+        setProfileDropdownOpen(false);
+        setShopModeDropdownOpen(false);
+      }
+      if (e.key === "/" && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) {
+        e.preventDefault();
+        if (searchInputRef.current) {
+          searchInputRef.current.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+
     const styleSheet = document.createElement("style");
     styleSheet.type = "text/css";
     styleSheet.innerText = `
@@ -306,6 +345,14 @@ export default function Dashboard({ initialTab = "sales" }) {
       .animate-badge-pop {
         animation: badgePop 0.22s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
       }
+      @keyframes slideInLeft {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(0); }
+      }
+      @keyframes fadeInOverlay {
+        0% { opacity: 0; }
+        100% { opacity: 1; }
+      }
     `;
     document.head.appendChild(styleSheet);
 
@@ -332,10 +379,14 @@ export default function Dashboard({ initialTab = "sales" }) {
         setUserProfile({
           name: data.name || auth.currentUser?.displayName || (isRest ? "Restaurant Manager" : "Store Owner"),
           email: data.email || auth.currentUser?.email || "",
-          phone: data.phone || "",
+          phone: data.phone || data.mobile || "",
+          address: typeof data.address === "string" ? data.address : (data.address?.fullAddress || ""),
           storeName: activeStoreName,
+          shopName: activeStoreName,
           profileImage: (isGlobalMode ? data.global_shopLogo : data.local_shopLogo) || data.profileImage || data.shopLogo || ""
         });
+        const dEnabled = data.doorDeliveryEnabled ?? data.deliveryConfig?.doorDeliveryEnabled ?? true;
+        setDoorDeliveryEnabled(dEnabled);
         if (data.settings) {
           setStoreSettings(data.settings);
         }
@@ -489,20 +540,41 @@ export default function Dashboard({ initialTab = "sales" }) {
               playNotificationSound("orderServed");
               setCounterToast({
                 id: o.id,
+                isPaid: false,
                 message: `Table ${classification.tableNo} – Order Completed. Bill is Ready at Counter.`,
                 order: o,
               });
             }
 
-            // Kitchen marked parcel food ready & packed
-            if (classification.isParcel && o.status === "ready" && !notifiedServedOrdersRef.current.has(o.id + "_parcel_ready")) {
-              notifiedServedOrdersRef.current.add(o.id + "_parcel_ready");
+            // Kitchen marked order ready
+            if (o.status === "ready" && !notifiedServedOrdersRef.current.has(o.id + "_ready_alert")) {
+              notifiedServedOrdersRef.current.add(o.id + "_ready_alert");
               playNotificationSound("foodReady");
-              setCounterToast({
-                id: o.id,
-                message: `Food Ready & Packed – PARCEL (${classification.customerName}). Ready to Bill!`,
-                order: o,
-              });
+              const tokStr = o.tokenNumber || o.tokenNo ? `TOKEN #${o.tokenNumber || o.tokenNo}` : (o.orderNumber || "Order");
+              const isOrderPaid = o.isPaid === true || !!o.billNo || !!o.billedAt;
+              
+              if (isOrderPaid) {
+                setCounterToast({
+                  id: o.id,
+                  isPaid: true,
+                  message: `🛎️ Food Ready: ${tokStr} (PAID ✅) • Bill #${o.billNo || "Direct"} – Ready for Customer Pickup!`,
+                  order: o,
+                });
+              } else if (classification.isParcel) {
+                setCounterToast({
+                  id: o.id,
+                  isPaid: false,
+                  message: `Food Ready & Packed – ${tokStr ? `${tokStr} • ` : ""}PARCEL (${classification.customerName}). Ready to Bill!`,
+                  order: o,
+                });
+              } else {
+                setCounterToast({
+                  id: o.id,
+                  isPaid: false,
+                  message: `🛎️ Food Ready for ${tokStr} (${classification.customerName})!`,
+                  order: o,
+                });
+              }
             }
           }
         });
@@ -511,28 +583,179 @@ export default function Dashboard({ initialTab = "sales" }) {
       console.warn("Kitchen orders sync listener notice:", err);
     });
 
+    // 6. Real-time Customer Online Orders & Delivery Sync
+    const localOrdersRef = collection(db, "users", currentUid, "local_orders");
+    const globalOrdersRef = collection(db, "users", currentUid, "global_orders");
+    const staffColRef = collection(db, "users", currentUid, "staffs");
+
+    let currentLocalOnline = [];
+    let currentGlobalOnline = [];
+
+    const syncCombinedOnlineOrders = () => {
+      const combined = [...currentLocalOnline, ...currentGlobalOnline];
+      combined.sort((a, b) => {
+        const timeA = a.createdAt?.toMillis?.() || (a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 0);
+        const timeB = b.createdAt?.toMillis?.() || (b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 0);
+        return timeB - timeA;
+      });
+      setOnlineOrdersList(combined);
+    };
+
+    const processOnlineOrderChanges = (snapshot, isGlobal) => {
+      if (isFirstOnlineOrdersSyncRef.current) {
+        snapshot.docs.forEach((d) => {
+          knownOnlineOrderIdsRef.current.add(d.id);
+        });
+      } else {
+        snapshot.docChanges().forEach((change) => {
+          const ord = { ...change.doc.data(), id: String(change.doc.id), orderDocId: String(change.doc.id), isGlobalMode: isGlobal };
+          const custName = (ord.customerName || "").toLowerCase().trim();
+          const orderType = (ord.orderType || ord.type || "").toLowerCase().trim();
+          if (
+            custName.includes("walk-in") ||
+            custName === "walk in customer" ||
+            orderType.includes("walk-in") ||
+            ord.isWalkIn === true
+          ) {
+            return;
+          }
+
+          if (change.type === "added") {
+            if (!knownOnlineOrderIdsRef.current.has(change.doc.id)) {
+              knownOnlineOrderIdsRef.current.add(change.doc.id);
+              const s = (ord.status || "Pending Verification").toLowerCase();
+              if (["pending verification", "accepted"].includes(s)) {
+                playNotificationSound("onlineOrder");
+                setOnlineOrderToast({
+                  id: ord.id,
+                  isDelivered: false,
+                  message: `Order #${ord.orderId || ord.id.slice(-6).toUpperCase()} • ₹${ord.totalAmount || ord.total || 0} (${ord.customerName || "Customer"})`,
+                  order: ord,
+                });
+
+                // Send real-time notification to store owner for online sales
+                try {
+                  notifyOwner({
+                    db,
+                    uid: currentUid,
+                    type: "online_order",
+                    title: `🛵 New Online Order: ₹${ord.totalAmount || ord.total || 0}`,
+                    body: `${ord.customerName || "Customer"} • Order #${ord.orderId || ord.id.slice(-6).toUpperCase()} (${isGlobal ? "Global Delivery" : "Local Store Order"})`,
+                    data: {
+                      orderId: ord.orderId || ord.id,
+                      totalAmount: ord.totalAmount || ord.total || 0,
+                      customerName: ord.customerName || "Customer",
+                      isGlobalMode: isGlobal,
+                      storeName: userProfile.storeName || "Turf Cafe",
+                    }
+                  });
+                } catch (notifErr) {
+                  console.warn("Online order owner notification notice:", notifErr);
+                }
+              }
+            }
+          } else if (change.type === "modified") {
+            if (ord.status === "Delivered" && !knownOnlineOrderIdsRef.current.has(ord.id + "_delivered_notified")) {
+              knownOnlineOrderIdsRef.current.add(ord.id + "_delivered_notified");
+              playNotificationSound("orderDelivered");
+              setOnlineOrderToast({
+                id: ord.id,
+                isDelivered: true,
+                message: `Order #${ord.orderId || ord.id.slice(-6).toUpperCase()} Marked Finished & Delivered!`,
+                order: ord,
+              });
+            }
+          }
+        });
+      }
+    };
+
+    const unsubscribeLocalOrders = onSnapshot(localOrdersRef, (snap) => {
+      currentLocalOnline = snap.docs.map((d) => ({
+        ...d.data(),
+        id: String(d.id),
+        orderDocId: String(d.id),
+        isGlobalMode: false,
+      }));
+      processOnlineOrderChanges(snap, false);
+      syncCombinedOnlineOrders();
+      isFirstOnlineOrdersSyncRef.current = false;
+    }, (err) => {
+      console.warn("Local online orders sync notice:", err?.message);
+    });
+
+    const unsubscribeGlobalOrders = onSnapshot(globalOrdersRef, (snap) => {
+      currentGlobalOnline = snap.docs.map((d) => ({
+        ...d.data(),
+        id: String(d.id),
+        orderDocId: String(d.id),
+        isGlobalMode: true,
+      }));
+      processOnlineOrderChanges(snap, true);
+      syncCombinedOnlineOrders();
+      isFirstOnlineOrdersSyncRef.current = false;
+    }, (err) => {
+      console.warn("Global online orders sync notice:", err?.message);
+    });
+
+    const unsubscribeDeliveryStaff = onSnapshot(staffColRef, (snap) => {
+      const dStaff = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((s) => s.role === "delivery");
+      setDeliveryStaffList(dStaff);
+    }, (err) => {
+      console.warn("Staff listener notice:", err?.message);
+    });
+
+    // 7. Real-time Store Owner Sales & Online Notifications Feed
+    const ownerNotifRef = collection(db, "users", currentUid, "owner_notifications");
+    const unsubscribeOwnerNotif = onSnapshot(ownerNotifRef, (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      list.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
+      setOwnerNotifications(list.slice(0, 40));
+    }, (err) => {
+      console.warn("Owner notifications listener notice:", err);
+    });
+
+    // 8. Real-time Waste & Spoilage Records Sync
+    const unsubscribeWaste = subscribeWasteRecords(
+      db,
+      currentUid,
+      (records) => {
+        setWasteRecords(records);
+      },
+      (err) => {
+        console.warn("Waste records listener notice:", err);
+      }
+    );
+
     return () => {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
       window.removeEventListener("resize", () => setProfileDropdownOpen(false));
+      window.removeEventListener("keydown", handleKeyDown);
       unsubscribeUser();
       unsubscribeInventory();
       unsubscribeOrders();
       unsubscribeActiveCart();
       unsubscribeHeldOrders();
       unsubscribeKitchenOrders();
+      unsubscribeLocalOrders();
+      unsubscribeGlobalOrders();
+      unsubscribeDeliveryStaff();
+      unsubscribeOwnerNotif();
+      unsubscribeWaste();
     };
   }, [isRestaurant, appMode]);
 
   // Derived Kitchen & Table Orders
   const activeKitchenOrders = kitchenOrders.filter((o) => o.status !== "completed");
   
-  // Ready to Bill Orders:
-  // - Table orders: ONLY when waiter completed and marked as "served"
-  // - Parcel orders: ONLY when kitchen marked Food Ready ("ready" or "served")
-  // Never when status is "pending" or "preparing"!
-  const servedTableOrders = activeKitchenOrders.filter((o) => {
+  // 1. Unpaid orders waiting to be billed at counter (Dine-in tables served, unpaid parcel ready)
+  // MUST NOT be already paid or billed!
+  const unpaidReadyToBillOrders = activeKitchenOrders.filter((o) => {
     if (o.status === "completed") return false;
+    if (o.isPaid === true || o.billNo || o.billedAt || o.billedAtMs) return false;
     const classification = getOrderClassification(o);
     if (classification.isParcel) {
       return o.status === "ready" || o.status === "served";
@@ -543,9 +766,37 @@ export default function Dashboard({ initialTab = "sales" }) {
     return o.status === "served" || o.status === "ready";
   });
 
-  const cookingTableOrders = activeKitchenOrders.filter((o) => {
-    return !servedTableOrders.some((s) => s.id === o.id);
+  // 2. Already paid orders whose food is cooked & ready for customer pickup / handover:
+  const paidReadyOrders = activeKitchenOrders.filter((o) => {
+    if (o.status === "completed") return false;
+    if (!o.isPaid && !o.billNo && !o.billedAt && !o.billedAtMs) return false;
+    return o.status === "ready" || o.status === "served";
   });
+
+  // Alias for backward compatibility:
+  const servedTableOrders = unpaidReadyToBillOrders;
+
+  const cookingTableOrders = activeKitchenOrders.filter((o) => {
+    return o.status === "pending" || o.status === "preparing";
+  });
+
+  // Derived New Online Orders Count for Navbar Notification Badge
+  const newOnlineOrdersCount = useMemo(() => {
+    return onlineOrdersList.filter(o => {
+      const custName = (o.customerName || "").toLowerCase().trim();
+      const orderType = (o.orderType || o.type || "").toLowerCase().trim();
+      if (
+        custName.includes("walk-in") ||
+        custName === "walk in customer" ||
+        orderType.includes("walk-in") ||
+        o.isWalkIn === true
+      ) {
+        return false;
+      }
+      const s = (o.status || "Pending Verification").toLowerCase();
+      return ["pending verification", "accepted", "packed", "out for delivery"].includes(s);
+    }).length;
+  }, [onlineOrdersList]);
 
   const getOrderElapsedMinutes = (createdAtMs) => {
     if (!createdAtMs) return "Just now";
@@ -672,6 +923,7 @@ export default function Dashboard({ initialTab = "sales" }) {
     const finalPhone = (directParcelPhone || customerPhone || "").trim();
     const nowMs = Date.now();
     const kotNumber = `KOT-${nowMs.toString().slice(-4)}`;
+    const nextTokenNo = getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: currentUid });
 
     const sanitizedItems = currentBill.map((item) => ({
       foodId: String(item.id || item.barcode || ""),
@@ -688,6 +940,8 @@ export default function Dashboard({ initialTab = "sales" }) {
 
     const kotPayload = {
       orderNumber: kotNumber,
+      tokenNumber: nextTokenNo,
+      tokenNo: nextTokenNo,
       tableNo: null,
       waiterId: "COUNTER",
       waiterName: "Counter Staff",
@@ -722,6 +976,7 @@ export default function Dashboard({ initialTab = "sales" }) {
         isParcel: true,
         customerName: finalCustomer,
         orderNumber: kotNumber,
+        tokenNumber: nextTokenNo,
         waiterName: "Counter Staff",
       });
       setCustomerName(finalCustomer);
@@ -1182,6 +1437,7 @@ export default function Dashboard({ initialTab = "sales" }) {
       const sequenceNum = String(ordersList.length + 1).padStart(4, "0");
       const bNo = `${datePrefix}-${sequenceNum}`;
       const bDate = now.toLocaleDateString("en-GB");
+      const nextTokenNo = activeTableOrderInfo?.tokenNumber || getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: currentUid });
       
       const sanitizedBillItems = currentBill.map((i) => ({
         id: String(i.id || i.barcode || ""),
@@ -1211,6 +1467,8 @@ export default function Dashboard({ initialTab = "sales" }) {
       const saleRecord = {
         billNo: bNo,
         invoiceId: bNo,
+        tokenNumber: nextTokenNo,
+        tokenNo: nextTokenNo,
         billDate: bDate,
         items: sanitizedBillItems,
         total: totalAmt,
@@ -1305,16 +1563,19 @@ export default function Dashboard({ initialTab = "sales" }) {
 
             const directKotPayload = {
               orderNumber: kotNum,
+              tokenNumber: nextTokenNo,
+              tokenNo: nextTokenNo,
               tableNo: null,
               waiterId: "COUNTER",
               waiterName: "Counter Billing",
               items: sanitizedKotItems,
-              orderNotes: `Direct bill: ${bNo}`,
+              orderNotes: `Direct counter bill: ${bNo}`,
               orderType: isParcelOrder ? "parcel" : "counter",
-              customerName: customerName.trim() || "Walk-in Customer",
+              customerName: customerName.trim() || (isParcelOrder ? "Parcel Customer" : "Walk-in Customer"),
               customerPhone: customerPhone.trim() || "",
-              status: "completed",
+              status: "pending", // KDS receives in real-time as a pending order to cook/pack
               readyForBilling: false,
+              isPaid: true, // Food already paid at billing counter
               totalAmount: totalAmt,
               totalItems: currentBill.reduce((sum, i) => sum + (Number(i.qty) || 1), 0),
               masterUid: String(currentUid),
@@ -1325,7 +1586,15 @@ export default function Dashboard({ initialTab = "sales" }) {
               updatedAt: serverTimestamp(),
             };
 
-            await addDoc(collection(db, "users", currentUid, "kitchen_orders"), directKotPayload);
+            const docRef = await addDoc(collection(db, "users", currentUid, "kitchen_orders"), directKotPayload);
+            try {
+              await setDoc(doc(db, "kitchen_orders", docRef.id), {
+                ...directKotPayload,
+                id: docRef.id,
+              });
+            } catch (rootErr) {
+              console.warn("Root kitchen_orders mirror notice:", rootErr);
+            }
           } catch (kErr) {
             console.warn("Could not record direct restaurant KOT:", kErr);
           }
@@ -1340,15 +1609,60 @@ export default function Dashboard({ initialTab = "sales" }) {
         items: [...currentBill],
         totalAmount: totalAmt,
         total: totalAmt,
+        tokenNumber: nextTokenNo,
+        tokenNo: nextTokenNo,
+        orderType: saleOrderType,
         customerName: customerName.trim() || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
         customerPhone: customerPhone.trim() || "N/A",
         paymentMethod: paymentMethod,
         paymentMode: paymentMethod.toUpperCase(),
       };
 
+      // Real-Time Notification to Store Owner for this sale
+      try {
+        notifyOwner({
+          db,
+          uid: currentUid,
+          type: "sale",
+          title: `💰 New In-Store Sale: ₹${totalAmt}.00 (Token #${nextTokenNo})`,
+          body: `${userProfile.storeName || "Turf Cafe"} • Bill #${bNo} • Paid via ${paymentMethod} (${sanitizedBillItems.reduce((acc, i) => acc + (Number(i.qty) || 1), 0)} items)`,
+          data: {
+            billNo: bNo,
+            tokenNumber: nextTokenNo,
+            totalAmount: totalAmt,
+            itemsCount: sanitizedBillItems.reduce((acc, i) => acc + (Number(i.qty) || 1), 0),
+            paymentMethod: paymentMethod,
+            customerName: customerName.trim() || "Walk-in Customer",
+            storeName: userProfile.storeName || "Turf Cafe",
+          }
+        });
+      } catch (notifErr) {
+        console.warn("Owner notification dispatch notice:", notifErr);
+      }
+
+      // Auto-trigger WhatsApp E-Bill if requested & phone number provided
+      if (sendWhatsAppBill) {
+        try {
+          const rawPhone = customerPhone.replace(/\D/g, "");
+          if (rawPhone && rawPhone.length >= 10) {
+            const waUrl = getWhatsAppEBillUrl(completedOrderData, {
+              storeName: userProfile.storeName || userProfile.name || "Turf Cafe",
+              address: userProfile.address || rawUserData?.address?.fullAddress || "",
+              phone: userProfile.phone || rawUserData?.phone || "",
+            });
+            if (waUrl) {
+              window.open(waUrl, "_blank");
+            }
+          }
+        } catch (waErr) {
+          console.warn("Auto WhatsApp E-Bill error:", waErr);
+        }
+      }
+
       setIsCheckoutModalOpen(false);
       setCustomerName("");
       setCustomerPhone("");
+      setSendWhatsAppBill(false);
       setCurrentBill([]);
       setActiveResumedOrderId(null);
       setActiveTableOrderId(null);
@@ -1385,6 +1699,8 @@ export default function Dashboard({ initialTab = "sales" }) {
       const docData = {
         id: order.id || order.billNo || "ORD-SALE",
         billNo: order.billNo || (order.id ? "#" + String(order.id).slice(-6).toUpperCase() : "B-SALE"),
+        tokenNumber: order.tokenNumber || order.tokenNo || null,
+        tokenNo: order.tokenNumber || order.tokenNo || null,
         orderDate: orderDate,
         docTitle: docType === "quotation" ? "QUOTATION" : docType === "salesInvoice" ? "TAX INVOICE" : docType === "purchaseInvoice" ? "PURCHASE INVOICE" : "STORE RECEIPT",
         paymentMethod: order.paymentMethod || order.paymentMode || "Cash",
@@ -1424,6 +1740,29 @@ export default function Dashboard({ initialTab = "sales" }) {
     } catch (err) {
       console.error("Print bill error:", err);
       alert("Could not trigger print: " + err.message);
+    }
+  };
+
+  const handleSendWhatsAppBill = (order) => {
+    if (!order) return;
+    let phone = String(order.customerPhone || "").replace(/\D/g, "");
+    if (!phone || phone.length < 10) {
+      const prompted = window.prompt("Enter customer 10-digit mobile number for WhatsApp E-Bill:", "");
+      if (!prompted) return;
+      phone = prompted.replace(/\D/g, "");
+      if (phone.length < 10) {
+        alert("Please enter a valid 10-digit mobile number.");
+        return;
+      }
+    }
+    const orderWithPhone = { ...order, customerPhone: phone };
+    const waUrl = getWhatsAppEBillUrl(orderWithPhone, {
+      storeName: userProfile.storeName || userProfile.name || "Turf Cafe",
+      address: userProfile.address || rawUserData?.address?.fullAddress || "",
+      phone: userProfile.phone || rawUserData?.phone || "",
+    });
+    if (waUrl) {
+      window.open(waUrl, "_blank");
     }
   };
 
@@ -1759,6 +2098,11 @@ export default function Dashboard({ initialTab = "sales" }) {
     ? `₹${computedAvgOrderVal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
     : "₹38.22";
 
+  // Waste & Spoilage Expense Statistics
+  const wasteStats = useMemo(() => calculateWasteStats(wasteRecords), [wasteRecords]);
+  const computedWasteLoss = statsTimeframe === "today" ? wasteStats.todayLoss : wasteStats.totalLoss;
+  const statWasteLossText = `₹${computedWasteLoss.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
   const statSalesGrowth = hasOrdersData && statsTimeframe === "today" 
     ? getGrowthText(computedTotalSales, yesterdaySales, "12.5% from yesterday")
     : "12.5% from yesterday";
@@ -1779,6 +2123,7 @@ export default function Dashboard({ initialTab = "sales" }) {
     }}>
       {/* Top Navbar Header */}
       <header style={styles.navbar}>
+        {/* Left Area: Brand & Shop Mode */}
         <div style={styles.navLeftGroup}>
           <div 
             ref={shopModeBtnRef}
@@ -1847,103 +2192,359 @@ export default function Dashboard({ initialTab = "sales" }) {
               </div>
             </div>
           </div>
-
-          <div style={styles.searchBarContainer}>
-            <span style={styles.searchIcon}>🔍</span>
-            <input 
-              type="text"
-              placeholder={isRestaurant ? "Search food or menu items..." : `Search ${isGlobalMode ? "global" : "local"} products...`}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={styles.searchInput}
-            />
-          </div>
         </div>
 
-        {/* Navigation Links Right Area */}
-        <div style={styles.navLinks}>
-          <button onClick={() => setActiveTab("sales")} style={{ ...styles.navBtn, backgroundColor: activeTab === "sales" ? "#ffedd5" : "transparent", color: activeTab === "sales" ? "#fc8019" : "#64748b" }}>
-            🧾 {isRestaurant ? "Billing" : isGlobalMode ? "Global Sales" : "Sales"}
-          </button>
-          <button onClick={() => setActiveTab("dashboard")} style={{ ...styles.navBtn, backgroundColor: activeTab === "dashboard" ? "#ffedd5" : "transparent", color: activeTab === "dashboard" ? "#fc8019" : "#64748b" }}>
-            🏠 Dashboard
-          </button>
-          <button onClick={() => setActiveTab("inventory")} style={{ ...styles.navBtn, backgroundColor: activeTab === "inventory" ? "#ffedd5" : "transparent", color: activeTab === "inventory" ? "#fc8019" : "#64748b" }}>
-            📦 {isRestaurant ? "Menu" : isGlobalMode ? "Global Inventory" : "Inventory"}
-          </button>
-          <button onClick={() => setActiveTab("orders")} style={{ ...styles.navBtn, backgroundColor: activeTab === "orders" ? "#ffedd5" : "transparent", color: activeTab === "orders" ? "#fc8019" : "#64748b" }}>
-            📋 Orders ({ordersList.length})
-          </button>
-          <button 
-            onClick={() => setActiveTab("staff")} 
-            style={{ 
-              ...styles.navBtn, 
-              backgroundColor: activeTab === "staff" ? "#ffedd5" : "transparent", 
-              color: activeTab === "staff" ? "#fc8019" : "#64748b" 
-            }}
-          >
-            👥 Staff
-          </button>
-          {isRestaurant && (
-            <button 
-              type="button"
-              onClick={() => {
-                setTableOrderTab("served");
-                setShowTableOrdersModal(true);
-              }} 
-              style={{ 
-                ...styles.navBtn, 
-                backgroundColor: servedTableOrders.length > 0 ? "#dcfce7" : "transparent", 
-                color: servedTableOrders.length > 0 ? "#15803d" : "#64748b",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                fontWeight: servedTableOrders.length > 0 ? "800" : "600"
-              }}
-              title="Live Restaurant Table & KOT Orders"
-            >
-              <span>🍽️ Tables</span>
-              {activeKitchenOrders.length > 0 && (
-                <span style={{
-                  backgroundColor: servedTableOrders.length > 0 ? "#16a34a" : "#64748b",
-                  color: "#ffffff",
-                  borderRadius: "10px",
-                  padding: "1px 7px",
-                  fontSize: "11px",
-                  fontWeight: "800"
-                }}>
-                  {servedTableOrders.length > 0 ? `🔔 ${servedTableOrders.length}` : activeKitchenOrders.length}
-                </span>
-              )}
-            </button>
-          )}
-          <button 
+        {/* Center Area: Main Navigation Bar Options (moved from hamburger menu) */}
+        <nav style={styles.navLinksGroup}>
+          {/* 1. Billing / Sales */}
+          <button
             type="button"
-            onClick={() => setShowResumeModal(true)} 
-            style={{ 
-              ...styles.navBtn, 
-              backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "transparent", 
-              color: heldOrders.length > 0 ? "#b45309" : "#64748b",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px"
+            onClick={() => setActiveTab("sales")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "sales" ? styles.navTabBtnActive : {})
             }}
-            title="View Pending Held Bills"
+            title={isRestaurant ? "POS Billing & Orders" : "Sales & Billing"}
           >
-            <span>⏸️ Held</span>
-            {heldOrders.length > 0 && (
-              <span style={{
-                backgroundColor: "#d97706",
-                color: "#ffffff",
-                borderRadius: "10px",
-                padding: "1px 7px",
-                fontSize: "11px",
-                fontWeight: "800"
-              }}>
-                {heldOrders.length}
+            <span style={{ fontSize: "14px" }}>🧾</span>
+            <span>{isRestaurant ? "Billing" : (isGlobalMode ? "Global Sales" : "Sales")}</span>
+          </button>
+
+          {/* 2. Dashboard */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("dashboard")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "dashboard" ? styles.navTabBtnActive : {})
+            }}
+            title="Sales analytics & insights"
+          >
+            <span style={{ fontSize: "14px" }}>🏠</span>
+            <span>Dashboard</span>
+          </button>
+
+          {/* 3. Menu Items / Inventory */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("inventory")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "inventory" ? styles.navTabBtnActive : {})
+            }}
+            title={isRestaurant ? "Food items, categories & pricing" : "Inventory management"}
+          >
+            <span style={{ fontSize: "14px" }}>📦</span>
+            <span>{isRestaurant ? "Menu Items" : (isGlobalMode ? "Global Inventory" : "Inventory")}</span>
+          </button>
+
+          {/* 4. Online Orders & Delivery */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("orders")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "orders" ? styles.navTabBtnActive : {})
+            }}
+            title="Customer online orders & live delivery dispatch"
+          >
+            <span style={{ fontSize: "14px" }}>🛵</span>
+            <span>Online Orders</span>
+            {newOnlineOrdersCount > 0 ? (
+              <span style={styles.navBadgeRed}>
+                🔔 {newOnlineOrdersCount}
+              </span>
+            ) : onlineOrdersList.length > 0 ? (
+              <span style={styles.navBadgeGray}>
+                {onlineOrdersList.length}
+              </span>
+            ) : null}
+          </button>
+
+          {/* 5. Staff Management */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("staff")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "staff" ? styles.navTabBtnActive : {})
+            }}
+            title="Waiter & kitchen staff roles"
+          >
+            <span style={{ fontSize: "14px" }}>👥</span>
+            <span>Staff</span>
+          </button>
+
+          {/* 6. Waste & Spoilage Management (Shop & Restaurant) */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("waste")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "waste" ? styles.navTabBtnActive : {})
+            }}
+            title={isRestaurant ? "Food waste, kitchen spoilage & loss calculation" : "Product waste & inventory shrinkage tracking"}
+          >
+            <span style={{ fontSize: "14px" }}>🗑️</span>
+            <span>{isRestaurant ? "Food Waste" : "Waste & Loss"}</span>
+            {wasteStats.todayLoss > 0 && (
+              <span style={styles.navBadgeRed}>
+                ₹{Math.round(wasteStats.todayLoss)}
               </span>
             )}
           </button>
+
+          {/* RESTAURANT OPERATIONS */}
+          {isRestaurant && (
+            <>
+              {/* Recipe Management & Food Costing */}
+              <button
+                type="button"
+                onClick={() => setActiveTab("recipes")}
+                style={{
+                  ...styles.navTabBtn,
+                  ...(activeTab === "recipes" ? styles.navTabBtnActive : {})
+                }}
+                title="Recipe Management, Food Costing & Raw Materials"
+              >
+                <span style={{ fontSize: "14px" }}>🥘</span>
+                <span>Recipes</span>
+              </button>
+
+              {/* Tables & Live KOT */}
+              <button
+                type="button"
+                onClick={() => {
+                  setTableOrderTab(unpaidReadyToBillOrders.length > 0 ? "served" : paidReadyOrders.length > 0 ? "pickup" : "kitchen");
+                  setShowTableOrdersModal(true);
+                }}
+                style={{
+                  ...styles.navTabBtn,
+                  ...((unpaidReadyToBillOrders.length > 0 || paidReadyOrders.length > 0) ? styles.navTabBtnAlert : {})
+                }}
+                title={
+                  unpaidReadyToBillOrders.length > 0
+                    ? `${unpaidReadyToBillOrders.length} order(s) ready to bill!`
+                    : paidReadyOrders.length > 0
+                    ? `${paidReadyOrders.length} order(s) ready for pickup!`
+                    : "Table orders & kitchen status"
+                }
+              >
+                <span style={{ fontSize: "14px" }}>🍽️</span>
+                <span>Tables</span>
+                {unpaidReadyToBillOrders.length > 0 ? (
+                  <span style={styles.navBadgeGreen}>
+                    🔔 {unpaidReadyToBillOrders.length}
+                  </span>
+                ) : paidReadyOrders.length > 0 ? (
+                  <span style={{ ...styles.navBadgeGreen, backgroundColor: "#ea580c" }}>
+                    🛎️ {paidReadyOrders.length}
+                  </span>
+                ) : activeKitchenOrders.length > 0 ? (
+                  <span style={styles.navBadgeGray}>
+                    {activeKitchenOrders.length}
+                  </span>
+                ) : null}
+              </button>
+
+              {/* Kitchen Display (KDS) */}
+              <a
+                href="/kitchen"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.navTabBtn, textDecoration: "none" }}
+                title="Open kitchen display screen in new tab"
+              >
+                <span style={{ fontSize: "14px" }}>👨‍🍳</span>
+                <span>Kitchen (KDS)</span>
+                <span style={{ fontSize: "10px", opacity: 0.65 }}>↗</span>
+              </a>
+
+              {/* Waiter Order App */}
+              <a
+                href="/waiter"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.navTabBtn, textDecoration: "none" }}
+                title="Open waiter mobile order app in new tab"
+              >
+                <span style={{ fontSize: "14px" }}>📱</span>
+                <span>Waiter App</span>
+                <span style={{ fontSize: "10px", opacity: 0.65 }}>↗</span>
+              </a>
+            </>
+          )}
+        </nav>
+
+        {/* Right Area: Held Orders, Owner Alerts & Profile */}
+        <div style={styles.navRightGroup}>
+          {/* Owner Notifications Bell */}
+          <div style={{ position: "relative" }}>
+            <button
+              ref={ownerNotifBtnRef}
+              type="button"
+              onClick={() => setOwnerNotifDropdownOpen(!ownerNotifDropdownOpen)}
+              style={{
+                backgroundColor: ownerNotifDropdownOpen ? "#ffedd5" : "#f8fafc",
+                border: "1.5px solid #cbd5e1",
+                borderRadius: "10px",
+                padding: "6px 12px",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                fontWeight: "700",
+                fontSize: "12.5px",
+                color: "#1e293b",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.05)"
+              }}
+              title="Store Owner Live Sales & Online Notifications"
+            >
+              <span style={{ fontSize: "14px" }}>🔔</span>
+              <span>Alerts</span>
+              {ownerNotifications.filter((n) => !n.read).length > 0 && (
+                <span
+                  style={{
+                    backgroundColor: "#ef4444",
+                    color: "#ffffff",
+                    fontSize: "10px",
+                    fontWeight: "900",
+                    padding: "1px 6px",
+                    borderRadius: "10px",
+                    marginLeft: "2px"
+                  }}
+                >
+                  {ownerNotifications.filter((n) => !n.read).length}
+                </span>
+              )}
+            </button>
+
+            {/* Owner Notifications Dropdown Panel */}
+            {ownerNotifDropdownOpen && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 8px)",
+                  right: "0",
+                  width: "360px",
+                  maxHeight: "440px",
+                  backgroundColor: "#ffffff",
+                  borderRadius: "16px",
+                  boxShadow: "0 14px 40px rgba(0,0,0,0.18)",
+                  border: "1.5px solid #e2e8f0",
+                  zIndex: 999999,
+                  display: "flex",
+                  flexDirection: "column",
+                  overflow: "hidden"
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Header */}
+                <div style={{ padding: "14px 16px", borderBottom: "1px solid #f1f5f9", display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#0f172a", color: "#ffffff" }}>
+                  <div>
+                    <div style={{ fontWeight: "800", fontSize: "14px", display: "flex", alignItems: "center", gap: "6px" }}>
+                      <span>📢</span>
+                      <span>Owner Live Sales Feed</span>
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#94a3b8" }}>
+                      Real-time alerts for in-store & online sales
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setOwnerNotifDropdownOpen(false)}
+                    style={{ background: "transparent", border: "none", color: "#94a3b8", fontSize: "16px", cursor: "pointer", fontWeight: "800" }}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {/* Desktop Push Banner Button */}
+                <div style={{ padding: "10px 14px", backgroundColor: "#f0fdf4", borderBottom: "1px solid #bbf7d0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: "11.5px", color: "#166534", fontWeight: "600" }}>
+                    Desktop Push: {typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted" ? "Active ✅" : "Not Enabled"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if ("Notification" in window) {
+                        Notification.requestPermission().then((perm) => {
+                          if (perm === "granted") {
+                            new Notification("🔔 Owner Notifications Enabled!", {
+                              body: "You will receive desktop alerts for all in-store and online sales."
+                            });
+                          }
+                        });
+                      }
+                    }}
+                    style={{
+                      padding: "4px 8px",
+                      backgroundColor: "#16a34a",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: "6px",
+                      fontSize: "11px",
+                      fontWeight: "700",
+                      cursor: "pointer"
+                    }}
+                  >
+                    Enable Push
+                  </button>
+                </div>
+
+                {/* Notifications List */}
+                <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+                  {ownerNotifications.length === 0 ? (
+                    <div style={{ textAlign: "center", padding: "30px 16px", color: "#94a3b8" }}>
+                      <div style={{ fontSize: "32px", marginBottom: "6px" }}>🎉</div>
+                      <div style={{ fontSize: "13px", fontWeight: "700", color: "#475569" }}>All caught up!</div>
+                      <div style={{ fontSize: "11px" }}>New counter sales and online orders will appear here instantly.</div>
+                    </div>
+                  ) : (
+                    ownerNotifications.map((n) => (
+                      <div
+                        key={n.id}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: "10px",
+                          backgroundColor: n.type === "online_order" ? "#f5f3ff" : "#fff7ed",
+                          border: `1px solid ${n.type === "online_order" ? "#ddd6fe" : "#fed7aa"}`,
+                          marginBottom: "6px"
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                          <span style={{ fontWeight: "800", fontSize: "12.5px", color: n.type === "online_order" ? "#6d28d9" : "#c2410c" }}>
+                            {n.title}
+                          </span>
+                          <span style={{ fontSize: "10px", color: "#64748b" }}>
+                            {n.createdAtMs ? new Date(n.createdAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Just now"}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "11.5px", color: "#334155", marginTop: "2px" }}>
+                          {n.body}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Held orders quick chip if any held */}
+          {heldOrders.length > 0 && (
+            <button 
+              type="button"
+              onClick={() => setShowResumeModal(true)} 
+              style={styles.quickHeldAlertBtn}
+              title="View pending held bills"
+            >
+              <span>⏸️ Held</span>
+              <span style={styles.quickHeldBadge}>
+                {heldOrders.length}
+              </span>
+            </button>
+          )}
 
           {/* Profile Trigger Button */}
           <button 
@@ -1951,16 +2552,12 @@ export default function Dashboard({ initialTab = "sales" }) {
             type="button"
             onClick={toggleProfileDropdown} 
             style={{ 
-              ...styles.navBtn, 
-              backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "transparent", 
-              color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#64748b",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              cursor: "pointer"
+              ...styles.navProfileBtn, 
+              backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "#f8fafc", 
+              color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#334155",
             }}
           >
-            <div style={{ width: "24px", height: "24px", borderRadius: "50%", overflow: "hidden", backgroundColor: "#ffedd5", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #fc8019", flexShrink: 0 }}>
+            <div style={styles.profileAvatarBox}>
               {userProfile.profileImage ? (
                 <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
               ) : (
@@ -1969,7 +2566,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                 </span>
               )}
             </div>
-            <span>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
+            <span style={styles.profileBtnText}>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
           </button>
         </div>
       </header>
@@ -2096,6 +2693,13 @@ export default function Dashboard({ initialTab = "sales" }) {
           >
             👥 Staff Accounts & Roles
           </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("waste"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "waste" ? "#fff7ed" : "transparent", color: activeTab === "waste" ? "#fc8019" : "#334155" }}
+          >
+            📉 Waste & Spoilage Tracking
+          </button>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <a 
             href="/waiter"
@@ -2158,13 +2762,19 @@ export default function Dashboard({ initialTab = "sales" }) {
                     <button 
                       type="button"
                       onClick={() => {
-                        setTableOrderTab(servedTableOrders.length > 0 ? "served" : "kitchen");
+                        if (paidReadyOrders.length > 0) {
+                          setTableOrderTab("pickup");
+                        } else if (unpaidReadyToBillOrders.length > 0) {
+                          setTableOrderTab("served");
+                        } else {
+                          setTableOrderTab("kitchen");
+                        }
                         setShowTableOrdersModal(true);
                       }} 
                       style={{
-                        backgroundColor: servedTableOrders.length > 0 ? "#dcfce7" : "#f1f5f9",
-                        border: servedTableOrders.length > 0 ? "1.5px solid #86efac" : "1.5px solid #cbd5e1",
-                        color: servedTableOrders.length > 0 ? "#15803d" : "#475569",
+                        backgroundColor: paidReadyOrders.length > 0 ? "#ffedd5" : unpaidReadyToBillOrders.length > 0 ? "#dcfce7" : "#f1f5f9",
+                        border: paidReadyOrders.length > 0 ? "1.5px solid #fdba74" : unpaidReadyToBillOrders.length > 0 ? "1.5px solid #86efac" : "1.5px solid #cbd5e1",
+                        color: paidReadyOrders.length > 0 ? "#c2410c" : unpaidReadyToBillOrders.length > 0 ? "#15803d" : "#475569",
                         padding: "4px 10px",
                         borderRadius: "8px",
                         fontWeight: "800",
@@ -2172,21 +2782,45 @@ export default function Dashboard({ initialTab = "sales" }) {
                         cursor: "pointer",
                         display: "flex",
                         alignItems: "center",
-                        gap: "5px"
+                        gap: "6px"
                       }}
                       title="View Live Table Orders & KOT"
                     >
                       <span>🍽️ TABLES</span>
-                      {activeKitchenOrders.length > 0 && (
+                      {paidReadyOrders.length > 0 && (
                         <span style={{
-                          backgroundColor: servedTableOrders.length > 0 ? "#16a34a" : "#64748b",
+                          backgroundColor: "#ea580c",
                           color: "#fff",
                           borderRadius: "10px",
                           padding: "0 6px",
                           fontSize: "10.5px",
                           fontWeight: "800"
                         }}>
-                          {servedTableOrders.length > 0 ? `🔔 ${servedTableOrders.length}` : activeKitchenOrders.length}
+                          🛎️ {paidReadyOrders.length}
+                        </span>
+                      )}
+                      {unpaidReadyToBillOrders.length > 0 && (
+                        <span style={{
+                          backgroundColor: "#16a34a",
+                          color: "#fff",
+                          borderRadius: "10px",
+                          padding: "0 6px",
+                          fontSize: "10.5px",
+                          fontWeight: "800"
+                        }}>
+                          🔔 {unpaidReadyToBillOrders.length}
+                        </span>
+                      )}
+                      {paidReadyOrders.length === 0 && unpaidReadyToBillOrders.length === 0 && activeKitchenOrders.length > 0 && (
+                        <span style={{
+                          backgroundColor: "#64748b",
+                          color: "#fff",
+                          borderRadius: "10px",
+                          padding: "0 6px",
+                          fontSize: "10.5px",
+                          fontWeight: "800"
+                        }}>
+                          {activeKitchenOrders.length}
                         </span>
                       )}
                     </button>
@@ -2515,21 +3149,109 @@ export default function Dashboard({ initialTab = "sales" }) {
 
             {/* RIGHT SIDE: Products Grid Matching Image 2 */}
             <div style={styles.posRightPane}>
-              {/* LIVE TABLE & PARCEL ORDERS READY FOR BILLING BANNER */}
-              {isRestaurant && servedTableOrders.length > 0 && (() => {
-                const tableOrdersList = servedTableOrders.filter((o) => getOrderClassification(o).isTable);
-                const parcelOrdersList = servedTableOrders.filter((o) => getOrderClassification(o).isParcel);
+              {/* 1. PAID ORDERS READY FOR CUSTOMER PICKUP BANNER (Orange/Amber Alert) */}
+              {isRestaurant && paidReadyOrders.length > 0 && (() => {
+                const pickupSummary = paidReadyOrders
+                  .map((o) => {
+                    const c = getOrderClassification(o);
+                    const tok = o.tokenNumber || o.tokenNo ? `Token #${o.tokenNumber || o.tokenNo}` : (o.orderNumber || "Order");
+                    const cust = c.customerName && c.customerName !== "Walk-in Customer" ? ` (${c.customerName})` : "";
+                    const bNo = o.billNo ? ` • Bill #${o.billNo}` : "";
+                    return `${tok}${cust}${bNo}`;
+                  })
+                  .join(", ");
+
+                return (
+                  <div
+                    onClick={() => {
+                      setTableOrderTab("pickup");
+                      setShowTableOrdersModal(true);
+                    }}
+                    style={{
+                      backgroundColor: "#fff7ed",
+                      border: "1.5px solid #fdba74",
+                      borderRadius: "14px",
+                      padding: "12px 18px",
+                      marginBottom: "12px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      cursor: "pointer",
+                      boxShadow: "0 4px 14px rgba(234, 88, 12, 0.12)",
+                      transition: "all 0.2s ease",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                      <div style={{
+                        width: "38px",
+                        height: "38px",
+                        borderRadius: "10px",
+                        backgroundColor: "#ea580c",
+                        color: "#fff",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: "20px"
+                      }}>
+                        🛎️
+                      </div>
+                      <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <span style={{ fontWeight: "800", color: "#9a3412", fontSize: "14px" }}>
+                            {paidReadyOrders.length} Paid Order{paidReadyOrders.length > 1 ? "s" : ""} Ready for Customer Pickup!
+                          </span>
+                          <span style={{
+                            backgroundColor: "#16a34a",
+                            color: "#ffffff",
+                            fontSize: "11px",
+                            fontWeight: "900",
+                            padding: "2px 7px",
+                            borderRadius: "6px"
+                          }}>
+                            PAID ✅
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "12px", color: "#c2410c", marginTop: "2px" }}>
+                          🎟️ {pickupSummary} • Food is cooked & packed! Hand over to customer.
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        backgroundColor: "#ea580c",
+                        color: "#ffffff",
+                        padding: "8px 16px",
+                        borderRadius: "10px",
+                        fontWeight: "800",
+                        fontSize: "12.5px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        whiteSpace: "nowrap"
+                      }}
+                    >
+                      <span>Hand Over ({paidReadyOrders.length})</span>
+                      <span>→</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* 2. LIVE UNPAID TABLE & PARCEL ORDERS READY FOR BILLING BANNER (Green Alert) */}
+              {isRestaurant && unpaidReadyToBillOrders.length > 0 && (() => {
+                const tableOrdersList = unpaidReadyToBillOrders.filter((o) => getOrderClassification(o).isTable);
+                const parcelOrdersList = unpaidReadyToBillOrders.filter((o) => getOrderClassification(o).isParcel);
                 const bannerTitle =
                   tableOrdersList.length > 0 && parcelOrdersList.length > 0
-                    ? `${servedTableOrders.length} Orders Ready to Bill (${tableOrdersList.length} Tables, ${parcelOrdersList.length} Parcels) 🧾`
+                    ? `${unpaidReadyToBillOrders.length} Orders Ready to Bill (${tableOrdersList.length} Tables, ${parcelOrdersList.length} Parcels) 🧾`
                     : tableOrdersList.length > 0
                     ? `${tableOrdersList.length} Table Order${tableOrdersList.length > 1 ? "s" : ""} Served — Ready to Bill! 🧾`
                     : `${parcelOrdersList.length} Parcel Order${parcelOrdersList.length > 1 ? "s" : ""} Ready & Packed! 🥡`;
 
-                const namesSummary = servedTableOrders
+                const namesSummary = unpaidReadyToBillOrders
                   .map((o) => {
                     const c = getOrderClassification(o);
-                    return c.isParcel ? `🥡 PARCEL: ${c.customerName}` : `🍽️ ${c.tableNo}`;
+                    return c.isParcel ? `🥡 PARCEL: ${c.customerName || "Customer"}` : `🍽️ ${c.tableNo || "Table"}`;
                   })
                   .join(", ");
 
@@ -2577,9 +3299,10 @@ export default function Dashboard({ initialTab = "sales" }) {
                         display: "flex",
                         alignItems: "center",
                         gap: "6px",
+                        whiteSpace: "nowrap"
                       }}
                     >
-                      <span>Bill Orders ({servedTableOrders.length})</span>
+                      <span>Bill Orders ({unpaidReadyToBillOrders.length})</span>
                       <span>→</span>
                     </div>
                   </div>
@@ -2588,18 +3311,53 @@ export default function Dashboard({ initialTab = "sales" }) {
 
               {/* Top Compact Stat Cards Row & Welcome Banner on Right Side */}
               <div style={styles.salesStatsBanner}>
-                {/* Top Row: Welcome & Subtitle + Timeframe Selector */}
+                {/* Top Row: Full Width Search Bar + Timeframe Selector */}
                 <div style={styles.salesStatsHeaderRow}>
-                  <div>
-                    <h2 style={styles.salesStatsWelcomeTitle}>
-                      Welcome back, {userProfile.name ? userProfile.name.split(" ")[0] : (isRestaurant ? "Chef" : "Owner")}! 👋
-                    </h2>
-                    <p style={styles.salesStatsWelcomeSub}>
-                      Here's what's happening with your {isRestaurant ? "restaurant" : "store"} today.
-                    </p>
+                  {/* Full Width Professional Search Bar */}
+                  <div style={{
+                    flex: 1,
+                    minWidth: 0,
+                    marginRight: "14px"
+                  }}>
+                    <div style={{
+                      ...styles.searchBarContainer,
+                      height: "42px",
+                      backgroundColor: "#ffffff",
+                      borderRadius: "10px",
+                      boxShadow: searchFocused ? "0 0 0 3.5px rgba(252, 128, 25, 0.14)" : "0 1px 3px rgba(0, 0, 0, 0.04)",
+                      borderColor: searchFocused ? "#fc8019" : "#cbd5e1",
+                      ...(searchFocused ? styles.searchBarFocused : {})
+                    }}>
+                      <span style={{ ...styles.searchIcon, fontSize: "15px" }}>🔍</span>
+                      <input 
+                        ref={searchInputRef}
+                        type="text"
+                        placeholder={isRestaurant ? "Search food or menu items... (Press / to search)" : `Search ${isGlobalMode ? "global" : "local"} products... (Press / to search)`}
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onFocus={() => setSearchFocused(true)}
+                        onBlur={() => setSearchFocused(false)}
+                        style={{ ...styles.searchInput, fontSize: "13.5px" }}
+                      />
+                      {searchQuery ? (
+                        <button 
+                          type="button"
+                          onClick={() => {
+                            setSearchQuery("");
+                            if (searchInputRef.current) searchInputRef.current.focus();
+                          }}
+                          style={styles.searchClearBtn}
+                          title="Clear search"
+                        >
+                          ✕
+                        </button>
+                      ) : (
+                        <kbd style={styles.searchKbdHint} title="Press / to focus search">/</kbd>
+                      )}
+                    </div>
                   </div>
 
-                  <div style={styles.statsTimeframePill}>
+                  <div style={{ ...styles.statsTimeframePill, flexShrink: 0 }}>
                     <button
                       type="button"
                       onClick={() => setStatsTimeframe("today")}
@@ -2709,6 +3467,27 @@ export default function Dashboard({ initialTab = "sales" }) {
                     <div style={styles.statCardValue}>{statAvgOrderText}</div>
                     <div style={styles.statCardSubtext}>
                       <span style={styles.statCardArrowUp}>↑</span> {statAvgGrowth}
+                    </div>
+                  </div>
+
+                  {/* CARD 5: Waste & Spoilage Loss */}
+                  <div
+                    style={{ ...styles.salesStatCard, cursor: "pointer", border: "1px solid #fee2e2", backgroundColor: "#fffafa" }}
+                    onClick={() => setActiveTab("waste")}
+                    title="Click to view Waste & Spoilage Management"
+                  >
+                    <div style={styles.statCardHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                        <div style={{ ...styles.statCardIconCircle, backgroundColor: "#ef4444" }}>
+                          <span style={{ fontSize: "11px" }}>📉</span>
+                        </div>
+                        <span style={{ ...styles.statCardTitle, color: "#991b1b" }}>Waste Loss</span>
+                      </div>
+                      <span style={{ ...styles.statCardThreeDots, color: "#ef4444", fontWeight: "700" }} title="Open Waste Management">→</span>
+                    </div>
+                    <div style={{ ...styles.statCardValue, color: "#dc2626" }}>{statWasteLossText}</div>
+                    <div style={{ ...styles.statCardSubtext, color: "#b91c1c" }}>
+                      <span>⚠️</span> {statsTimeframe === "today" ? `${wasteStats.todayQuantity} units lost today` : `${wasteStats.totalQuantity} units lost overall`}
                     </div>
                   </div>
                 </div>
@@ -2875,6 +3654,23 @@ export default function Dashboard({ initialTab = "sales" }) {
           <StaffManagement onBack={() => setActiveTab("sales")} />
         )}
 
+        {/* RECIPE MANAGEMENT & FOOD COSTING TAB */}
+        {activeTab === "recipes" && (
+          <RecipeManagement
+            products={products}
+            userProfile={userProfile}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
+        {/* WASTE & SPOILAGE MANAGEMENT TAB (SHOP & RESTAURANT) */}
+        {activeTab === "waste" && (
+          <WasteManagement
+            userProfile={userProfile}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
         {/* TAB 2: DASHBOARD */}
         {activeTab === "dashboard" && (
           <div style={{ padding: "24px", paddingBottom: "80px", maxWidth: "1400px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
@@ -2963,9 +3759,34 @@ export default function Dashboard({ initialTab = "sales" }) {
                   {isRestaurant ? "MENU" : isGlobalMode ? "GLOBAL" : "LOCAL"} ({products.length} Items)
                 </span>
               </div>
-              <button onClick={openAddModal} style={styles.addNewBtn}>
-                {isRestaurant ? "+ Add New Food" : isGlobalMode ? "+ Add Global Product" : "+ Add Local Product"}
-              </button>
+              <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                {isRestaurant && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("recipes")}
+                    style={{
+                      backgroundColor: "#fff7ed",
+                      border: "1.5px solid #fed7aa",
+                      color: "#c2410c",
+                      padding: "8px 16px",
+                      borderRadius: "10px",
+                      fontWeight: "800",
+                      fontSize: "12.5px",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px"
+                    }}
+                  >
+                    <span>🥘</span>
+                    <span>Recipes & Food Costing</span>
+                    <span>→</span>
+                  </button>
+                )}
+                <button onClick={openAddModal} style={styles.addNewBtn}>
+                  {isRestaurant ? "+ Add New Food" : isGlobalMode ? "+ Add Global Product" : "+ Add Local Product"}
+                </button>
+              </div>
             </div>
             {products.length === 0 ? (
               <div style={styles.centerBox}>
@@ -2989,8 +3810,28 @@ export default function Dashboard({ initialTab = "sales" }) {
                     <div style={styles.productDetails}>
                       <h4 style={styles.productName}>{item.itemName || item.name}</h4>
                       <p style={styles.productCategory}>₹{item.salesPrice || item.price || 0}</p>
-                      <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                      {item.makingCost !== undefined && item.makingCost > 0 && (
+                        <div style={{ fontSize: "11px", color: "#16a34a", fontWeight: "800", marginTop: "2px", backgroundColor: "#f0fdf4", padding: "2px 6px", borderRadius: "6px", display: "inline-block" }}>
+                          Making: ₹{item.makingCost} • Profit: +₹{item.grossProfit} ({item.profitMarginPercent}%)
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: "8px", marginTop: "10px", flexWrap: "wrap" }}>
                         <button onClick={() => openEditModal(item)} style={styles.editCardBtn}>✏️ Edit</button>
+                        {isRestaurant && (
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab("recipes")}
+                            style={{
+                              ...styles.editCardBtn,
+                              backgroundColor: "#fff7ed",
+                              color: "#c2410c",
+                              border: "1px solid #fed7aa",
+                            }}
+                            title="Configure Recipe & Ingredients Costing"
+                          >
+                            🥘 Recipe
+                          </button>
+                        )}
                         <button onClick={() => handleDeleteProduct(item.id)} style={styles.deleteCardBtn}>🗑️ Delete</button>
                       </div>
                     </div>
@@ -3001,178 +3842,28 @@ export default function Dashboard({ initialTab = "sales" }) {
           </div>
         )}
 
-        {/* TAB 4: ORDERS */}
-        {activeTab === "orders" && (() => {
-          const localOrdersCount = ordersList.filter(o => (o.isGlobalMode || false) === false && o.appMode !== "global").length;
-          const globalOrdersCount = ordersList.filter(o => o.isGlobalMode === true || o.appMode === "global").length;
-          const displayedOrders = ordersList.filter(o => {
-            if (orderModeFilter === "all") return true;
-            const isOrdGlobal = o.isGlobalMode === true || o.appMode === "global";
-            if (orderModeFilter === "local") return !isOrdGlobal;
-            if (orderModeFilter === "global") return isOrdGlobal;
-            return isGlobalMode ? isOrdGlobal : !isOrdGlobal;
-          });
-
-          return (
-            <div style={{ padding: "30px", maxWidth: "1000px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
-                <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
-                  {isRestaurant ? "📋 Restaurant Orders & Bills" : isGlobalMode ? "🌐 Global Orders & Billing" : "🏪 Local Orders & Billing"}
-                </h2>
-              </div>
-
-              {/* Order Mode Filter Pills */}
-              <div style={{ display: "flex", gap: "8px", marginBottom: "20px", flexWrap: "wrap", alignItems: "center" }}>
-                <button 
-                  onClick={() => setOrderModeFilter("current")} 
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: "20px",
-                    border: "1.5px solid " + (orderModeFilter === "current" ? (isGlobalMode ? "#10b981" : "#6366f1") : "#e2e8f0"),
-                    backgroundColor: orderModeFilter === "current" ? (isGlobalMode ? "#ecfdf5" : "#eef2ff") : "#fff",
-                    color: orderModeFilter === "current" ? (isGlobalMode ? "#059669" : "#4f46e5") : "#64748b",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    cursor: "pointer"
-                  }}
-                >
-                  Current Active Mode ({isGlobalMode ? `Global: ${globalOrdersCount}` : `Local: ${localOrdersCount}`})
-                </button>
-
-                <button 
-                  onClick={() => setOrderModeFilter("local")} 
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: "20px",
-                    border: "1.5px solid " + (orderModeFilter === "local" ? "#6366f1" : "#e2e8f0"),
-                    backgroundColor: orderModeFilter === "local" ? "#eef2ff" : "#fff",
-                    color: orderModeFilter === "local" ? "#4f46e5" : "#64748b",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    cursor: "pointer"
-                  }}
-                >
-                  🏪 Local Orders ({localOrdersCount})
-                </button>
-
-                <button 
-                  onClick={() => setOrderModeFilter("global")} 
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: "20px",
-                    border: "1.5px solid " + (orderModeFilter === "global" ? "#10b981" : "#e2e8f0"),
-                    backgroundColor: orderModeFilter === "global" ? "#ecfdf5" : "#fff",
-                    color: orderModeFilter === "global" ? "#059669" : "#64748b",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    cursor: "pointer"
-                  }}
-                >
-                  🌐 Global Orders ({globalOrdersCount})
-                </button>
-
-                <button 
-                  onClick={() => setOrderModeFilter("all")} 
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: "20px",
-                    border: "1.5px solid " + (orderModeFilter === "all" ? "#0f172a" : "#e2e8f0"),
-                    backgroundColor: orderModeFilter === "all" ? "#f1f5f9" : "#fff",
-                    color: orderModeFilter === "all" ? "#0f172a" : "#64748b",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    cursor: "pointer"
-                  }}
-                >
-                  All Orders ({ordersList.length})
-                </button>
-              </div>
-
-              {displayedOrders.length === 0 ? (
-                <div style={styles.centerBox}>
-                  No {orderModeFilter === "local" ? "local" : orderModeFilter === "global" ? "global" : ""} orders recorded yet.
-                </div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                  {displayedOrders.map((order, idx) => {
-                    const isOrdGlobal = order.isGlobalMode === true || order.appMode === "global";
-                    const classification = getOrderClassification(order);
-                    return (
-                      <div key={order.id || idx} onClick={() => setSelectedOrderDetails(order)} style={{ backgroundColor: "#fff", borderRadius: "16px", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", flexWrap: "wrap", gap: "10px" }}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px", flexWrap: "wrap" }}>
-                            <h4 style={{ margin: 0, fontSize: "16px" }}>Order ID: #{order.id.slice(-6).toUpperCase()}</h4>
-                            <span style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              gap: "4px",
-                              fontSize: "10px",
-                              fontWeight: "800",
-                              padding: "2px 8px",
-                              borderRadius: "10px",
-                              backgroundColor: isOrdGlobal ? "#ecfdf5" : "#eef2ff",
-                              color: isOrdGlobal ? "#059669" : "#4f46e5"
-                            }}>
-                              {isOrdGlobal ? "🌐 Global" : "🏪 Local"}
-                            </span>
-                            {classification.isTable && (
-                              <span style={{
-                                fontSize: "10px",
-                                fontWeight: "800",
-                                padding: "2px 8px",
-                                borderRadius: "10px",
-                                backgroundColor: "#e0f2fe",
-                                color: "#0369a1"
-                              }}>
-                                🍽️ {classification.tableNo}
-                              </span>
-                            )}
-                            {classification.isParcel && (
-                              <span style={{
-                                fontSize: "10px",
-                                fontWeight: "800",
-                                padding: "2px 8px",
-                                borderRadius: "10px",
-                                backgroundColor: "#fef3c7",
-                                color: "#b45309"
-                              }}>
-                                🥡 PARCEL
-                              </span>
-                            )}
-                          </div>
-                          <p style={{ margin: "0 0 4px 0", fontSize: "12px", color: "#64748b" }}>
-                            Customer: {order.customerName || "Walk-in"}
-                            {classification.isTable ? ` | Table: ${classification.tableNo}` : classification.isParcel ? ` | PARCEL` : ""}
-                            {" | Payment: " + (order.paymentMethod || order.paymentMode || "Cash")}
-                          </p>
-                          <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>Total: <strong style={{ color: "#fc8019" }}>₹{order.totalAmount || order.total}</strong></p>
-                        </div>
-                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
-                          <button 
-                            type="button"
-                            onClick={() => handlePrintBill(order, "posReceipt")} 
-                            style={styles.printBillBtn}
-                            title="Print Thermal Receipt"
-                          >
-                            🧾 Receipt
-                          </button>
-                          <button 
-                            type="button"
-                            onClick={() => handlePrintBill(order, "salesInvoice")} 
-                            style={{ ...styles.printBillBtn, backgroundColor: "#0f172a", color: "#ffffff", borderColor: "#0f172a" }}
-                            title="Print A4 / Sheet Tax Invoice"
-                          >
-                            📄 Invoice
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          );
-        })()}
+        {/* TAB 4: ONLINE ORDERS & DELIVERY (Real-time synced with Mobile App) */}
+        {activeTab === "orders" && (
+          <OnlineOrders
+            db={db}
+            uid={auth.currentUser?.uid || localStorage.getItem("uid") || ""}
+            onlineOrders={onlineOrdersList}
+            salesOrders={ordersList}
+            deliveryStaffList={deliveryStaffList}
+            doorDeliveryEnabled={doorDeliveryEnabled}
+            setDoorDeliveryEnabled={setDoorDeliveryEnabled}
+            shopProfile={{
+              name: userProfile.shopName || userProfile.name || userProfile.storeName || "My Store",
+              address: userProfile.address || "",
+              phone: userProfile.phone || userProfile.mobile || "",
+            }}
+            isGlobalMode={isGlobalMode}
+            isRestaurant={isRestaurant}
+            onViewBillDetails={(bill) => {
+              setSelectedOrderDetails(bill);
+            }}
+          />
+        )}
       </div>
 
       {/* HOLD ORDER MODAL */}
@@ -3508,6 +4199,17 @@ export default function Dashboard({ initialTab = "sales" }) {
             <form onSubmit={handleFinalCheckoutSubmit} style={styles.modalForm}>
               <div style={{ backgroundColor: "#fff7ed", padding: "12px 16px", borderRadius: "10px", border: "1px solid #fed7aa", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontSize: "14px", fontWeight: "700", color: "#9a3412" }}>Total Items: {totalBillItemsCount}</span>
+                <span style={{
+                  backgroundColor: "#ea580c",
+                  color: "#ffffff",
+                  padding: "3px 10px",
+                  borderRadius: "8px",
+                  fontSize: "13px",
+                  fontWeight: "900",
+                  letterSpacing: "0.5px"
+                }}>
+                  🎟️ Token: #{activeTableOrderInfo?.tokenNumber || getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: auth.currentUser?.uid || localStorage.getItem("uid") })}
+                </span>
                 <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>₹{totalBillAmount}.00</span>
               </div>
 
@@ -3604,6 +4306,31 @@ export default function Dashboard({ initialTab = "sales" }) {
                 </div>
               </div>
 
+              {/* WhatsApp E-Bill Option */}
+              <div style={{ width: "100%", marginTop: "-4px", marginBottom: "8px" }}>
+                <label style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  fontSize: "12.5px",
+                  color: "#166534",
+                  fontWeight: "700",
+                  cursor: "pointer",
+                  backgroundColor: "#f0fdf4",
+                  padding: "8px 12px",
+                  borderRadius: "8px",
+                  border: "1px solid #bbf7d0"
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={sendWhatsAppBill}
+                    onChange={(e) => setSendWhatsAppBill(e.target.checked)}
+                    style={{ accentColor: "#16a34a", width: "16px", height: "16px", cursor: "pointer" }}
+                  />
+                  <span>📲 Send E-Bill via WhatsApp {customerPhone.trim() ? `to ${customerPhone.trim()}` : "(Opens WhatsApp with E-Bill)"}</span>
+                </label>
+              </div>
+
               <div style={styles.inputGroup}>
                 <label style={styles.label}>Select Payment Method</label>
                 <div style={styles.paymentCardsGrid}>
@@ -3667,8 +4394,29 @@ export default function Dashboard({ initialTab = "sales" }) {
                 </div>
               )}
 
-              <div style={styles.modalBtns}>
-                <button type="submit" style={styles.saveModalBtn}>Confirm & Print Bill 🖨️</button>
+              <div style={{ ...styles.modalBtns, display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <button type="submit" style={{ ...styles.saveModalBtn, flex: 1, minWidth: "150px" }}>
+                  Confirm & Print Bill 🖨️
+                </button>
+                <button 
+                  type="button" 
+                  onClick={(e) => {
+                    setSendWhatsAppBill(true);
+                    handleFinalCheckoutSubmit(e);
+                  }}
+                  style={{ 
+                    ...styles.saveModalBtn, 
+                    flex: 1, 
+                    minWidth: "150px", 
+                    backgroundColor: "#16a34a", 
+                    display: "flex", 
+                    alignItems: "center", 
+                    justifyContent: "center", 
+                    gap: "6px" 
+                  }}
+                >
+                  <span>Confirm & WhatsApp 📲</span>
+                </button>
                 <button type="button" onClick={() => setIsCheckoutModalOpen(false)} style={styles.cancelModalBtn}>Cancel</button>
               </div>
             </form>
@@ -3714,6 +4462,32 @@ export default function Dashboard({ initialTab = "sales" }) {
             <div style={{ display: "flex", gap: "8px", marginBottom: "16px", backgroundColor: "#f1f5f9", padding: "4px", borderRadius: "12px" }}>
               <button
                 type="button"
+                onClick={() => setTableOrderTab("pickup")}
+                style={{
+                  flex: 1,
+                  padding: "10px 14px",
+                  borderRadius: "9px",
+                  border: "none",
+                  fontWeight: "800",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  backgroundColor: tableOrderTab === "pickup" ? "#ffffff" : "transparent",
+                  color: tableOrderTab === "pickup" ? "#c2410c" : "#64748b",
+                  boxShadow: tableOrderTab === "pickup" ? "0 2px 6px rgba(0,0,0,0.06)" : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "6px"
+                }}
+              >
+                <span>🛎️ Ready for Pickup</span>
+                <span style={{ backgroundColor: "#ffedd5", color: "#c2410c", padding: "1px 7px", borderRadius: "10px", fontSize: "11px", fontWeight: "800" }}>
+                  {paidReadyOrders.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setTableOrderTab("served")}
                 style={{
                   flex: 1,
@@ -3733,8 +4507,8 @@ export default function Dashboard({ initialTab = "sales" }) {
                 }}
               >
                 <span>🔔 Ready to Bill</span>
-                <span style={{ backgroundColor: "#dcfce7", color: "#166534", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
-                  {servedTableOrders.length}
+                <span style={{ backgroundColor: "#dcfce7", color: "#166534", padding: "1px 7px", borderRadius: "10px", fontSize: "11px", fontWeight: "800" }}>
+                  {unpaidReadyToBillOrders.length}
                 </span>
               </button>
 
@@ -3759,7 +4533,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                 }}
               >
                 <span>🍳 In Kitchen</span>
-                <span style={{ backgroundColor: "#ffedd5", color: "#c2410c", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
+                <span style={{ backgroundColor: "#ffedd5", color: "#c2410c", padding: "1px 7px", borderRadius: "10px", fontSize: "11px", fontWeight: "800" }}>
                   {cookingTableOrders.length}
                 </span>
               </button>
@@ -3785,7 +4559,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                 }}
               >
                 <span>📋 All Orders</span>
-                <span style={{ backgroundColor: "#e0f2fe", color: "#0369a1", padding: "1px 7px", borderRadius: "10px", fontSize: "11px" }}>
+                <span style={{ backgroundColor: "#e0f2fe", color: "#0369a1", padding: "1px 7px", borderRadius: "10px", fontSize: "11px", fontWeight: "800" }}>
                   {activeKitchenOrders.length}
                 </span>
               </button>
@@ -3794,8 +4568,10 @@ export default function Dashboard({ initialTab = "sales" }) {
             {/* Orders Scrollable List */}
             <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px", paddingRight: "4px" }}>
               {(() => {
-                const displayList = tableOrderTab === "served"
-                  ? servedTableOrders
+                const displayList = tableOrderTab === "pickup"
+                  ? paidReadyOrders
+                  : tableOrderTab === "served"
+                  ? unpaidReadyToBillOrders
                   : tableOrderTab === "kitchen"
                   ? cookingTableOrders
                   : activeKitchenOrders;
@@ -3804,13 +4580,21 @@ export default function Dashboard({ initialTab = "sales" }) {
                   return (
                     <div style={{ textAlign: "center", padding: "50px 20px", color: "#94a3b8" }}>
                       <div style={{ fontSize: "42px", marginBottom: "8px" }}>
-                        {tableOrderTab === "served" ? "🔔" : "🍳"}
+                        {tableOrderTab === "pickup" ? "🛎️" : tableOrderTab === "served" ? "🔔" : "🍳"}
                       </div>
                       <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155" }}>
-                        {tableOrderTab === "served" ? "No table orders waiting for billing" : "No active orders in kitchen"}
+                        {tableOrderTab === "pickup"
+                          ? "No paid orders waiting for customer pickup"
+                          : tableOrderTab === "served"
+                          ? "No table orders waiting for billing"
+                          : "No active orders in kitchen"}
                       </div>
                       <p style={{ margin: "4px 0 0 0", fontSize: "13px" }}>
-                        {tableOrderTab === "served" ? "When a waiter marks a table order as 'Served', it appears here ready for checkout!" : "New KOT orders from waiters or counter will appear here in real-time."}
+                        {tableOrderTab === "pickup"
+                          ? "When kitchen cooks food for already-paid counter or parcel orders, they appear here ready for customer handover!"
+                          : tableOrderTab === "served"
+                          ? "When a waiter marks an unpaid table order as 'Served', it appears here ready for checkout!"
+                          : "New KOT orders from waiters or counter will appear here in real-time."}
                       </p>
                     </div>
                   );
@@ -3822,6 +4606,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                   const isServed = order.status === "served";
                   const isReady = order.status === "ready";
                   const isPreparing = order.status === "preparing";
+                  const isPaidOrder = order.isPaid === true || !!order.billNo || !!order.billedAt || !!order.billedAtMs;
                   const orderTotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price || i.salesPrice || 0) * Number(i.qty || 1)), 0);
 
                   const cardTitle = isParcel
@@ -3830,24 +4615,53 @@ export default function Dashboard({ initialTab = "sales" }) {
                     ? classification.tableNo
                     : `Counter Order (${classification.customerName})`;
 
+                  const isPickupReady = isPaidOrder && (isReady || isServed);
+                  const isBillReady = !isPaidOrder && (isServed || (isParcel && isReady));
+
                   return (
                     <div
                       key={order.id}
                       style={{
-                        backgroundColor: (isServed || (isParcel && isReady)) ? "#f0fdf4" : "#ffffff",
-                        border: (isServed || (isParcel && isReady)) ? "2px solid #86efac" : "1.5px solid #e2e8f0",
+                        backgroundColor: isPickupReady ? "#fff7ed" : isBillReady ? "#f0fdf4" : "#ffffff",
+                        border: isPickupReady ? "2px solid #fdba74" : isBillReady ? "2px solid #86efac" : "1.5px solid #e2e8f0",
                         borderRadius: "16px",
                         padding: "16px",
-                        boxShadow: (isServed || (isParcel && isReady)) ? "0 4px 12px rgba(34, 197, 94, 0.12)" : "0 2px 6px rgba(0,0,0,0.04)"
+                        boxShadow: isPickupReady ? "0 4px 12px rgba(234, 88, 12, 0.12)" : isBillReady ? "0 4px 12px rgba(34, 197, 94, 0.12)" : "0 2px 6px rgba(0,0,0,0.04)"
                       }}
                     >
                       {/* Card Header Row */}
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
                         <div>
                           <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                            {(order.tokenNumber || order.tokenNo) && (
+                              <span style={{
+                                fontSize: "12px",
+                                fontWeight: "900",
+                                padding: "3px 9px",
+                                borderRadius: "8px",
+                                backgroundColor: "#ffedd5",
+                                color: "#c2410c",
+                                border: "1.5px solid #fdba74"
+                              }}>
+                                🎟️ TOKEN #{order.tokenNumber || order.tokenNo}
+                              </span>
+                            )}
                             <span style={{ fontSize: "18px", fontWeight: "900", color: "#0f172a" }}>
                               {cardTitle}
                             </span>
+                            {isPaidOrder && (
+                              <span style={{
+                                fontSize: "11px",
+                                fontWeight: "900",
+                                padding: "2px 8px",
+                                borderRadius: "8px",
+                                backgroundColor: "#dcfce7",
+                                color: "#15803d",
+                                border: "1px solid #86efac"
+                              }}>
+                                PAID ✅
+                              </span>
+                            )}
                             <span style={{
                               fontSize: "11px",
                               fontWeight: "800",
@@ -3858,6 +4672,11 @@ export default function Dashboard({ initialTab = "sales" }) {
                             }}>
                               {isParcel ? "🥡 PARCEL" : classification.isTable ? "🍽️ DINE-IN" : "⚡ COUNTER"}
                             </span>
+                            {order.billNo && (
+                              <span style={{ fontSize: "12px", color: "#0369a1", fontWeight: "700" }}>
+                                Bill #{order.billNo}
+                              </span>
+                            )}
                             <span style={{ fontSize: "12px", color: "#64748b", fontWeight: "600" }}>
                               #{order.orderNumber || "KOT"}
                             </span>
@@ -3874,7 +4693,11 @@ export default function Dashboard({ initialTab = "sales" }) {
 
                         {/* Status Badge */}
                         <div>
-                          {isServed ? (
+                          {isPaidOrder && (isReady || isServed) ? (
+                            <span style={{ backgroundColor: "#ea580c", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
+                              🛎️ READY FOR PICKUP
+                            </span>
+                          ) : isServed ? (
                             <span style={{ backgroundColor: "#16a34a", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
                               ✓ SERVED (Ready to Bill)
                             </span>
@@ -3949,49 +4772,121 @@ export default function Dashboard({ initialTab = "sales" }) {
 
                       {/* Card Action Buttons */}
                       <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", flexWrap: "wrap", marginTop: "10px" }}>
-                        <button
-                          type="button"
-                          onClick={() => handlePrintPreBill(order)}
-                          style={{
-                            padding: "8px 14px",
-                            backgroundColor: "#f8fafc",
-                            border: "1.5px solid #cbd5e1",
-                            borderRadius: "10px",
-                            color: "#334155",
-                            fontWeight: "700",
-                            fontSize: "12.5px",
-                            cursor: "pointer",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "5px"
-                          }}
-                          title="Print Table Slip with amounts before checkout"
-                        >
-                          <span>🖨️</span>
-                          <span>Print Table Slip</span>
-                        </button>
+                        {isPaidOrder ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleSendWhatsAppBill(order)}
+                              style={{
+                                padding: "8px 14px",
+                                backgroundColor: "#25D366",
+                                border: "none",
+                                borderRadius: "10px",
+                                color: "#ffffff",
+                                fontWeight: "800",
+                                fontSize: "12.5px",
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "5px"
+                              }}
+                              title="Send or resend e-bill to customer via WhatsApp"
+                            >
+                              <span>📲</span>
+                              <span>WhatsApp E-Bill</span>
+                            </button>
 
-                        <button
-                          type="button"
-                          onClick={() => handleLoadTableOrderToBill(order)}
-                          style={{
-                            padding: "8px 18px",
-                            backgroundColor: "#16a34a",
-                            border: "none",
-                            borderRadius: "10px",
-                            color: "#ffffff",
-                            fontWeight: "800",
-                            fontSize: "13px",
-                            cursor: "pointer",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            boxShadow: "0 2px 8px rgba(22, 163, 74, 0.28)"
-                          }}
-                        >
-                          <span>🧾</span>
-                          <span>Load into Bill & Print Receipt →</span>
-                        </button>
+                            <button
+                              type="button"
+                              onClick={() => handlePrintBill(order, "posReceipt")}
+                              style={{
+                                padding: "8px 14px",
+                                backgroundColor: "#f8fafc",
+                                border: "1.5px solid #cbd5e1",
+                                borderRadius: "10px",
+                                color: "#334155",
+                                fontWeight: "700",
+                                fontSize: "12.5px",
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "5px"
+                              }}
+                              title="Reprint Customer Bill Receipt"
+                            >
+                              <span>🖨️</span>
+                              <span>Reprint Bill</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleMarkOrderCompleted(order.id)}
+                              style={{
+                                padding: "8px 18px",
+                                backgroundColor: "#16a34a",
+                                border: "none",
+                                borderRadius: "10px",
+                                color: "#ffffff",
+                                fontWeight: "800",
+                                fontSize: "13px",
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                boxShadow: "0 2px 8px rgba(22, 163, 74, 0.28)"
+                              }}
+                            >
+                              <span>✅</span>
+                              <span>Food Handed Over / Complete</span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handlePrintPreBill(order)}
+                              style={{
+                                padding: "8px 14px",
+                                backgroundColor: "#f8fafc",
+                                border: "1.5px solid #cbd5e1",
+                                borderRadius: "10px",
+                                color: "#334155",
+                                fontWeight: "700",
+                                fontSize: "12.5px",
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "5px"
+                              }}
+                              title="Print Table Slip with amounts before checkout"
+                            >
+                              <span>🖨️</span>
+                              <span>Print Table Slip</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleLoadTableOrderToBill(order)}
+                              style={{
+                                padding: "8px 18px",
+                                backgroundColor: "#16a34a",
+                                border: "none",
+                                borderRadius: "10px",
+                                color: "#ffffff",
+                                fontWeight: "800",
+                                fontSize: "13px",
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                boxShadow: "0 2px 8px rgba(22, 163, 74, 0.28)"
+                              }}
+                            >
+                              <span>🧾</span>
+                              <span>Load into Bill & Print Receipt →</span>
+                            </button>
+                          </>
+                        )}
 
                         <button
                           type="button"
@@ -4126,7 +5021,24 @@ export default function Dashboard({ initialTab = "sales" }) {
       {selectedOrderDetails && (
         <div style={styles.modalOverlay} onClick={() => setSelectedOrderDetails(null)}>
           <div style={{ ...styles.modalBox, maxWidth: "450px" }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: 0, color: "#1e3a8a", textAlign: "center" }}>{userProfile.storeName} RECEIPT</h3>
+            <div style={{ textAlign: "center", marginBottom: "6px" }}>
+              <h3 style={{ margin: 0, color: "#1e3a8a" }}>{userProfile.storeName || "Turf Cafe"} RECEIPT</h3>
+              {(selectedOrderDetails.tokenNumber || selectedOrderDetails.tokenNo) && (
+                <div style={{
+                  display: "inline-block",
+                  backgroundColor: "#fff7ed",
+                  color: "#c2410c",
+                  border: "1.5px solid #fed7aa",
+                  padding: "2px 10px",
+                  borderRadius: "8px",
+                  fontSize: "13px",
+                  fontWeight: "900",
+                  marginTop: "6px"
+                }}>
+                  🎟️ TOKEN #{selectedOrderDetails.tokenNumber || selectedOrderDetails.tokenNo}
+                </div>
+              )}
+            </div>
             <p style={{ textAlign: "center", fontSize: "12px", color: "#64748b", margin: "4px 0 12px 0" }}>
               Customer: {selectedOrderDetails.customerName || "Walk-in"}
               {(() => {
@@ -4149,18 +5061,25 @@ export default function Dashboard({ initialTab = "sales" }) {
               <span>Total:</span>
               <span style={{ color: "#fc8019" }}>₹{selectedOrderDetails.totalAmount || selectedOrderDetails.total}</span>
             </div>
-            <div style={{ display: "flex", gap: "8px", marginTop: "16px" }}>
+            <div style={{ display: "flex", gap: "8px", marginTop: "16px", flexWrap: "wrap" }}>
               <button 
                 type="button" 
                 onClick={() => handlePrintBill(selectedOrderDetails, "posReceipt")} 
-                style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                style={{ flex: 1, minWidth: "100px", padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
               >
                 🧾 Print Receipt
               </button>
               <button 
                 type="button" 
+                onClick={() => handleSendWhatsAppBill(selectedOrderDetails)} 
+                style={{ flex: 1, minWidth: "100px", padding: "10px", backgroundColor: "#16a34a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px", display: "flex", alignItems: "center", justifyContent: "center", gap: "4px" }}
+              >
+                <span>📲 WhatsApp</span>
+              </button>
+              <button 
+                type="button" 
                 onClick={() => handlePrintBill(selectedOrderDetails, "salesInvoice")} 
-                style={{ flex: 1, padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                style={{ flex: 1, minWidth: "100px", padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
               >
                 📄 A4 Invoice
               </button>
@@ -4176,7 +5095,7 @@ export default function Dashboard({ initialTab = "sales" }) {
         </div>
       )}
 
-      {/* REAL-TIME COUNTER TOAST NOTIFICATION (Table Order Served & Parcel Food Ready) */}
+      {/* REAL-TIME COUNTER TOAST NOTIFICATION (Table Order Served & Food Ready) */}
       {counterToast && (
         <div
           style={{
@@ -4185,7 +5104,7 @@ export default function Dashboard({ initialTab = "sales" }) {
             left: "50%",
             transform: "translateX(-50%)",
             zIndex: 999999,
-            backgroundColor: "#065f46",
+            backgroundColor: counterToast.isPaid ? "#c2410c" : "#065f46",
             color: "#ffffff",
             padding: "12px 20px",
             borderRadius: "14px",
@@ -4199,35 +5118,153 @@ export default function Dashboard({ initialTab = "sales" }) {
             boxSizing: "border-box",
           }}
         >
-          <span style={{ fontSize: "20px" }}>🔔</span>
+          <span style={{ fontSize: "20px" }}>{counterToast.isPaid ? "🛎️" : "🔔"}</span>
           <span style={{ flex: 1 }}>{counterToast.message}</span>
-          <button
-            type="button"
-            onClick={() => {
-              setCounterToast(null);
-              setTableOrderTab("served");
-              setShowTableOrdersModal(true);
-            }}
-            style={{
-              backgroundColor: "#ffffff",
-              color: "#065f46",
-              border: "none",
-              padding: "5px 12px",
-              borderRadius: "8px",
-              fontWeight: "800",
-              fontSize: "12px",
-              cursor: "pointer",
-            }}
-          >
-            Load Bill ↗
-          </button>
+          {counterToast.isPaid ? (
+            <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={() => {
+                  handleMarkOrderCompleted(counterToast.id);
+                  setCounterToast(null);
+                }}
+                style={{
+                  backgroundColor: "#ffffff",
+                  color: "#c2410c",
+                  border: "none",
+                  padding: "6px 12px",
+                  borderRadius: "8px",
+                  fontWeight: "800",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap"
+                }}
+              >
+                ✅ Hand Over Food
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCounterToast(null);
+                  setTableOrderTab("pickup");
+                  setShowTableOrdersModal(true);
+                }}
+                style={{
+                  backgroundColor: "rgba(255,255,255,0.2)",
+                  color: "#ffffff",
+                  border: "1px solid rgba(255,255,255,0.4)",
+                  padding: "6px 10px",
+                  borderRadius: "8px",
+                  fontWeight: "700",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap"
+                }}
+              >
+                View ↗
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setCounterToast(null);
+                setTableOrderTab("served");
+                setShowTableOrdersModal(true);
+              }}
+              style={{
+                backgroundColor: "#ffffff",
+                color: "#065f46",
+                border: "none",
+                padding: "5px 12px",
+                borderRadius: "8px",
+                fontWeight: "800",
+                fontSize: "12px",
+                cursor: "pointer",
+                whiteSpace: "nowrap"
+              }}
+            >
+              Load Bill ↗
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setCounterToast(null)}
             style={{
               background: "transparent",
               border: "none",
-              color: "#a7f3d0",
+              color: counterToast.isPaid ? "#fed7aa" : "#a7f3d0",
+              cursor: "pointer",
+              fontSize: "18px",
+              fontWeight: "800",
+              padding: "0 4px",
+            }}
+            title="Dismiss notification"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* REAL-TIME ONLINE ORDER TOAST NOTIFICATION */}
+      {onlineOrderToast && (
+        <div
+          style={{
+            position: "fixed",
+            top: counterToast ? "76px" : "16px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 999999,
+            backgroundColor: onlineOrderToast.isDelivered ? "#059669" : "#4338ca",
+            color: "#ffffff",
+            padding: "12px 20px",
+            borderRadius: "14px",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            fontWeight: "800",
+            fontSize: "14px",
+            maxWidth: "92vw",
+            boxSizing: "border-box",
+          }}
+        >
+          <span style={{ fontSize: "22px" }}>{onlineOrderToast.isDelivered ? "🎉" : "🛵"}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: "13.5px" }}>{onlineOrderToast.message}</div>
+            {!onlineOrderToast.isDelivered && (
+              <div style={{ fontSize: "11px", opacity: 0.9, fontWeight: "500", marginTop: "1px" }}>
+                Click below to view details and assign delivery boy / pack order
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setOnlineOrderToast(null);
+              setActiveTab("orders");
+            }}
+            style={{
+              backgroundColor: "#ffffff",
+              color: onlineOrderToast.isDelivered ? "#059669" : "#4338ca",
+              border: "none",
+              padding: "5px 14px",
+              borderRadius: "8px",
+              fontWeight: "800",
+              fontSize: "12px",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            View Order ↗
+          </button>
+          <button
+            type="button"
+            onClick={() => setOnlineOrderToast(null)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#c7d2fe",
               cursor: "pointer",
               fontSize: "18px",
               fontWeight: "800",
@@ -4255,23 +5292,65 @@ export default function Dashboard({ initialTab = "sales" }) {
             <h3 style={{ margin: "0 0 8px 0", color: "#0f172a", fontSize: "20px", fontWeight: "800" }}>
               {popupModal.message.includes("Payment") ? "Payment Successful!" : "Success!"}
             </h3>
+
+            {(popupModal.lastOrder?.tokenNumber || popupModal.lastOrder?.tokenNo) && (
+              <div style={{
+                display: "inline-block",
+                backgroundColor: "#fff7ed",
+                border: "2px solid #ea580c",
+                color: "#c2410c",
+                padding: "6px 18px",
+                borderRadius: "10px",
+                fontSize: "20px",
+                fontWeight: "900",
+                marginBottom: "12px",
+                letterSpacing: "0.5px"
+              }}>
+                🎟️ TOKEN #{popupModal.lastOrder.tokenNumber || popupModal.lastOrder.tokenNo}
+              </div>
+            )}
+
             <p style={{ color: "#64748b", fontSize: "14px", marginBottom: "16px", lineHeight: "1.4" }}>{popupModal.message}</p>
             
             {popupModal.lastOrder && (
-              <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px" }}>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    type="button"
+                    onClick={() => handlePrintBill(popupModal.lastOrder, "posReceipt")}
+                    style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                  >
+                    🧾 Print Receipt
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handlePrintBill(popupModal.lastOrder, "salesInvoice")}
+                    style={{ flex: 1, padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                  >
+                    📄 A4 Invoice
+                  </button>
+                </div>
+
                 <button
                   type="button"
-                  onClick={() => handlePrintBill(popupModal.lastOrder, "posReceipt")}
-                  style={{ flex: 1, padding: "10px", backgroundColor: "#2563eb", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
+                  onClick={() => handleSendWhatsAppBill(popupModal.lastOrder)}
+                  style={{
+                    width: "100%",
+                    padding: "10px",
+                    backgroundColor: "#16a34a",
+                    color: "#ffffff",
+                    border: "none",
+                    borderRadius: "8px",
+                    fontWeight: "800",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: "6px"
+                  }}
                 >
-                  🧾 Print Receipt
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handlePrintBill(popupModal.lastOrder, "salesInvoice")}
-                  style={{ flex: 1, padding: "10px", backgroundColor: "#0f172a", color: "#fff", border: "none", borderRadius: "8px", fontWeight: "700", cursor: "pointer", fontSize: "13px" }}
-                >
-                  📄 A4 Invoice
+                  <span>📲 Send WhatsApp E-Bill</span>
                 </button>
               </div>
             )}
@@ -4819,12 +5898,427 @@ const styles = {
     boxSizing: "border-box",
     flexShrink: 0
   },
-  navLeftGroup: { display: "flex", alignItems: "center", gap: "16px", flexShrink: 0 },
+  navLeftGroup: { 
+    display: "flex", 
+    alignItems: "center", 
+    gap: "12px", 
+    flexShrink: 0 
+  },
+  hamburgerBtn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "38px",
+    height: "38px",
+    borderRadius: "10px",
+    border: "1.5px solid #e2e8f0",
+    backgroundColor: "#ffffff",
+    cursor: "pointer",
+    position: "relative",
+    flexShrink: 0,
+    transition: "all 0.15s ease",
+    padding: 0
+  },
+  hamburgerIconBox: {
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: "3.5px",
+    width: "18px"
+  },
+  hamburgerBar: {
+    width: "18px",
+    height: "2.2px",
+    backgroundColor: "#334155",
+    borderRadius: "2px"
+  },
+  hamburgerBadgeDot: {
+    position: "absolute",
+    top: "4px",
+    right: "4px",
+    width: "8px",
+    height: "8px",
+    backgroundColor: "#ef4444",
+    borderRadius: "50%",
+    border: "1.5px solid #ffffff",
+    boxShadow: "0 0 4px rgba(239, 68, 68, 0.6)"
+  },
   logoArea: { display: "flex", alignItems: "center", gap: "8px" },
   sidebarBrand: { fontSize: "16px", fontWeight: "800", color: "#1e3a8a", margin: 0, whiteSpace: "nowrap" },
-  searchBarContainer: { display: "flex", alignItems: "center", backgroundColor: "#f1f5f9", padding: "6px 12px", borderRadius: "8px", width: "220px", maxWidth: "220px", minWidth: "130px", flexShrink: 1, gap: "6px" },
-  searchInput: { border: "none", background: "transparent", outline: "none", width: "100%", fontSize: "12px", color: "#1e293b" },
-  searchIcon: { fontSize: "14px" },
+  navLinksGroup: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    flex: 1,
+    justifyContent: "center",
+    overflowX: "auto",
+    scrollbarWidth: "none",
+    msOverflowStyle: "none",
+    padding: "0 8px"
+  },
+  navTabBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "6px 12px",
+    borderRadius: "8px",
+    fontSize: "12.5px",
+    fontWeight: "600",
+    color: "#475569",
+    backgroundColor: "transparent",
+    border: "1.5px solid transparent",
+    cursor: "pointer",
+    transition: "all 0.15s ease",
+    whiteSpace: "nowrap",
+    userSelect: "none",
+    flexShrink: 0
+  },
+  navTabBtnActive: {
+    backgroundColor: "#fff7ed",
+    color: "#ea580c",
+    border: "1.5px solid #fed7aa",
+    fontWeight: "700",
+    boxShadow: "0 1px 2px rgba(234, 88, 12, 0.08)"
+  },
+  navTabBtnAlert: {
+    backgroundColor: "#f0fdf4",
+    color: "#15803d",
+    border: "1.5px solid #bbf7d0",
+    fontWeight: "700"
+  },
+  navBadgeRed: {
+    backgroundColor: "#ef4444",
+    color: "#ffffff",
+    fontSize: "10px",
+    fontWeight: "800",
+    padding: "1px 6px",
+    borderRadius: "10px",
+    lineHeight: "1.2"
+  },
+  navBadgeGreen: {
+    backgroundColor: "#16a34a",
+    color: "#ffffff",
+    fontSize: "10px",
+    fontWeight: "800",
+    padding: "1px 6px",
+    borderRadius: "10px",
+    lineHeight: "1.2"
+  },
+  navBadgeGray: {
+    backgroundColor: "#e2e8f0",
+    color: "#475569",
+    fontSize: "10px",
+    fontWeight: "700",
+    padding: "1px 6px",
+    borderRadius: "10px",
+    lineHeight: "1.2"
+  },
+  navCenterGroup: {
+    flex: 1,
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    minWidth: "220px",
+    maxWidth: "580px",
+    padding: "0 12px"
+  },
+  searchBarContainer: {
+    display: "flex",
+    alignItems: "center",
+    backgroundColor: "#f8fafc",
+    border: "1.5px solid #e2e8f0",
+    padding: "0 14px",
+    borderRadius: "12px",
+    width: "100%",
+    height: "42px",
+    boxSizing: "border-box",
+    gap: "10px",
+    transition: "all 0.2s ease",
+    boxShadow: "0 1px 2px rgba(0, 0, 0, 0.03)"
+  },
+  searchBarFocused: {
+    backgroundColor: "#ffffff",
+    borderColor: "#fc8019",
+    boxShadow: "0 0 0 3.5px rgba(252, 128, 25, 0.14), 0 2px 6px rgba(0, 0, 0, 0.04)"
+  },
+  searchInput: {
+    border: "none",
+    background: "transparent",
+    outline: "none",
+    width: "100%",
+    fontSize: "13.5px",
+    fontWeight: "500",
+    color: "#1e293b"
+  },
+  searchIcon: {
+    fontSize: "15px",
+    color: "#94a3b8"
+  },
+  searchClearBtn: {
+    background: "#e2e8f0",
+    border: "none",
+    borderRadius: "50%",
+    width: "18px",
+    height: "18px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: "10px",
+    cursor: "pointer",
+    color: "#475569",
+    padding: 0,
+    flexShrink: 0
+  },
+  searchKbdHint: {
+    fontSize: "11px",
+    fontWeight: "700",
+    color: "#94a3b8",
+    backgroundColor: "#f1f5f9",
+    padding: "2px 7px",
+    borderRadius: "6px",
+    border: "1px solid #e2e8f0",
+    fontFamily: "inherit",
+    userSelect: "none"
+  },
+  navRightGroup: {
+    display: "flex",
+    gap: "10px",
+    alignItems: "center",
+    flexShrink: 0
+  },
+  activeTabBadge: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    backgroundColor: "#fff7ed",
+    border: "1.5px solid #fed7aa",
+    padding: "5px 12px",
+    borderRadius: "10px",
+    cursor: "pointer",
+    transition: "all 0.15s ease",
+    userSelect: "none"
+  },
+  activeTabBadgeText: {
+    fontSize: "12.5px",
+    fontWeight: "800",
+    color: "#ea580c"
+  },
+  quickTableAlertBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    backgroundColor: "#dcfce7",
+    border: "1.5px solid #86efac",
+    padding: "5px 10px",
+    borderRadius: "10px",
+    cursor: "pointer",
+    fontWeight: "800",
+    fontSize: "12px",
+    color: "#15803d"
+  },
+  quickAlertBadge: {
+    backgroundColor: "#16a34a",
+    color: "#ffffff",
+    borderRadius: "10px",
+    padding: "1px 7px",
+    fontSize: "10.5px",
+    fontWeight: "800"
+  },
+  quickHeldAlertBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    backgroundColor: "#fef3c7",
+    border: "1.5px solid #fde68a",
+    padding: "5px 10px",
+    borderRadius: "10px",
+    cursor: "pointer",
+    fontWeight: "800",
+    fontSize: "12px",
+    color: "#b45309"
+  },
+  quickHeldBadge: {
+    backgroundColor: "#d97706",
+    color: "#ffffff",
+    borderRadius: "10px",
+    padding: "1px 7px",
+    fontSize: "10.5px",
+    fontWeight: "800"
+  },
+  navProfileBtn: {
+    padding: "4px 10px 4px 6px",
+    border: "1.5px solid #e2e8f0",
+    borderRadius: "10px",
+    fontWeight: "700",
+    fontSize: "13px",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    transition: "all 0.15s ease"
+  },
+  profileAvatarBox: {
+    width: "28px",
+    height: "28px",
+    borderRadius: "50%",
+    overflow: "hidden",
+    backgroundColor: "#ffedd5",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    border: "1px solid #fc8019",
+    flexShrink: 0
+  },
+  profileBtnText: {
+    fontWeight: "700",
+    fontSize: "13px"
+  },
+
+  // Hamburger Drawer Styles
+  drawerOverlay: {
+    position: "fixed",
+    inset: 0,
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
+    backdropFilter: "blur(3px)",
+    WebkitBackdropFilter: "blur(3px)",
+    zIndex: 9998,
+    animation: "fadeInOverlay 0.2s ease forwards"
+  },
+  drawerContainer: {
+    position: "fixed",
+    top: 0,
+    left: 0,
+    bottom: 0,
+    width: "330px",
+    maxWidth: "86vw",
+    backgroundColor: "#ffffff",
+    zIndex: 9999,
+    display: "flex",
+    flexDirection: "column",
+    boxShadow: "8px 0 32px rgba(15, 23, 42, 0.2)",
+    animation: "slideInLeft 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards"
+  },
+  drawerHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "16px 18px",
+    borderBottom: "1px solid #f1f5f9",
+    backgroundColor: "#ffffff"
+  },
+  drawerCloseBtn: {
+    width: "32px",
+    height: "32px",
+    borderRadius: "8px",
+    border: "1px solid #e2e8f0",
+    backgroundColor: "#f8fafc",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
+    color: "#64748b",
+    fontSize: "14px",
+    fontWeight: "700"
+  },
+  drawerContent: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "12px 14px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px"
+  },
+  drawerSectionHeader: {
+    fontSize: "11px",
+    fontWeight: "800",
+    color: "#94a3b8",
+    textTransform: "uppercase",
+    letterSpacing: "0.6px",
+    margin: "12px 6px 6px",
+    userSelect: "none"
+  },
+  drawerItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    padding: "10px 12px",
+    borderRadius: "10px",
+    border: "none",
+    backgroundColor: "transparent",
+    cursor: "pointer",
+    width: "100%",
+    textAlign: "left",
+    transition: "all 0.15s ease",
+    boxSizing: "border-box"
+  },
+  drawerItemActive: {
+    backgroundColor: "#fff7ed",
+    boxShadow: "inset 3px 0 0 #ea580c"
+  },
+  drawerIconBox: {
+    width: "34px",
+    height: "34px",
+    borderRadius: "8px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: "16px",
+    flexShrink: 0
+  },
+  drawerItemContent: {
+    flex: 1,
+    minWidth: 0
+  },
+  drawerItemTitle: {
+    fontSize: "13.5px",
+    fontWeight: "700",
+    color: "#1e293b"
+  },
+  drawerItemSub: {
+    fontSize: "11px",
+    color: "#64748b",
+    marginTop: "1px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
+  },
+  drawerBadge: {
+    backgroundColor: "#f1f5f9",
+    color: "#475569",
+    fontSize: "11px",
+    fontWeight: "800",
+    padding: "2px 8px",
+    borderRadius: "10px"
+  },
+  activeDot: {
+    color: "#ea580c",
+    fontSize: "12px",
+    fontWeight: "900"
+  },
+  drawerFooter: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "14px 18px",
+    borderTop: "1px solid #f1f5f9",
+    backgroundColor: "#f8fafc",
+    gap: "10px"
+  },
+  drawerLogoutBtn: {
+    width: "34px",
+    height: "34px",
+    borderRadius: "8px",
+    border: "1px solid #fee2e2",
+    backgroundColor: "#fef2f2",
+    color: "#dc2626",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
+    fontSize: "16px",
+    flexShrink: 0
+  },
   navLinks: { display: "flex", gap: "8px", alignItems: "center", flexShrink: 0 },
   navBtn: { padding: "7px 14px", border: "none", borderRadius: "8px", fontWeight: "700", fontSize: "13px", cursor: "pointer", whiteSpace: "nowrap" },
 
@@ -4968,7 +6462,7 @@ const styles = {
   },
   salesStatsCardsGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
     gap: "10px",
     width: "100%",
     boxSizing: "border-box"

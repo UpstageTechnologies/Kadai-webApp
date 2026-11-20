@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
+import { logWasteRecord, WASTE_REASONS } from "../utils/wasteService";
 
 export default function Inventory() {
   const [items, setItems] = useState([]);
@@ -32,6 +33,14 @@ export default function Inventory() {
   const [webImageQuery, setWebImageQuery] = useState("");
   const [webImageResults, setWebImageResults] = useState([]);
   const [webImageLoading, setWebImageLoading] = useState(false);
+
+  // Quick Waste Modal States
+  const [wasteModalItem, setWasteModalItem] = useState(null);
+  const [wasteQty, setWasteQty] = useState("");
+  const [wasteReason, setWasteReason] = useState(WASTE_REASONS[0].label);
+  const [wasteNotes, setWasteNotes] = useState("");
+  const [savingWaste, setSavingWaste] = useState(false);
+  const [wasteSuccessToast, setWasteSuccessToast] = useState("");
 
   const RESTAURANT_CATEGORIES = useMemo(() => [
     "Starters",
@@ -355,6 +364,53 @@ export default function Inventory() {
     }
   };
 
+  const handleConfirmWaste = async (e) => {
+    e.preventDefault();
+    if (!wasteModalItem) return;
+    const qty = Number(wasteQty);
+    if (isNaN(qty) || qty <= 0) {
+      alert("Please enter a valid wasted quantity.");
+      return;
+    }
+    const currentStock = Number(wasteModalItem.quantity) || 0;
+    if (qty > currentStock) {
+      alert(`Wasted quantity (${qty}) cannot exceed currently available stock (${currentStock}).`);
+      return;
+    }
+
+    setSavingWaste(true);
+    try {
+      const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+      await logWasteRecord({
+        db,
+        uid: currentUid,
+        itemId: wasteModalItem.id,
+        itemType: isRestaurant ? "restaurant_food_item" : "shop_product",
+        wastedQty: qty,
+        reason: wasteReason,
+        notes: wasteNotes,
+        reportedBy: localStorage.getItem("staff_name") || "Owner",
+        shopMode: appMode,
+        unitCost: Number(wasteModalItem.purchasePrice ?? wasteModalItem.price ?? 0),
+        unitType: wasteModalItem.unitType || "Qty",
+        productName: wasteModalItem.itemName || wasteModalItem.name,
+        category: wasteModalItem.category || "General",
+        image: wasteModalItem.image || "",
+      });
+
+      setSavingWaste(false);
+      setWasteModalItem(null);
+      setWasteQty("");
+      setWasteNotes("");
+      setWasteSuccessToast(`Successfully recorded waste for ${wasteModalItem.itemName || wasteModalItem.name}.`);
+      setTimeout(() => setWasteSuccessToast(""), 3500);
+    } catch (err) {
+      console.error("Waste error:", err);
+      alert(err.message || "Failed to log waste.");
+      setSavingWaste(false);
+    }
+  };
+
   const filteredItems = items.filter(item => {
     const name = item.itemName || item.name || "";
     const cat = item.category || "";
@@ -418,6 +474,7 @@ export default function Inventory() {
                     <span style={styles.priceText}>₹{price}</span>
                     <div style={styles.actionBtns}>
                       <button onClick={() => handleOpenEditModal(item)} style={styles.editBtn}>Edit</button>
+                      <button onClick={() => { setWasteModalItem(item); setWasteQty(""); setWasteNotes(""); }} style={styles.wasteBtn} title="Log spoilage or expired waste for this item">Waste</button>
                       <button onClick={() => handleDeleteItem(item.id)} style={styles.deleteBtn}>Delete</button>
                     </div>
                   </div>
@@ -773,6 +830,105 @@ export default function Inventory() {
           </div>
         </div>
       )}
+
+      {/* QUICK LOG WASTE MODAL */}
+      {wasteModalItem && (
+        <div style={styles.modalOverlay} onClick={() => setWasteModalItem(null)}>
+          <div style={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+              <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>
+                🗑️ Log Waste: {wasteModalItem.itemName || wasteModalItem.name}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setWasteModalItem(null)}
+                style={{ background: "none", border: "none", cursor: "pointer", fontSize: "18px", color: "#94a3b8" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmWaste} style={styles.form}>
+              <div style={{ padding: "10px", backgroundColor: "#f8fafc", borderRadius: "8px", fontSize: "12px", color: "#475569" }}>
+                Available Stock: <strong>{wasteModalItem.quantity} {wasteModalItem.unitType || "units"}</strong> | Unit Cost: <strong>₹{wasteModalItem.purchasePrice || wasteModalItem.price}</strong>
+              </div>
+
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Quantity to Expire / Waste *</label>
+                <input
+                  type="number"
+                  step="any"
+                  min="0.01"
+                  max={Number(wasteModalItem.quantity) || 999999}
+                  value={wasteQty}
+                  onChange={(e) => setWasteQty(e.target.value)}
+                  placeholder={`Max: ${wasteModalItem.quantity}`}
+                  style={styles.input}
+                  required
+                />
+              </div>
+
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Reason for Loss *</label>
+                <select
+                  value={wasteReason}
+                  onChange={(e) => setWasteReason(e.target.value)}
+                  style={styles.input}
+                  required
+                >
+                  {WASTE_REASONS.map((r) => (
+                    <option key={r.id} value={r.label}>
+                      {r.icon} {r.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={styles.inputGroup}>
+                <label style={styles.label}>Notes (Optional)</label>
+                <input
+                  type="text"
+                  value={wasteNotes}
+                  onChange={(e) => setWasteNotes(e.target.value)}
+                  placeholder="e.g. Expired batch, packaging ripped"
+                  style={styles.input}
+                />
+              </div>
+
+              {Number(wasteQty) > 0 && (
+                <div style={{ padding: "10px 12px", backgroundColor: "#fef2f2", borderRadius: "8px", border: "1px solid #fecaca", fontSize: "13px", color: "#b91c1c" }}>
+                  Financial Loss: <strong>₹{((Number(wasteModalItem.purchasePrice || wasteModalItem.price || 0)) * Number(wasteQty)).toFixed(2)}</strong>
+                </div>
+              )}
+
+              <div style={styles.modalActions}>
+                <button
+                  type="button"
+                  onClick={() => setWasteModalItem(null)}
+                  style={styles.cancelBtn}
+                  disabled={savingWaste}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  style={{ ...styles.saveBtn, backgroundColor: "#ef4444" }}
+                  disabled={savingWaste || !wasteQty}
+                >
+                  {savingWaste ? "Recording Loss..." : "Confirm & Reduce Stock"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TOAST NOTIFICATION */}
+      {wasteSuccessToast && (
+        <div style={{ position: "fixed", bottom: "24px", right: "24px", backgroundColor: "#065f46", color: "#fff", padding: "12px 20px", borderRadius: "10px", fontWeight: "700", zIndex: 9999, boxShadow: "0 4px 12px rgba(0,0,0,0.15)" }}>
+          {wasteSuccessToast}
+        </div>
+      )}
     </div>
   );
 }
@@ -797,6 +953,7 @@ const styles = {
   priceText: { fontSize: "15px", fontWeight: "800", color: "#0f172a" },
   actionBtns: { display: "flex", gap: "4px", width: "100%" },
   editBtn: { flex: 1, padding: "6px 8px", backgroundColor: "#e0e7ff", color: "#4f46e5", border: "none", borderRadius: "6px", fontWeight: "600", cursor: "pointer", fontSize: "11px", textAlign: "center" },
+  wasteBtn: { flex: 1, padding: "6px 8px", backgroundColor: "#ffedd5", color: "#c2410c", border: "none", borderRadius: "6px", fontWeight: "600", cursor: "pointer", fontSize: "11px", textAlign: "center" },
   deleteBtn: { flex: 1, padding: "6px 8px", backgroundColor: "#fee2e2", color: "#dc2626", border: "none", borderRadius: "6px", fontWeight: "600", cursor: "pointer", fontSize: "11px", textAlign: "center" },
   centerBox: { textAlign: "center", padding: "40px", color: "#64748b", fontSize: "14px", fontWeight: "600" },
   modalOverlay: { position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000, padding: "16px", boxSizing: "border-box" },
