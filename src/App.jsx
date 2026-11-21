@@ -59,6 +59,10 @@ export default function App() {
         <Route path="/staff" element={isAuthenticated ? <Dashboard key="staff" initialTab="staff" /> : <Navigate to="/login" replace />} />
         <Route path="/recipes" element={isAuthenticated ? <Dashboard key="recipes" initialTab="recipes" /> : <Navigate to="/login" replace />} />
         <Route path="/waste" element={isAuthenticated ? <Dashboard key="waste" initialTab="waste" /> : <Navigate to="/login" replace />} />
+        <Route path="/purchases" element={isAuthenticated ? <Dashboard key="purchases" initialTab="purchases" /> : <Navigate to="/login" replace />} />
+        <Route path="/feedback" element={isAuthenticated ? <Dashboard key="feedback" initialTab="feedback" /> : <Navigate to="/login" replace />} />
+        <Route path="/branches" element={isAuthenticated ? <Dashboard key="branches" initialTab="branches" /> : <Navigate to="/login" replace />} />
+        <Route path="/attendance" element={isAuthenticated ? <Dashboard key="attendance" initialTab="staff" /> : <Navigate to="/login" replace />} />
         <Route path="/waiter" element={isAuthenticated ? <WaiterOrder /> : <Navigate to="/login" replace />} />
         <Route path="/kitchen" element={isAuthenticated ? <KitchenDisplay /> : <Navigate to="/login" replace />} />
         <Route path="*" element={<Navigate to={isAuthenticated ? getHomeRedirect() : "/login"} replace />} />

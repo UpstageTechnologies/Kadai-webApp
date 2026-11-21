@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { collection, onSnapshot, doc, setDoc, deleteDoc, serverTimestamp, getDoc, updateDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 
@@ -67,7 +67,159 @@ export default function StaffManagement({ onBack }) {
   const [createdStaffModal, setCreatedStaffModal] = useState(null);
   const [copiedText, setCopiedText] = useState(false);
 
+  // Sub Tab: "accounts" vs "attendance"
+  const [activeSubTab, setActiveSubTab] = useState("accounts");
+
+  // Attendance states
+  const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [attendanceRecords, setAttendanceRecords] = useState({});
+
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+
+  // Real-time listener for selected date attendance
+  useEffect(() => {
+    if (!currentUid || !selectedDate) return;
+    const unsub = onSnapshot(
+      doc(db, "users", currentUid, "staff_attendance", selectedDate),
+      (snap) => {
+        if (snap.exists()) {
+          setAttendanceRecords(snap.data().records || {});
+        } else {
+          setAttendanceRecords({});
+        }
+      },
+      (err) => console.error("Attendance listener error:", err)
+    );
+    return () => unsub();
+  }, [currentUid, selectedDate]);
+
+  const handleSetStaffStatus = async (sId, status) => {
+    if (!currentUid) return;
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    const existing = attendanceRecords[sId] || {};
+    const updated = {
+      ...attendanceRecords,
+      [sId]: {
+        ...existing,
+        status,
+        inTime: existing.inTime || (status === "present" || status === "half_day" ? timeStr : ""),
+        outTime: existing.outTime || "",
+        notes: existing.notes || "",
+        updatedAtMs: Date.now()
+      }
+    };
+
+    setAttendanceRecords(updated);
+    try {
+      await setDoc(
+        doc(db, "users", currentUid, "staff_attendance", selectedDate),
+        { date: selectedDate, records: updated, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+    } catch (err) {
+      console.error("Error updating attendance:", err);
+    }
+  };
+
+  const handleUpdateStaffTime = async (sId, field, val) => {
+    if (!currentUid) return;
+    const existing = attendanceRecords[sId] || { status: "present" };
+    const updated = {
+      ...attendanceRecords,
+      [sId]: {
+        ...existing,
+        [field]: val,
+        updatedAtMs: Date.now()
+      }
+    };
+    setAttendanceRecords(updated);
+    try {
+      await setDoc(
+        doc(db, "users", currentUid, "staff_attendance", selectedDate),
+        { date: selectedDate, records: updated, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+    } catch (err) {
+      console.error("Error updating time:", err);
+    }
+  };
+
+  const handleMarkAllPresent = async () => {
+    if (!currentUid || staffList.length === 0) return;
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const updated = { ...attendanceRecords };
+
+    staffList.forEach((s) => {
+      const sId = s.id || s.staffId;
+      const existing = updated[sId] || {};
+      updated[sId] = {
+        ...existing,
+        status: "present",
+        inTime: existing.inTime || timeStr,
+        notes: existing.notes || "On shift",
+        updatedAtMs: Date.now()
+      };
+    });
+
+    setAttendanceRecords(updated);
+    try {
+      await setDoc(
+        doc(db, "users", currentUid, "staff_attendance", selectedDate),
+        { date: selectedDate, records: updated, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+      alert(`✅ Marked all ${staffList.length} staff as Present for ${selectedDate}!`);
+    } catch (err) {
+      alert("Error marking attendance: " + err.message);
+    }
+  };
+
+  const handlePrevDay = () => {
+    const cur = new Date(selectedDate);
+    cur.setDate(cur.getDate() - 1);
+    setSelectedDate(cur.toISOString().slice(0, 10));
+  };
+
+  const handleNextDay = () => {
+    const cur = new Date(selectedDate);
+    cur.setDate(cur.getDate() + 1);
+    setSelectedDate(cur.toISOString().slice(0, 10));
+  };
+
+  const handleExportAttendance = () => {
+    if (staffList.length === 0) {
+      alert("No staff members to export attendance for.");
+      return;
+    }
+
+    const headers = ["Date", "Staff ID", "Staff Name", "Role", "Status", "Check-in Time", "Check-out Time", "Notes"];
+    const rows = staffList.map((s) => {
+      const sId = s.id || s.staffId;
+      const rec = attendanceRecords[sId] || {};
+      return [
+        selectedDate,
+        `"${sId}"`,
+        `"${(s.name || "").replace(/"/g, '""')}"`,
+        s.role || "staff",
+        (rec.status || "not_marked").toUpperCase(),
+        rec.inTime || "",
+        rec.outTime || "",
+        `"${(rec.notes || "").replace(/"/g, '""')}"`
+      ];
+    });
+
+    const csvContent = "data:text/csv;charset=utf-8," + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `Staff_Attendance_${selectedDate}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   useEffect(() => {
     if (!currentUid) {
@@ -222,6 +374,25 @@ export default function StaffManagement({ onBack }) {
     setTimeout(() => setCopiedText(false), 2000);
   };
 
+  const attendanceStats = useMemo(() => {
+    let present = 0;
+    let halfDay = 0;
+    let absent = 0;
+    let leave = 0;
+
+    staffList.forEach((s) => {
+      const sId = s.id || s.staffId;
+      const rec = attendanceRecords[sId];
+      if (rec?.status === "present") present++;
+      else if (rec?.status === "half_day") halfDay++;
+      else if (rec?.status === "absent") absent++;
+      else if (rec?.status === "leave") leave++;
+    });
+
+    const rate = staffList.length > 0 ? Math.round(((present + halfDay * 0.5) / staffList.length) * 100) : 0;
+    return { present, halfDay, absent, leave, rate };
+  }, [staffList, attendanceRecords]);
+
   return (
     <div style={styles.container}>
       {/* Top Header */}
@@ -233,20 +404,69 @@ export default function StaffManagement({ onBack }) {
             </button>
           )}
           <div>
-            <h2 style={styles.pageTitle}>👥 Staff Accounts & Permissions</h2>
+            <h2 style={styles.pageTitle}>👥 Staff Accounts & Daily Attendance</h2>
             <p style={styles.pageSubtitle}>
-              Create & manage accounts for Waiters, Kitchen Staff, Delivery Boys and Cashiers
+              Manage staff permissions, roles, and track daily attendance (பணியாளர் வருகைப் பதிவு)
             </p>
           </div>
         </div>
 
-        <button type="button" onClick={handleOpenAddModal} style={styles.addBtn}>
-          + Create New Staff Account
+        {activeSubTab === "accounts" ? (
+          <button type="button" onClick={handleOpenAddModal} style={styles.addBtn}>
+            + Create New Staff Account
+          </button>
+        ) : (
+          <button type="button" onClick={handleMarkAllPresent} style={{ ...styles.addBtn, backgroundColor: "#16a34a" }}>
+            ✅ Mark All Present
+          </button>
+        )}
+      </div>
+
+      {/* Sub Tabs Switcher: Accounts vs Attendance */}
+      <div style={styles.subTabsRow}>
+        <button
+          type="button"
+          onClick={() => setActiveSubTab("accounts")}
+          style={{
+            ...styles.subTabBtn,
+            backgroundColor: activeSubTab === "accounts" ? "#0f172a" : "#ffffff",
+            color: activeSubTab === "accounts" ? "#ffffff" : "#475569",
+            borderColor: activeSubTab === "accounts" ? "#0f172a" : "#cbd5e1"
+          }}
+        >
+          <span>👥</span>
+          <span>Staff Accounts & Roles ({staffList.length})</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSubTab("attendance")}
+          style={{
+            ...styles.subTabBtn,
+            backgroundColor: activeSubTab === "attendance" ? "#16a34a" : "#ffffff",
+            color: activeSubTab === "attendance" ? "#ffffff" : "#475569",
+            borderColor: activeSubTab === "attendance" ? "#16a34a" : "#cbd5e1"
+          }}
+        >
+          <span>📅</span>
+          <span>Daily Staff Attendance (வருகைப் பதிவு)</span>
+          <span style={{
+            fontSize: "11px",
+            padding: "2px 7px",
+            borderRadius: "10px",
+            backgroundColor: activeSubTab === "attendance" ? "rgba(255,255,255,0.25)" : "#dcfce7",
+            color: activeSubTab === "attendance" ? "#ffffff" : "#166534",
+            fontWeight: "800"
+          }}>
+            {attendanceStats.present}/{staffList.length} Present
+          </span>
         </button>
       </div>
 
-      {/* Role Quick Cards Summary */}
-      <div style={styles.roleSummaryGrid}>
+      {activeSubTab === "accounts" && (
+        <>
+          {/* Role Quick Cards Summary */}
+          <div style={styles.roleSummaryGrid}>
         {ROLE_OPTIONS.map((r) => {
           const count = staffList.filter((s) => s.role === r.id).length;
           return (
@@ -388,6 +608,260 @@ export default function StaffManagement({ onBack }) {
           </div>
         )}
       </div>
+      </>
+      )}
+
+      {/* ATTENDANCE SUB-TAB */}
+      {activeSubTab === "attendance" && (
+        <div>
+          {/* Attendance Controls Bar */}
+          <div style={styles.attControlsRow}>
+            {/* Date Navigator */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <button type="button" onClick={handlePrevDay} style={styles.dateNavBtn} title="Previous Day">
+                ← Prev
+              </button>
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                style={styles.attDateInput}
+              />
+              <button type="button" onClick={handleNextDay} style={styles.dateNavBtn} title="Next Day">
+                Next →
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedDate(new Date().toISOString().slice(0, 10))}
+                style={{
+                  ...styles.dateNavBtn,
+                  backgroundColor: selectedDate === new Date().toISOString().slice(0, 10) ? "#0f172a" : "#f1f5f9",
+                  color: selectedDate === new Date().toISOString().slice(0, 10) ? "#ffffff" : "#334155"
+                }}
+              >
+                Today
+              </button>
+            </div>
+
+            {/* Quick Actions */}
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button type="button" onClick={handleMarkAllPresent} style={styles.markAllBtn}>
+                <span>✅</span>
+                <span>Mark All Present</span>
+              </button>
+              <button type="button" onClick={() => window.print()} style={styles.attPrintBtn}>
+                <span>🖨️</span>
+                <span>Print Sheet</span>
+              </button>
+              <button type="button" onClick={handleExportAttendance} style={styles.attExportBtn}>
+                <span>📥</span>
+                <span>Export CSV</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Attendance Summary Stat Cards */}
+          <div style={styles.attStatsGrid}>
+            <div style={styles.attStatCard}>
+              <div style={styles.attStatLabel}>Total Staff</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: "#0f172a" }}>{staffList.length}</div>
+              <div style={styles.attStatSub}>Enrolled staff members</div>
+            </div>
+            <div style={{ ...styles.attStatCard, borderLeft: "4px solid #16a34a" }}>
+              <div style={{ ...styles.attStatLabel, color: "#166534" }}>Present (வருகை)</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: "#16a34a" }}>{attendanceStats.present}</div>
+              <div style={styles.attStatSub}>Full day on duty</div>
+            </div>
+            <div style={{ ...styles.attStatCard, borderLeft: "4px solid #f59e0b" }}>
+              <div style={{ ...styles.attStatLabel, color: "#b45309" }}>Half Day (அரை நாள்)</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: "#f59e0b" }}>{attendanceStats.halfDay}</div>
+              <div style={styles.attStatSub}>Half shift attended</div>
+            </div>
+            <div style={{ ...styles.attStatCard, borderLeft: "4px solid #ef4444" }}>
+              <div style={{ ...styles.attStatLabel, color: "#991b1b" }}>Absent (வரவில்லை)</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: "#ef4444" }}>{attendanceStats.absent}</div>
+              <div style={styles.attStatSub}>Did not report</div>
+            </div>
+            <div style={{ ...styles.attStatCard, borderLeft: "4px solid #6366f1" }}>
+              <div style={{ ...styles.attStatLabel, color: "#4338ca" }}>On Leave (விடுப்பு)</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: "#6366f1" }}>{attendanceStats.leave}</div>
+              <div style={styles.attStatSub}>Approved leave</div>
+            </div>
+            <div style={styles.attStatCard}>
+              <div style={styles.attStatLabel}>Attendance Rate</div>
+              <div style={{ fontSize: "22px", fontWeight: "900", color: attendanceStats.rate >= 80 ? "#16a34a" : "#ea580c" }}>
+                {attendanceStats.rate}%
+              </div>
+              <div style={styles.attStatSub}>For {selectedDate}</div>
+            </div>
+          </div>
+
+          {/* Attendance Table Card */}
+          <div style={styles.tableCard}>
+            <div style={styles.tableCardHeader}>
+              <h3 style={{ margin: 0, fontSize: "15px", fontWeight: "800", color: "#0f172a" }}>
+                Daily Staff Attendance Log for {selectedDate}
+              </h3>
+              <span style={{ fontSize: "12px", color: "#64748b" }}>
+                Click status button to mark staff attendance in real-time
+              </span>
+            </div>
+
+            {staffList.length === 0 ? (
+              <div style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
+                No staff accounts added yet. Switch to "Staff Accounts & Roles" to add staff.
+              </div>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr style={styles.thRow}>
+                      <th style={styles.th}>Staff Member</th>
+                      <th style={styles.th}>Role</th>
+                      <th style={styles.th}>Attendance Status</th>
+                      <th style={styles.th}>In Time</th>
+                      <th style={styles.th}>Out Time</th>
+                      <th style={styles.th}>Notes / Remarks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {staffList.map((s, idx) => {
+                      const sId = s.id || s.staffId;
+                      const roleObj = ROLE_OPTIONS.find((r) => r.id === s.role) || ROLE_OPTIONS[3];
+                      const rec = attendanceRecords[sId] || {};
+                      const status = rec.status || "not_marked";
+
+                      return (
+                        <tr key={sId || idx} style={styles.tr}>
+                          <td style={styles.td}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                              <div style={{
+                                width: "32px",
+                                height: "32px",
+                                borderRadius: "50%",
+                                backgroundColor: roleObj.bgColor,
+                                color: roleObj.color,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontWeight: "800",
+                                fontSize: "13px"
+                              }}>
+                                {s.name ? s.name.charAt(0).toUpperCase() : "S"}
+                              </div>
+                              <div>
+                                <div style={{ fontWeight: "700", color: "#0f172a", fontSize: "13.5px" }}>
+                                  {s.name}
+                                </div>
+                                <div style={{ fontSize: "11px", color: "#64748b" }}>
+                                  ID: {sId} {s.mobile ? `• ${s.mobile}` : ""}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+
+                          <td style={styles.td}>
+                            <span style={{ ...styles.roleBadge, backgroundColor: roleObj.bgColor, color: roleObj.color }}>
+                              {roleObj.icon} {roleObj.label}
+                            </span>
+                          </td>
+
+                          <td style={styles.td}>
+                            <div style={{ display: "flex", gap: "6px" }}>
+                              <button
+                                type="button"
+                                onClick={() => handleSetStaffStatus(sId, "present")}
+                                style={{
+                                  ...styles.statusBtn,
+                                  backgroundColor: status === "present" ? "#16a34a" : "#f0fdf4",
+                                  color: status === "present" ? "#ffffff" : "#166534",
+                                  borderColor: status === "present" ? "#16a34a" : "#bbf7d0",
+                                  fontWeight: status === "present" ? "800" : "600"
+                                }}
+                              >
+                                🟢 Present
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSetStaffStatus(sId, "half_day")}
+                                style={{
+                                  ...styles.statusBtn,
+                                  backgroundColor: status === "half_day" ? "#f59e0b" : "#fffbeb",
+                                  color: status === "half_day" ? "#ffffff" : "#b45309",
+                                  borderColor: status === "half_day" ? "#f59e0b" : "#fde68a",
+                                  fontWeight: status === "half_day" ? "800" : "600"
+                                }}
+                              >
+                                🟡 Half Day
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSetStaffStatus(sId, "absent")}
+                                style={{
+                                  ...styles.statusBtn,
+                                  backgroundColor: status === "absent" ? "#ef4444" : "#fef2f2",
+                                  color: status === "absent" ? "#ffffff" : "#991b1b",
+                                  borderColor: status === "absent" ? "#ef4444" : "#fecaca",
+                                  fontWeight: status === "absent" ? "800" : "600"
+                                }}
+                              >
+                                🔴 Absent
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSetStaffStatus(sId, "leave")}
+                                style={{
+                                  ...styles.statusBtn,
+                                  backgroundColor: status === "leave" ? "#6366f1" : "#e0e7ff",
+                                  color: status === "leave" ? "#ffffff" : "#4338ca",
+                                  borderColor: status === "leave" ? "#6366f1" : "#c7d2fe",
+                                  fontWeight: status === "leave" ? "800" : "600"
+                                }}
+                              >
+                                🔵 Leave
+                              </button>
+                            </div>
+                          </td>
+
+                          <td style={styles.td}>
+                            <input
+                              type="text"
+                              value={rec.inTime || ""}
+                              onChange={(e) => handleUpdateStaffTime(sId, "inTime", e.target.value)}
+                              placeholder="09:00 AM"
+                              style={styles.timeInput}
+                            />
+                          </td>
+
+                          <td style={styles.td}>
+                            <input
+                              type="text"
+                              value={rec.outTime || ""}
+                              onChange={(e) => handleUpdateStaffTime(sId, "outTime", e.target.value)}
+                              placeholder="06:00 PM"
+                              style={styles.timeInput}
+                            />
+                          </td>
+
+                          <td style={styles.td}>
+                            <input
+                              type="text"
+                              value={rec.notes || ""}
+                              onChange={(e) => handleUpdateStaffTime(sId, "notes", e.target.value)}
+                              placeholder="Remarks, shift notes..."
+                              style={styles.notesInput}
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* CREATE / EDIT STAFF MODAL */}
       {isModalOpen && (
@@ -893,5 +1367,137 @@ const styles = {
     alignItems: "center",
     padding: "8px 0",
     borderBottom: "1px solid #e2e8f0",
+  },
+  subTabsRow: {
+    display: "flex",
+    gap: "10px",
+    marginBottom: "20px",
+    flexWrap: "wrap",
+  },
+  subTabBtn: {
+    padding: "9px 18px",
+    borderRadius: "10px",
+    border: "1.5px solid",
+    fontSize: "13px",
+    fontWeight: "700",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    transition: "all 0.15s ease",
+  },
+  attControlsRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#ffffff",
+    padding: "14px 18px",
+    borderRadius: "12px",
+    border: "1px solid #e2e8f0",
+    marginBottom: "16px",
+    flexWrap: "wrap",
+    gap: "12px",
+  },
+  dateNavBtn: {
+    padding: "6px 12px",
+    borderRadius: "8px",
+    border: "1px solid #cbd5e1",
+    backgroundColor: "#f1f5f9",
+    color: "#334155",
+    fontSize: "12px",
+    fontWeight: "700",
+    cursor: "pointer",
+  },
+  attDateInput: {
+    padding: "6px 10px",
+    borderRadius: "8px",
+    border: "1.5px solid #cbd5e1",
+    fontSize: "12.5px",
+    fontWeight: "600",
+    color: "#1e293b",
+    outline: "none",
+  },
+  markAllBtn: {
+    padding: "7px 14px",
+    borderRadius: "8px",
+    border: "none",
+    backgroundColor: "#16a34a",
+    color: "#ffffff",
+    fontSize: "12.5px",
+    fontWeight: "700",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "5px",
+  },
+  attPrintBtn: {
+    padding: "7px 12px",
+    borderRadius: "8px",
+    border: "1px solid #cbd5e1",
+    backgroundColor: "#ffffff",
+    color: "#334155",
+    fontSize: "12.5px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+  attExportBtn: {
+    padding: "7px 12px",
+    borderRadius: "8px",
+    border: "1px solid #c7d2fe",
+    backgroundColor: "#eff6ff",
+    color: "#4338ca",
+    fontSize: "12.5px",
+    fontWeight: "700",
+    cursor: "pointer",
+  },
+  attStatsGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+    gap: "12px",
+    marginBottom: "16px",
+  },
+  attStatCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: "12px",
+    padding: "14px 16px",
+    border: "1px solid #e2e8f0",
+  },
+  attStatLabel: {
+    fontSize: "11px",
+    fontWeight: "700",
+    color: "#64748b",
+    textTransform: "uppercase",
+    marginBottom: "4px",
+  },
+  attStatSub: {
+    fontSize: "11px",
+    color: "#94a3b8",
+    marginTop: "2px",
+  },
+  statusBtn: {
+    padding: "4px 9px",
+    borderRadius: "6px",
+    border: "1px solid",
+    fontSize: "11.5px",
+    cursor: "pointer",
+    transition: "all 0.1s ease",
+  },
+  timeInput: {
+    width: "85px",
+    padding: "4px 8px",
+    borderRadius: "6px",
+    border: "1px solid #cbd5e1",
+    fontSize: "11.5px",
+    outline: "none",
+    textAlign: "center",
+  },
+  notesInput: {
+    width: "100%",
+    minWidth: "120px",
+    padding: "4px 8px",
+    borderRadius: "6px",
+    border: "1px solid #cbd5e1",
+    fontSize: "11.5px",
+    outline: "none",
   },
 };

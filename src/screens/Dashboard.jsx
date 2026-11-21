@@ -10,6 +10,9 @@ import StaffManagement from "./StaffManagement";
 import OnlineOrders from "./OnlineOrders";
 import RecipeManagement from "./RecipeManagement";
 import WasteManagement from "./WasteManagement";
+import PurchaseReport from "./PurchaseReport";
+import FeedbackScreen from "./FeedbackScreen";
+import BranchManagement from "./BranchManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
@@ -37,6 +40,37 @@ export default function Dashboard({ initialTab = "sales" }) {
   const isGlobalMode = appMode === "global";
   const [rawUserData, setRawUserData] = useState(null);
   const userSubscription = resolveUserSubscription(rawUserData);
+
+  // Multi-Store Branches Management State
+  const [activeBranchId, setActiveBranchId] = useState(() => localStorage.getItem("active_branch_id") || "main_default");
+  const [activeBranchName, setActiveBranchName] = useState(() => localStorage.getItem("active_branch_name") || "Main Branch");
+  const [branchesList, setBranchesList] = useState([]);
+
+  useEffect(() => {
+    const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!currentUid) return;
+    const unsub = onSnapshot(collection(db, "users", currentUid, "branches"), (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setBranchesList(list);
+      if (list.length > 0) {
+        const found = list.find((b) => b.id === activeBranchId);
+        if (found) {
+          setActiveBranchName(found.name);
+        } else if (!activeBranchId || activeBranchId === "main_default") {
+          setActiveBranchId(list[0].id);
+          setActiveBranchName(list[0].name);
+        }
+      }
+    });
+    return () => unsub();
+  }, [activeBranchId]);
+
+  const handleSelectBranch = (branchId, bName) => {
+    setActiveBranchId(branchId);
+    setActiveBranchName(bName);
+    localStorage.setItem("active_branch_id", branchId);
+    localStorage.setItem("active_branch_name", bName);
+  };
 
   // Shop Mode Dropdown State and Dynamic Coordinates
   const [shopModeDropdownOpen, setShopModeDropdownOpen] = useState(false);
@@ -2168,6 +2202,28 @@ export default function Dashboard({ initialTab = "sales" }) {
                 <span 
                   onClick={(e) => {
                     e.stopPropagation();
+                    setActiveTab("branches");
+                  }}
+                  style={{
+                    backgroundColor: "#f8fafc",
+                    color: "#0f172a",
+                    border: "1px solid #cbd5e1",
+                    fontSize: "9px",
+                    fontWeight: "800",
+                    padding: "1.5px 6px",
+                    borderRadius: "8px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "2px",
+                    cursor: "pointer"
+                  }}
+                  title="Current Active Branch. Click to manage branches."
+                >
+                  📍 {activeBranchName}
+                </span>
+                <span 
+                  onClick={(e) => {
+                    e.stopPropagation();
                     setActiveTab("subscription");
                   }}
                   style={{
@@ -2261,18 +2317,32 @@ export default function Dashboard({ initialTab = "sales" }) {
             ) : null}
           </button>
 
-          {/* 5. Staff Management */}
+          {/* 5. Purchase Report (Shop Stocks & Restaurant Groceries) */}
           <button
             type="button"
-            onClick={() => setActiveTab("staff")}
+            onClick={() => setActiveTab("purchases")}
             style={{
               ...styles.navTabBtn,
-              ...(activeTab === "staff" ? styles.navTabBtnActive : {})
+              ...(activeTab === "purchases" ? styles.navTabBtnActive : {})
             }}
-            title="Waiter & kitchen staff roles"
+            title={isRestaurant ? "Restaurant groceries, raw materials & food supplies purchase report" : "Shop product stocks & inventory purchase report"}
           >
-            <span style={{ fontSize: "14px" }}>👥</span>
-            <span>Staff</span>
+            <span style={{ fontSize: "14px" }}>📊</span>
+            <span>Purchase Report</span>
+          </button>
+
+          {/* 6. Customer Feedback & Ratings */}
+          <button
+            type="button"
+            onClick={() => setActiveTab("feedback")}
+            style={{
+              ...styles.navTabBtn,
+              ...(activeTab === "feedback" ? styles.navTabBtnActive : {})
+            }}
+            title="Customer feedback, ratings & diner reviews"
+          >
+            <span style={{ fontSize: "14px" }}>⭐</span>
+            <span>Feedback</span>
           </button>
 
           {/* 6. Waste & Spoilage Management (Shop & Restaurant) */}
@@ -2347,31 +2417,6 @@ export default function Dashboard({ initialTab = "sales" }) {
                 ) : null}
               </button>
 
-              {/* Kitchen Display (KDS) */}
-              <a
-                href="/kitchen"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ ...styles.navTabBtn, textDecoration: "none" }}
-                title="Open kitchen display screen in new tab"
-              >
-                <span style={{ fontSize: "14px" }}>👨‍🍳</span>
-                <span>Kitchen (KDS)</span>
-                <span style={{ fontSize: "10px", opacity: 0.65 }}>↗</span>
-              </a>
-
-              {/* Waiter Order App */}
-              <a
-                href="/waiter"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ ...styles.navTabBtn, textDecoration: "none" }}
-                title="Open waiter mobile order app in new tab"
-              >
-                <span style={{ fontSize: "14px" }}>📱</span>
-                <span>Waiter App</span>
-                <span style={{ fontSize: "10px", opacity: 0.65 }}>↗</span>
-              </a>
             </>
           )}
         </nav>
@@ -2578,7 +2623,7 @@ export default function Dashboard({ initialTab = "sales" }) {
             ...styles.portalDropdownMenu,
             top: `${shopMenuCoords.top}px`,
             left: `${shopMenuCoords.left}px`,
-            minWidth: "240px"
+            minWidth: "260px"
           }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -2626,6 +2671,57 @@ export default function Dashboard({ initialTab = "sales" }) {
               </div>
             </div>
             {isGlobalMode && <span style={{ color: "#059669", fontWeight: "800", fontSize: "15px" }}>✓</span>}
+          </button>
+
+          {/* MULTI-STORE BRANCH SELECTOR */}
+          <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "6px 0" }} />
+          <div style={{ padding: "6px 12px 4px", fontSize: "11px", fontWeight: "700", color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.5px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>Store Branch (கிளை)</span>
+            <span 
+              style={{ fontSize: "11px", color: "#7c3aed", cursor: "pointer", fontWeight: "700" }} 
+              onClick={() => { setShopModeDropdownOpen(false); setActiveTab("branches"); }}
+            >
+              Manage ↗
+            </span>
+          </div>
+          {branchesList.map(b => (
+            <button
+              key={b.id}
+              type="button"
+              onClick={() => { handleSelectBranch(b.id, b.name); setShopModeDropdownOpen(false); }}
+              style={{
+                ...styles.dropdownItem,
+                backgroundColor: activeBranchId === b.id ? "#f5f3ff" : "transparent",
+                color: activeBranchId === b.id ? "#7c3aed" : "#334155",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "8px 12px"
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "15px" }}>📍</span>
+                <span style={{ fontWeight: activeBranchId === b.id ? "700" : "500", fontSize: "13px" }}>{b.name}</span>
+              </div>
+              {activeBranchId === b.id && <span style={{ color: "#7c3aed", fontWeight: "800", fontSize: "14px" }}>✓</span>}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => { setShopModeDropdownOpen(false); setActiveTab("branches"); }}
+            style={{
+              ...styles.dropdownItem,
+              color: "#7c3aed",
+              fontWeight: "700",
+              fontSize: "12px",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              paddingTop: "6px"
+            }}
+          >
+            <span>➕</span>
+            <span>Add / Manage Branches</span>
           </button>
         </div>,
         document.body
@@ -2691,7 +2787,21 @@ export default function Dashboard({ initialTab = "sales" }) {
             onClick={() => { setActiveTab("staff"); setProfileDropdownOpen(false); }}
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "staff" ? "#fff7ed" : "transparent", color: activeTab === "staff" ? "#fc8019" : "#334155" }}
           >
-            👥 Staff Accounts & Roles
+            👥 Staff Accounts & Attendance
+          </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("branches"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "branches" ? "#fff7ed" : "transparent", color: activeTab === "branches" ? "#fc8019" : "#334155" }}
+          >
+            🏢 Multi-Store Branches (கிளைகள்)
+          </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("feedback"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "feedback" ? "#fff7ed" : "transparent", color: activeTab === "feedback" ? "#fc8019" : "#334155" }}
+          >
+            ⭐ Customer Feedback & Ratings
           </button>
           <button 
             type="button"
@@ -2699,6 +2809,13 @@ export default function Dashboard({ initialTab = "sales" }) {
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "waste" ? "#fff7ed" : "transparent", color: activeTab === "waste" ? "#fc8019" : "#334155" }}
           >
             📉 Waste & Spoilage Tracking
+          </button>
+          <button 
+            type="button"
+            onClick={() => { setActiveTab("purchases"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "purchases" ? "#fff7ed" : "transparent", color: activeTab === "purchases" ? "#fc8019" : "#334155" }}
+          >
+            📊 Purchase Reports (Stock & Groceries)
           </button>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <a 
@@ -3649,9 +3766,32 @@ export default function Dashboard({ initialTab = "sales" }) {
           />
         )}
 
-        {/* STAFF MANAGEMENT TAB */}
+        {/* STAFF MANAGEMENT & ATTENDANCE TAB */}
         {activeTab === "staff" && (
-          <StaffManagement onBack={() => setActiveTab("sales")} />
+          <StaffManagement 
+            onBack={() => setActiveTab("sales")} 
+            activeBranchName={activeBranchName}
+          />
+        )}
+
+        {/* CUSTOMER FEEDBACK & RATINGS TAB */}
+        {activeTab === "feedback" && (
+          <FeedbackScreen
+            userProfile={userProfile}
+            isRestaurant={isRestaurant}
+            activeBranchName={activeBranchName}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
+        {/* MULTI-STORE / BRANCH MANAGEMENT TAB */}
+        {activeTab === "branches" && (
+          <BranchManagement
+            userProfile={userProfile}
+            activeBranchId={activeBranchId}
+            onSelectBranch={handleSelectBranch}
+            onBack={() => setActiveTab("sales")}
+          />
         )}
 
         {/* RECIPE MANAGEMENT & FOOD COSTING TAB */}
@@ -3667,6 +3807,16 @@ export default function Dashboard({ initialTab = "sales" }) {
         {activeTab === "waste" && (
           <WasteManagement
             userProfile={userProfile}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
+        {/* PURCHASE REPORTS TAB (SHOP STOCKS & RESTAURANT GROCERIES) */}
+        {activeTab === "purchases" && (
+          <PurchaseReport
+            userProfile={userProfile}
+            isRestaurant={isRestaurant}
+            isGlobalMode={isGlobalMode}
             onBack={() => setActiveTab("sales")}
           />
         )}
@@ -5951,11 +6101,12 @@ const styles = {
     alignItems: "center",
     gap: "6px",
     flex: 1,
-    justifyContent: "center",
+    justifyContent: "flex-start",
     overflowX: "auto",
     scrollbarWidth: "none",
     msOverflowStyle: "none",
-    padding: "0 8px"
+    padding: "0 8px",
+    minWidth: 0
   },
   navTabBtn: {
     display: "inline-flex",
