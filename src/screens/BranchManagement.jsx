@@ -6,6 +6,7 @@ import {
   updateDoc,
   deleteDoc,
   doc,
+  setDoc,
   serverTimestamp
 } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
@@ -14,6 +15,8 @@ export default function BranchManagement({
   userProfile = {},
   activeBranchId,
   onSelectBranch,
+  ordersList = [],
+  products = [],
   onBack
 }) {
   const [branches, setBranches] = useState([]);
@@ -30,7 +33,7 @@ export default function BranchManagement({
   const [saving, setSaving] = useState(false);
 
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid") || "";
-  const storeName = userProfile.storeName || "My Store";
+  const storeName = userProfile.storeName || "Turf Cafe";
 
   // Listen to branches in Firestore
   useEffect(() => {
@@ -41,28 +44,46 @@ export default function BranchManagement({
 
     const unsub = onSnapshot(
       collection(db, "users", currentUid, "branches"),
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => ({
+      async (snapshot) => {
+        let list = snapshot.docs.map((d) => ({
           id: d.id,
           ...d.data()
         }));
 
-        // If no branch exists yet, initialize a default Main Branch
-        if (list.length === 0) {
-          const defaultBranch = {
-            id: "main_default",
-            name: `${storeName} - Main Branch`,
-            code: "BR-01",
-            address: "Main Store Location",
-            phone: userProfile.mobile || "",
-            managerName: userProfile.name || "Owner",
-            isPrimary: true,
-            status: "active"
-          };
-          setBranches([defaultBranch]);
-        } else {
-          setBranches(list);
+        // Check if primary main branch document exists in Firestore
+        const hasPrimary = list.some((b) => b.isPrimary || b.id === "main_branch" || b.code === "BR-01");
+
+        if (list.length === 0 || !hasPrimary) {
+          try {
+            const mainRef = doc(db, "users", currentUid, "branches", "main_branch");
+            const defaultBranch = {
+              name: `${storeName} - Main Branch`,
+              code: "BR-01",
+              address: "Main Store Location",
+              phone: userProfile.mobile || userProfile.phone || "",
+              managerName: userProfile.name || "Restaurant Manager",
+              isPrimary: true,
+              status: "active",
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            };
+            await setDoc(mainRef, defaultBranch, { merge: true });
+            if (!list.some(b => b.id === "main_branch")) {
+              list = [{ id: "main_branch", ...defaultBranch }, ...list];
+            }
+          } catch (e) {
+            console.warn("Could not seed main branch in Firestore:", e);
+          }
         }
+
+        // Sort so primary branch is always first, then by code or name
+        list.sort((a, b) => {
+          if (a.isPrimary || a.id === "main_branch") return -1;
+          if (b.isPrimary || b.id === "main_branch") return 1;
+          return (a.code || "").localeCompare(b.code || "");
+        });
+
+        setBranches(list);
         setLoading(false);
       },
       (err) => {
@@ -114,12 +135,30 @@ export default function BranchManagement({
         updatedAt: serverTimestamp()
       };
 
-      if (editingBranch && editingBranch.id !== "main_default") {
+      if (editingBranch) {
         await updateDoc(doc(db, "users", currentUid, "branches", editingBranch.id), payload);
         alert(`✅ Branch "${payload.name}" updated successfully!`);
       } else {
+        // Pre-seed primary Main Branch in Firestore if not yet stored
+        try {
+          const mainRef = doc(db, "users", currentUid, "branches", "main_branch");
+          await setDoc(mainRef, {
+            name: `${storeName} - Main Branch`,
+            code: "BR-01",
+            address: "Main Store Location",
+            phone: userProfile.mobile || userProfile.phone || "",
+            managerName: userProfile.name || "Restaurant Manager",
+            isPrimary: true,
+            status: "active",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        } catch (seedErr) {
+          console.warn("Main branch pre-seed notice:", seedErr);
+        }
+
         payload.createdAt = serverTimestamp();
-        payload.isPrimary = branches.length === 0;
+        payload.isPrimary = false;
         const newRef = await addDoc(collection(db, "users", currentUid, "branches"), payload);
         alert(`✅ New Branch "${payload.name}" created successfully!`);
         if (onSelectBranch) {
@@ -137,7 +176,7 @@ export default function BranchManagement({
   };
 
   const handleDeleteBranch = async (b) => {
-    if (b.isPrimary) {
+    if (b.isPrimary || b.id === "main_branch" || b.id === "main_default") {
       alert("Cannot delete the primary/main branch.");
       return;
     }
@@ -147,8 +186,9 @@ export default function BranchManagement({
       await deleteDoc(doc(db, "users", currentUid, "branches", b.id));
       if (activeBranchId === b.id && onSelectBranch) {
         const remaining = branches.filter((item) => item.id !== b.id);
-        if (remaining.length > 0) {
-          onSelectBranch(remaining[0].id, remaining[0].name);
+        const primary = remaining.find((item) => item.isPrimary || item.id === "main_branch") || remaining[0];
+        if (primary) {
+          onSelectBranch(primary.id, primary.name);
         }
       }
       alert("Branch removed successfully.");
@@ -222,16 +262,36 @@ export default function BranchManagement({
           </div>
         ) : (
           branches.map((b) => {
-            const isActive = (activeBranchId && activeBranchId === b.id) || (!activeBranchId && b.isPrimary);
+            const isActive = (activeBranchId && activeBranchId === b.id) || 
+                             (!activeBranchId && (b.isPrimary || b.id === "main_branch")) ||
+                             (activeBranchId === "main_default" && (b.isPrimary || b.id === "main_branch"));
+
+            // Calculate real branch metrics from ordersList & products
+            const branchOrders = (ordersList || []).filter((o) => {
+              if (!o.branchId && !o.branchName) {
+                return b.isPrimary || b.id === "main_branch";
+              }
+              return o.branchId === b.id || o.branchName === b.name;
+            });
+            const branchTotalSales = branchOrders.reduce((sum, o) => sum + Number(o.totalAmount || o.total || 0), 0);
+            const branchProducts = (products || []).filter((p) => {
+              if (!p.branchId || p.isAllBranches) return true;
+              return p.branchId === b.id;
+            });
 
             return (
               <div
                 key={b.id}
+                onClick={() => onSelectBranch && onSelectBranch(b.id, b.name)}
                 style={{
                   ...styles.branchCard,
                   borderColor: isActive ? "#16a34a" : "#e2e8f0",
-                  boxShadow: isActive ? "0 4px 14px rgba(22, 163, 74, 0.15)" : "0 1px 3px rgba(0,0,0,0.03)"
+                  backgroundColor: isActive ? "#f0fdf4" : "#ffffff",
+                  boxShadow: isActive ? "0 4px 16px rgba(22, 163, 74, 0.18)" : "0 1px 3px rgba(0,0,0,0.03)",
+                  cursor: "pointer",
+                  position: "relative"
                 }}
+                title={`Click to switch to "${b.name}"`}
               >
                 {/* Card Header */}
                 <div style={styles.cardHeader}>
@@ -253,7 +313,7 @@ export default function BranchManagement({
                       <h3 style={styles.branchName}>{b.name}</h3>
                       <div style={{ display: "flex", gap: "6px", alignItems: "center", marginTop: "2px" }}>
                         <span style={styles.codeBadge}>{b.code || "BR-01"}</span>
-                        {b.isPrimary && <span style={styles.primaryBadge}>Primary Outlet</span>}
+                        {(b.isPrimary || b.id === "main_branch") && <span style={styles.primaryBadge}>Primary Outlet</span>}
                       </div>
                     </div>
                   </div>
@@ -263,13 +323,34 @@ export default function BranchManagement({
                   ) : (
                     <button
                       type="button"
-                      onClick={() => onSelectBranch && onSelectBranch(b.id, b.name)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectBranch && onSelectBranch(b.id, b.name);
+                      }}
                       style={styles.switchBtn}
                       title="Switch active store session to this branch"
                     >
                       Switch Here →
                     </button>
                   )}
+                </div>
+
+                {/* Branch Stats Row */}
+                <div style={styles.branchStatsRow}>
+                  <div style={styles.branchStatBox}>
+                    <span style={styles.branchStatLabel}>Total Revenue</span>
+                    <span style={{ ...styles.branchStatVal, color: "#16a34a" }}>
+                      ₹{branchTotalSales.toLocaleString("en-IN", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                  <div style={styles.branchStatBox}>
+                    <span style={styles.branchStatLabel}>Orders</span>
+                    <span style={styles.branchStatVal}>{branchOrders.length}</span>
+                  </div>
+                  <div style={styles.branchStatBox}>
+                    <span style={styles.branchStatLabel}>Products</span>
+                    <span style={styles.branchStatVal}>{branchProducts.length}</span>
+                  </div>
                 </div>
 
                 {/* Details */}
@@ -292,15 +373,21 @@ export default function BranchManagement({
                 <div style={styles.cardFooter}>
                   <button
                     type="button"
-                    onClick={() => openEditModal(b)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openEditModal(b);
+                    }}
                     style={styles.actionBtnEdit}
                   >
                     ✏️ Edit Details
                   </button>
-                  {!b.isPrimary && (
+                  {!(b.isPrimary || b.id === "main_branch") && (
                     <button
                       type="button"
-                      onClick={() => handleDeleteBranch(b)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteBranch(b);
+                      }}
                       style={styles.actionBtnDelete}
                     >
                       🗑️ Delete
@@ -520,7 +607,36 @@ const styles = {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "flex-start",
-    marginBottom: "14px"
+    marginBottom: "12px"
+  },
+  branchStatsRow: {
+    display: "grid",
+    gridTemplateColumns: "1.2fr 1fr 1fr",
+    gap: "8px",
+    backgroundColor: "#f8fafc",
+    padding: "8px 10px",
+    borderRadius: "8px",
+    border: "1px solid #e2e8f0",
+    marginBottom: "12px"
+  },
+  branchStatBox: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    textAlign: "center"
+  },
+  branchStatLabel: {
+    fontSize: "9.5px",
+    color: "#64748b",
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: "0.4px"
+  },
+  branchStatVal: {
+    fontSize: "13px",
+    fontWeight: "800",
+    color: "#0f172a",
+    marginTop: "2px"
   },
   branchName: {
     fontSize: "15px",

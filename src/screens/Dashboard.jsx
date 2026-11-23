@@ -41,29 +41,75 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [rawUserData, setRawUserData] = useState(null);
   const userSubscription = resolveUserSubscription(rawUserData);
 
+  // User Profile & Settings States
+  const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store", profileImage: "" });
+
   // Multi-Store Branches Management State
-  const [activeBranchId, setActiveBranchId] = useState(() => localStorage.getItem("active_branch_id") || "main_default");
+  const [activeBranchId, setActiveBranchId] = useState(() => localStorage.getItem("active_branch_id") || "main_branch");
   const [activeBranchName, setActiveBranchName] = useState(() => localStorage.getItem("active_branch_name") || "Main Branch");
   const [branchesList, setBranchesList] = useState([]);
 
   useEffect(() => {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) return;
-    const unsub = onSnapshot(collection(db, "users", currentUid, "branches"), (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    const unsub = onSnapshot(collection(db, "users", currentUid, "branches"), async (snap) => {
+      let list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      // Ensure Primary Main Branch exists in Firestore
+      const hasPrimary = list.some((b) => b.isPrimary || b.id === "main_branch" || b.code === "BR-01");
+      if (list.length === 0 || !hasPrimary) {
+        try {
+          const mainRef = doc(db, "users", currentUid, "branches", "main_branch");
+          const defaultBranch = {
+            name: `${userProfile.storeName || "Turf Cafe"} - Main Branch`,
+            code: "BR-01",
+            address: "Main Store Location",
+            phone: userProfile.mobile || userProfile.phone || "",
+            managerName: userProfile.name || "Restaurant Manager",
+            isPrimary: true,
+            status: "active",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          };
+          await setDoc(mainRef, defaultBranch, { merge: true });
+          if (!list.some(b => b.id === "main_branch")) {
+            list = [{ id: "main_branch", ...defaultBranch }, ...list];
+          }
+        } catch (e) {
+          console.warn("Could not seed main branch in Firestore:", e);
+        }
+      }
+
+      // Sort so primary branch is always first
+      list.sort((a, b) => {
+        if (a.isPrimary || a.id === "main_branch") return -1;
+        if (b.isPrimary || b.id === "main_branch") return 1;
+        return (a.code || "").localeCompare(b.code || "");
+      });
+
       setBranchesList(list);
+
+      // Keep active branch valid
       if (list.length > 0) {
-        const found = list.find((b) => b.id === activeBranchId);
+        const found = list.find((b) => b.id === activeBranchId || (activeBranchId === "main_default" && (b.isPrimary || b.id === "main_branch")));
         if (found) {
+          setActiveBranchId(found.id);
           setActiveBranchName(found.name);
-        } else if (!activeBranchId || activeBranchId === "main_default") {
-          setActiveBranchId(list[0].id);
-          setActiveBranchName(list[0].name);
+          localStorage.setItem("active_branch_id", found.id);
+          localStorage.setItem("active_branch_name", found.name);
+        } else {
+          const primary = list.find((b) => b.isPrimary || b.id === "main_branch") || list[0];
+          setActiveBranchId(primary.id);
+          setActiveBranchName(primary.name);
+          localStorage.setItem("active_branch_id", primary.id);
+          localStorage.setItem("active_branch_name", primary.name);
         }
       }
     });
+
     return () => unsub();
-  }, [activeBranchId]);
+  }, [activeBranchId, userProfile.storeName]);
 
   const handleSelectBranch = (branchId, bName) => {
     setActiveBranchId(branchId);
@@ -130,8 +176,7 @@ export default function Dashboard({ initialTab = "sales" }) {
   const [menuCoords, setMenuCoords] = useState({ top: 0, right: 0 });
   const profileBtnRef = useRef(null);
 
-  // User Profile & Settings States
-  const [userProfile, setUserProfile] = useState({ name: "", email: "", phone: "", storeName: "Kadai Pro Store", profileImage: "" });
+  // Store Settings States
   const [storeSettings, setStoreSettings] = useState({ upiId: "kadaippro@okaxis", allowCash: true, allowUpi: true, allowCard: true });
   const [printSettings, setPrintSettings] = useState(() => {
     try {
@@ -862,85 +907,81 @@ export default function Dashboard({ initialTab = "sales" }) {
     return `${Math.floor(diff / 60)}h ${diff % 60}m ago`;
   };
 
-  // Helper to get Customer Feedback & Star Ratings for any product
+  // Helper to get Customer Feedback & Star Ratings for any product (Real Customer Data Only)
   const getProductFeedbackData = (product) => {
-    if (!product) return { avg: "5.0", count: 0, reviews: [] };
+    if (!product) return { avg: null, count: 0, reviews: [] };
     const pId = String(product.id || "");
     const pName = (product.itemName || product.name || "").toLowerCase().trim();
 
-    // Find custom feedbacks saved in Firestore matching this product
+    // 1. Check real customer feedbacks saved in Firestore matching this product
     const firestoreReviews = (customerFeedbacks || []).filter((fb) => {
       const fbProdId = String(fb.productId || "");
       const fbProdName = (fb.productName || "").toLowerCase().trim();
       return (pId && fbProdId === pId) || (pName && fbProdName === pName);
     });
 
-    // Hash-based realistic default reviews so each menu item displays ratings even before reviews are submitted
-    const hash = (pName || "food").split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
-    const baseAvg = (4.6 + ((hash % 4) * 0.1)).toFixed(1); // 4.6, 4.7, 4.8, or 4.9
-    const baseCount = 8 + (hash % 16); // 8 - 23 reviews
+    // 2. Also check customer ratings/reviews submitted on online customer orders
+    const orderReviews = [];
+    (onlineOrdersList || []).forEach((ord) => {
+      if (Array.isArray(ord.items)) {
+        ord.items.forEach((it) => {
+          const itId = String(it.id || it.productId || "");
+          const itName = (it.name || it.itemName || "").toLowerCase().trim();
+          if ((pId && itId === pId) || (pName && itName === pName)) {
+            const rVal = Number(it.rating || it.itemRating || ord.rating || ord.orderRating || 0);
+            if (rVal > 0) {
+              orderReviews.push({
+                id: ord.id + "_" + (it.id || "item"),
+                name: ord.customerName || "Customer",
+                rating: Math.min(5, Math.max(1, Math.round(rVal))),
+                date: ord.createdAt?.toDate ? ord.createdAt.toDate().toLocaleDateString("en-IN") : "Recent Order",
+                comment: it.review || it.feedback || ord.review || ord.customerFeedback || "Verified Customer Order",
+                isReal: true,
+              });
+            }
+          }
+        });
+      }
+    });
 
-    const defaultReviews = isRestaurant ? [
-      {
-        name: "Karthik R.",
-        rating: 5,
-        date: "Yesterday",
-        comment: `Excellent taste! The ${product.itemName || product.name} was perfectly prepared, fresh, and delicious.`
-      },
-      {
-        name: "Priya Sundar",
-        rating: 5,
-        date: "3 days ago",
-        comment: `Loved the quality and flavor. One of the best items on the menu!`
-      },
-      {
-        name: "Arun Kumar",
-        rating: 4,
-        date: "1 week ago",
-        comment: `Good portion size, hot and fast service.`
-      }
-    ] : [
-      {
-        name: "Suresh M.",
-        rating: 5,
-        date: "2 days ago",
-        comment: `Top quality item, fresh and well packed.`
-      },
-      {
-        name: "Divya N.",
-        rating: 5,
-        date: "4 days ago",
-        comment: `Great value for money. Very satisfied.`
-      }
+    const allRealReviews = [
+      ...firestoreReviews.map((r) => ({
+        id: r.id,
+        name: r.customerName || "Customer",
+        rating: Math.min(5, Math.max(1, Math.round(Number(r.rating || r.foodOrProductRating || r.overallRating || 5)))),
+        date: r.dateStr || "Recently",
+        comment: r.comments || "",
+        isReal: true,
+      })),
+      ...orderReviews
     ];
 
-    if (firestoreReviews.length === 0) {
+    if (allRealReviews.length > 0) {
+      const sum = allRealReviews.reduce((acc, r) => acc + r.rating, 0);
+      const avg = (sum / allRealReviews.length).toFixed(1);
       return {
-        avg: baseAvg,
-        count: baseCount,
-        reviews: defaultReviews,
+        avg,
+        count: allRealReviews.length,
+        reviews: allRealReviews,
       };
     }
 
-    // Merge Firestore reviews with baseline
-    const totalCount = baseCount + firestoreReviews.length;
-    const fsSum = firestoreReviews.reduce((sum, r) => sum + Number(r.rating || r.overallRating || 5), 0);
-    const combinedSum = (Number(baseAvg) * baseCount) + fsSum;
-    const avg = (combinedSum / totalCount).toFixed(1);
+    // Check if the product document itself has a real rating from customer app / catalog sync
+    const productDocRating = Number(product.rating || product.averageRating || 0);
+    const productDocCount = Number(product.ratingsCount || product.reviewCount || product.totalRatings || 0);
+    if (productDocRating > 0) {
+      return {
+        avg: productDocRating.toFixed(1),
+        count: productDocCount || 1,
+        reviews: [],
+      };
+    }
 
-    const formattedFsReviews = firestoreReviews.map((r) => ({
-      id: r.id,
-      name: r.customerName || "Customer",
-      rating: Number(r.rating || r.overallRating || 5),
-      date: r.dateStr || "Recently",
-      comment: r.comments || "Great food!",
-      isReal: true
-    }));
-
+    // No reviews yet - NO DUMMY DATA!
     return {
-      avg,
-      count: totalCount,
-      reviews: [...formattedFsReviews, ...defaultReviews]
+      avg: null,
+      count: 0,
+      reviews: [],
     };
   };
 
@@ -1673,6 +1714,8 @@ export default function Dashboard({ initialTab = "sales" }) {
         appMode: appMode,
         isRestaurant: isRestaurant,
         shopType: isRestaurant ? "restaurant" : "retail",
+        branchId: activeBranchId || "main_branch",
+        branchName: activeBranchName || "Main Branch",
         createdAt: serverTimestamp()
       };
 
@@ -1856,6 +1899,7 @@ export default function Dashboard({ initialTab = "sales" }) {
       setActiveResumedOrderId(null);
       setActiveTableOrderId(null);
       setActiveTableOrderInfo(null);
+      playNotificationSound("paymentSuccess");
       setPopupModal({ 
         show: true, 
         message: "Payment Successful & Order Recorded! 🎉",
@@ -2175,6 +2219,8 @@ export default function Dashboard({ initialTab = "sales" }) {
         imageUrl: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         isGlobalMode: isGlobalMode,
         inventoryMode: isGlobalMode ? "global" : "local",
+        branchId: activeBranchId || "main_branch",
+        branchName: activeBranchName || "Main Branch",
         updatedAt: serverTimestamp()
       };
 
@@ -2214,6 +2260,17 @@ export default function Dashboard({ initialTab = "sales" }) {
   const totalBillItemsCount = currentBill.reduce((sum, item) => sum + item.qty, 0);
 
   const filteredProducts = products.filter(item => {
+    // Branch Filter: Match activeBranchId. If item has no branchId or isAllBranches is true, show in primary or all branches.
+    const isCurrentPrimary = activeBranchId === "main_branch" || activeBranchId === "main_default" || branchesList.find(b => b.id === activeBranchId)?.isPrimary;
+    const matchesBranch = (() => {
+      if (!item.branchId || item.isAllBranches === true) {
+        return true;
+      }
+      return item.branchId === activeBranchId || (isCurrentPrimary && (item.branchId === "main_default" || item.branchId === "main_branch"));
+    })();
+
+    if (!matchesBranch) return false;
+
     const itemName = item.itemName || item.name || "";
     const itemCat = item.category || "General";
     const matchesSearch = itemName.toLowerCase().includes(searchQuery.toLowerCase());
@@ -2223,6 +2280,17 @@ export default function Dashboard({ initialTab = "sales" }) {
 
   // --- Sales Top Stat Cards Metrics Calculation ---
   const relevantOrders = ordersList.filter(o => {
+    // Branch Filter: If order has branchId, match activeBranchId. If order has no branchId, assign to primary branch.
+    const isCurrentPrimary = activeBranchId === "main_branch" || activeBranchId === "main_default" || branchesList.find(b => b.id === activeBranchId)?.isPrimary;
+    const matchesBranch = (() => {
+      if (!o.branchId && !o.branchName) {
+        return isCurrentPrimary;
+      }
+      return o.branchId === activeBranchId || o.branchName === activeBranchName;
+    })();
+
+    if (!matchesBranch) return false;
+
     if (isRestaurant) {
       return o.shopType === "restaurant" || o.isRestaurant === true || isRestaurant;
     }
@@ -2230,7 +2298,7 @@ export default function Dashboard({ initialTab = "sales" }) {
     return isGlobalMode ? isOrdGlobal : !isOrdGlobal;
   });
 
-  const ordersPool = relevantOrders.length > 0 ? relevantOrders : ordersList;
+  const ordersPool = relevantOrders;
 
   const now = new Date();
   const isSameDay = (d1, d2) => 
@@ -2278,14 +2346,10 @@ export default function Dashboard({ initialTab = "sales" }) {
   };
 
   const hasOrdersData = ordersPool.length > 0;
-  const statTotalSalesText = hasOrdersData 
-    ? `₹${computedTotalSales.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-    : "₹4,892.45";
-  const statOrdersText = hasOrdersData ? computedOrdersCount : 128;
-  const statCustomersText = hasOrdersData ? (computedCustomersCount || computedOrdersCount) : 256;
-  const statAvgOrderText = hasOrdersData 
-    ? `₹${computedAvgOrderVal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-    : "₹38.22";
+  const statTotalSalesText = `₹${computedTotalSales.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const statOrdersText = computedOrdersCount;
+  const statCustomersText = computedCustomersCount;
+  const statAvgOrderText = `₹${computedAvgOrderVal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
   // Waste & Spoilage Expense Statistics
   const wasteStats = useMemo(() => calculateWasteStats(wasteRecords), [wasteRecords]);
@@ -3659,27 +3723,6 @@ export default function Dashboard({ initialTab = "sales" }) {
                       <span style={styles.statCardArrowUp}>↑</span> {statAvgGrowth}
                     </div>
                   </div>
-
-                  {/* CARD 5: Waste & Spoilage Loss */}
-                  <div
-                    style={{ ...styles.salesStatCard, cursor: "pointer", border: "1px solid #fee2e2", backgroundColor: "#fffafa" }}
-                    onClick={() => setActiveTab("waste")}
-                    title="Click to view Waste & Spoilage Management"
-                  >
-                    <div style={styles.statCardHeader}>
-                      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
-                        <div style={{ ...styles.statCardIconCircle, backgroundColor: "#ef4444" }}>
-                          <span style={{ fontSize: "11px" }}>📉</span>
-                        </div>
-                        <span style={{ ...styles.statCardTitle, color: "#991b1b" }}>Waste Loss</span>
-                      </div>
-                      <span style={{ ...styles.statCardThreeDots, color: "#ef4444", fontWeight: "700" }} title="Open Waste Management">→</span>
-                    </div>
-                    <div style={{ ...styles.statCardValue, color: "#dc2626" }}>{statWasteLossText}</div>
-                    <div style={{ ...styles.statCardSubtext, color: "#b91c1c" }}>
-                      <span>⚠️</span> {statsTimeframe === "today" ? `${wasteStats.todayQuantity} units lost today` : `${wasteStats.totalQuantity} units lost overall`}
-                    </div>
-                  </div>
                 </div>
               </div>
 
@@ -3767,16 +3810,20 @@ export default function Dashboard({ initialTab = "sales" }) {
                                     gap: "3px",
                                     padding: "2px 6px",
                                     borderRadius: "6px",
-                                    backgroundColor: "#fffbeb",
-                                    border: "1px solid #fef3c7",
+                                    backgroundColor: fbData.count > 0 ? "#fffbeb" : "#f8fafc",
+                                    border: "1px solid " + (fbData.count > 0 ? "#fef3c7" : "#e2e8f0"),
                                     cursor: "pointer",
                                     fontSize: "11px"
                                   }}
-                                  title={`Customer Rating: ${fbData.avg}★ (${fbData.count} reviews) - Click to view feedback`}
+                                  title={fbData.count > 0 ? `Customer Rating: ${fbData.avg}★ (${fbData.count} reviews) - Click to view` : "No customer ratings yet - Click to rate"}
                                 >
-                                  <span style={{ color: "#f59e0b", fontSize: "11px" }}>★</span>
-                                  <span style={{ fontWeight: "800", color: "#b45309" }}>{fbData.avg}</span>
-                                  <span style={{ color: "#92400e", fontSize: "10px" }}>({fbData.count})</span>
+                                  <span style={{ color: fbData.count > 0 ? "#f59e0b" : "#94a3b8", fontSize: "11px" }}>★</span>
+                                  <span style={{ fontWeight: "800", color: fbData.count > 0 ? "#b45309" : "#64748b" }}>
+                                    {fbData.count > 0 ? fbData.avg : "Rate"}
+                                  </span>
+                                  <span style={{ color: fbData.count > 0 ? "#92400e" : "#94a3b8", fontSize: "10px" }}>
+                                    ({fbData.count})
+                                  </span>
                                 </div>
                               );
                             })()}
@@ -3892,6 +3939,8 @@ export default function Dashboard({ initialTab = "sales" }) {
             userProfile={userProfile}
             activeBranchId={activeBranchId}
             onSelectBranch={handleSelectBranch}
+            ordersList={ordersList}
+            products={products}
             onBack={() => setActiveTab("sales")}
           />
         )}
@@ -4006,7 +4055,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                         </div>
                       )}
 
-                      {/* Customer Ratings & Feedback Stars */}
+                      {/* Customer Ratings & Feedback Stars (Real Customer Data Only) */}
                       {(() => {
                         const fbData = getProductFeedbackData(item);
                         return (
@@ -4022,19 +4071,25 @@ export default function Dashboard({ initialTab = "sales" }) {
                               marginTop: "6px",
                               padding: "4px 8px",
                               borderRadius: "8px",
-                              backgroundColor: "#fffbeb",
-                              border: "1px solid #fef3c7",
+                              backgroundColor: fbData.count > 0 ? "#fffbeb" : "#f8fafc",
+                              border: "1px solid " + (fbData.count > 0 ? "#fef3c7" : "#e2e8f0"),
                               cursor: "pointer",
                               transition: "all 0.15s ease"
                             }}
-                            title="Click to view diner feedback & ratings"
+                            title={fbData.count > 0 ? `Customer Rating: ${fbData.avg}★ (${fbData.count} reviews) - Click to view` : "No customer ratings yet - Click to rate"}
                           >
-                            <span style={{ color: "#f59e0b", fontSize: "13px", letterSpacing: "1px" }}>
-                              {"★".repeat(Math.round(Number(fbData.avg)))}
-                              {"☆".repeat(5 - Math.round(Number(fbData.avg)))}
+                            <span style={{ color: fbData.count > 0 ? "#f59e0b" : "#94a3b8", fontSize: "13px", letterSpacing: "1px" }}>
+                              {fbData.count > 0 ? (
+                                "★".repeat(Math.min(5, Math.max(1, Math.round(Number(fbData.avg))))) +
+                                "☆".repeat(Math.max(0, 5 - Math.round(Number(fbData.avg))))
+                              ) : "☆☆☆☆☆"}
                             </span>
-                            <span style={{ fontWeight: "800", fontSize: "12px", color: "#b45309" }}>{fbData.avg}</span>
-                            <span style={{ fontSize: "11px", color: "#92400e" }}>({fbData.count})</span>
+                            <span style={{ fontWeight: "800", fontSize: "12px", color: fbData.count > 0 ? "#b45309" : "#64748b" }}>
+                              {fbData.count > 0 ? fbData.avg : "No ratings"}
+                            </span>
+                            <span style={{ fontSize: "11px", color: fbData.count > 0 ? "#92400e" : "#94a3b8" }}>
+                              ({fbData.count})
+                            </span>
                           </div>
                         );
                       })()}
@@ -5677,19 +5732,33 @@ export default function Dashboard({ initialTab = "sales" }) {
                 alignItems: "center",
                 marginBottom: "16px"
               }}>
-                <div>
-                  <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
-                    <span style={{ fontSize: "32px", fontWeight: "900", color: "#b45309" }}>{fbData.avg}</span>
-                    <span style={{ fontSize: "14px", fontWeight: "700", color: "#d97706" }}>/ 5.0</span>
+                {fbData.count > 0 ? (
+                  <div>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
+                      <span style={{ fontSize: "32px", fontWeight: "900", color: "#b45309" }}>{fbData.avg}</span>
+                      <span style={{ fontSize: "14px", fontWeight: "700", color: "#d97706" }}>/ 5.0</span>
+                    </div>
+                    <div style={{ color: "#f59e0b", fontSize: "18px", letterSpacing: "2px", margin: "2px 0" }}>
+                      {"★".repeat(Math.min(5, Math.max(1, Math.round(Number(fbData.avg)))))}
+                      {"☆".repeat(Math.max(0, 5 - Math.round(Number(fbData.avg))))}
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#92400e", fontWeight: "600" }}>
+                      Based on {fbData.count} verified customer {fbData.count === 1 ? "rating" : "ratings"}
+                    </div>
                   </div>
-                  <div style={{ color: "#f59e0b", fontSize: "18px", letterSpacing: "2px", margin: "2px 0" }}>
-                    {"★".repeat(Math.round(Number(fbData.avg)))}
-                    {"☆".repeat(5 - Math.round(Number(fbData.avg)))}
+                ) : (
+                  <div>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
+                      <span style={{ fontSize: "20px", fontWeight: "800", color: "#b45309" }}>No Ratings Yet</span>
+                    </div>
+                    <div style={{ color: "#d1d5db", fontSize: "18px", letterSpacing: "2px", margin: "2px 0" }}>
+                      ☆☆☆☆☆
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#92400e", fontWeight: "600" }}>
+                      0 customer reviews recorded so far
+                    </div>
                   </div>
-                  <div style={{ fontSize: "12px", color: "#92400e", fontWeight: "600" }}>
-                    Based on {fbData.count} verified customer orders
-                  </div>
-                </div>
+                )}
                 
                 <button
                   type="button"
@@ -5809,33 +5878,51 @@ export default function Dashboard({ initialTab = "sales" }) {
                 <h4 style={{ margin: "0 0 10px 0", fontSize: "13px", fontWeight: "800", color: "#334155" }}>
                   💬 Diner Feedback & Reviews ({fbData.reviews.length})
                 </h4>
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  {fbData.reviews.map((rev, rIdx) => (
-                    <div 
-                      key={rev.id || rIdx}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "9px",
-                        backgroundColor: "#f8fafc",
-                        border: "1px solid #e2e8f0"
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                          <span style={{ fontWeight: "800", fontSize: "12.5px", color: "#0f172a" }}>{rev.name}</span>
-                          <span style={{ fontSize: "10px", backgroundColor: "#dcfce7", color: "#166534", padding: "1px 6px", borderRadius: "4px", fontWeight: "700" }}>Verified Order</span>
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                          <span style={{ color: "#f59e0b", fontSize: "12px" }}>{"★".repeat(rev.rating)}</span>
-                          <span style={{ fontSize: "10.5px", color: "#94a3b8" }}>{rev.date}</span>
-                        </div>
-                      </div>
-                      <p style={{ margin: 0, fontSize: "12px", color: "#475569", fontStyle: "italic", lineHeight: "1.4" }}>
-                        "{rev.comment}"
-                      </p>
+                {fbData.reviews.length === 0 ? (
+                  <div style={{
+                    padding: "24px 16px",
+                    textAlign: "center",
+                    backgroundColor: "#f8fafc",
+                    borderRadius: "10px",
+                    border: "1px dashed #cbd5e1"
+                  }}>
+                    <span style={{ fontSize: "26px", display: "block", marginBottom: "6px" }}>🍽️</span>
+                    <div style={{ fontSize: "13.5px", fontWeight: "700", color: "#334155" }}>No customer reviews recorded yet</div>
+                    <div style={{ fontSize: "12px", color: "#64748b", marginTop: "3px" }}>
+                      Ratings and feedback from customer orders will automatically appear here.
                     </div>
-                  ))}
-                </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {fbData.reviews.map((rev, rIdx) => (
+                      <div 
+                        key={rev.id || rIdx}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: "9px",
+                          backgroundColor: "#f8fafc",
+                          border: "1px solid #e2e8f0"
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            <span style={{ fontWeight: "800", fontSize: "12.5px", color: "#0f172a" }}>{rev.name}</span>
+                            <span style={{ fontSize: "10px", backgroundColor: "#dcfce7", color: "#166534", padding: "1px 6px", borderRadius: "4px", fontWeight: "700" }}>Verified Order</span>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            <span style={{ color: "#f59e0b", fontSize: "12px" }}>{"★".repeat(rev.rating || 5)}</span>
+                            <span style={{ fontSize: "10.5px", color: "#94a3b8" }}>{rev.date}</span>
+                          </div>
+                        </div>
+                        {rev.comment ? (
+                          <p style={{ margin: 0, fontSize: "12px", color: "#475569", fontStyle: "italic", lineHeight: "1.4" }}>
+                            "{rev.comment}"
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -6360,8 +6447,8 @@ export default function Dashboard({ initialTab = "sales" }) {
 const styles = {
   appContainer: { display: "flex", minHeight: "100vh", backgroundColor: "#f8fafc", fontFamily: "system-ui, sans-serif", flexDirection: "column", width: "100%" },
   navbar: { 
-    display: "flex", 
-    justifyContent: "space-between", 
+    display: "grid", 
+    gridTemplateColumns: "1.3fr auto 0.7fr", 
     alignItems: "center", 
     padding: "10px 20px", 
     backgroundColor: "#ffffff", 
@@ -6378,6 +6465,7 @@ const styles = {
     display: "flex", 
     alignItems: "center", 
     gap: "12px", 
+    justifySelf: "start",
     flexShrink: 0 
   },
   hamburgerBtn: {
@@ -6425,9 +6513,9 @@ const styles = {
   navLinksGroup: {
     display: "flex",
     alignItems: "center",
-    gap: "6px",
-    flex: 1,
-    justifyContent: "flex-start",
+    gap: "8px",
+    justifySelf: "center",
+    justifyContent: "center",
     overflowX: "auto",
     scrollbarWidth: "none",
     msOverflowStyle: "none",
@@ -6562,6 +6650,7 @@ const styles = {
     display: "flex",
     gap: "10px",
     alignItems: "center",
+    justifySelf: "end",
     flexShrink: 0
   },
   activeTabBadge: {
