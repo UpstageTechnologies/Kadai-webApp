@@ -17,6 +17,7 @@ import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscript
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
 import { subscribeWasteRecords, calculateWasteStats } from "../utils/wasteService";
+import { deductRecipeStock } from "../utils/recipeStockService";
 
 export default function Dashboard({ initialTab = "sales" }) {
   const [activeTab, setActiveTab] = useState(initialTab === "dashboard" ? "sales" : initialTab);
@@ -1114,8 +1115,16 @@ export default function Dashboard({ initialTab = "sales" }) {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid || !orderId) return;
     try {
+      const targetKot = kitchenOrders.find((k) => k.id === orderId);
+      if (targetKot && Array.isArray(targetKot.items) && !targetKot.isPaid && !targetKot.ingredientsDeducted) {
+        try {
+          deductRecipeStock(currentUid, targetKot.items);
+        } catch (_) {}
+      }
+
       await updateDoc(doc(db, "users", currentUid, "kitchen_orders", orderId), {
         status: "completed",
+        ingredientsDeducted: true,
         billedAt: serverTimestamp(),
         billedAtMs: Date.now(),
         readyForBilling: false,
@@ -1722,6 +1731,13 @@ export default function Dashboard({ initialTab = "sales" }) {
       if (currentUid) {
         // 1. Direct save in "sales" collection (No online order notification)
         await addDoc(collection(db, "users", currentUid, "sales"), saleRecord);
+
+        // Deduct raw material recipe ingredients from stock in real-time
+        try {
+          deductRecipeStock(currentUid, sanitizedBillItems);
+        } catch (stockErr) {
+          console.warn("Recipe stock deduction notice:", stockErr);
+        }
 
         // 2. Transmit confirmation event to Mobile App
         try {
@@ -2499,21 +2515,21 @@ export default function Dashboard({ initialTab = "sales" }) {
             <span>{isRestaurant ? "Menu Items" : (isGlobalMode ? "Global Inventory" : "Inventory")}</span>
           </button>
 
-          {/* 3. Online Orders & Delivery (Icon Only) */}
+          {/* 3. Online Orders & Delivery */}
           <button
             type="button"
             onClick={() => setActiveTab("orders")}
             style={{
               ...styles.navTabBtn,
-              ...(activeTab === "orders" ? styles.navTabBtnActive : {}),
-              padding: "7px 11px"
+              ...(activeTab === "orders" ? styles.navTabBtnActive : {})
             }}
             title="Customer online orders & live delivery dispatch"
           >
-            <span style={{ fontSize: "16px" }}>🛵</span>
+            <span style={{ fontSize: "14px" }}>🌐</span>
+            <span>Online</span>
             {newOnlineOrdersCount > 0 ? (
               <span style={styles.navBadgeRed}>
-                🔔 {newOnlineOrdersCount}
+                {newOnlineOrdersCount}
               </span>
             ) : onlineOrdersList.length > 0 ? (
               <span style={styles.navBadgeGray}>
@@ -2534,25 +2550,6 @@ export default function Dashboard({ initialTab = "sales" }) {
           >
             <span style={{ fontSize: "14px" }}>📊</span>
             <span>Purchase Report</span>
-          </button>
-
-          {/* 5. Waste & Spoilage Management (Icon Only) */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("waste")}
-            style={{
-              ...styles.navTabBtn,
-              ...(activeTab === "waste" ? styles.navTabBtnActive : {}),
-              padding: "7px 11px"
-            }}
-            title={isRestaurant ? "Food waste, kitchen spoilage & loss calculation" : "Product waste & inventory shrinkage tracking"}
-          >
-            <span style={{ fontSize: "16px" }}>🗑️</span>
-            {wasteStats.todayLoss > 0 && (
-              <span style={styles.navBadgeRed}>
-                ₹{Math.round(wasteStats.todayLoss)}
-              </span>
-            )}
           </button>
 
           {/* RESTAURANT OPERATIONS */}
@@ -4759,7 +4756,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                   gap: "6px"
                 }}
               >
-                <span>🛎️ Ready for Pickup</span>
+                <span>🛎️ Ready</span>
                 <span style={{ backgroundColor: "#ffedd5", color: "#c2410c", padding: "1px 7px", borderRadius: "10px", fontSize: "11px", fontWeight: "800" }}>
                   {paidReadyOrders.length}
                 </span>
@@ -4974,7 +4971,7 @@ export default function Dashboard({ initialTab = "sales" }) {
                         <div>
                           {isPaidOrder && (isReady || isServed) ? (
                             <span style={{ backgroundColor: "#ea580c", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>
-                              🛎️ READY FOR PICKUP
+                              🛎️ READY
                             </span>
                           ) : isServed ? (
                             <span style={{ backgroundColor: "#16a34a", color: "#fff", padding: "4px 10px", borderRadius: "10px", fontSize: "12px", fontWeight: "800" }}>

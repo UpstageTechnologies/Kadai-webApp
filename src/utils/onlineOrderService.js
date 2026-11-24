@@ -11,6 +11,7 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { auth } from "./firebase";
+import { deductRecipeStock } from "./recipeStockService";
 
 export const asArray = (value) => (Array.isArray(value) ? value : []);
 export const asText = (value) => (value == null ? "" : String(value));
@@ -287,6 +288,11 @@ export async function updateOnlineOrderStatus({
         const myShop = order.orderedShops.find((s) => s?.shopId === sellerUid);
         if (myShop) orderedItems = myShop.items || [];
       }
+
+      // Deduct raw material recipe ingredients for completed online food orders
+      try {
+        deductRecipeStock(sellerUid, orderedItems);
+      } catch (_) {}
 
       let localItems = [];
       let globalItems = [];

@@ -9,16 +9,51 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
+import { getGroceryImage } from "../utils/groceryImages";
 
-// Unit conversion helper
-export function computeIngredientCost(qty, unit, rawMaterial) {
+// Helper to parse net quantity from item names (e.g., "Milk 500ml", "Coffee 100g", "Oil 1L")
+export function parsePackSizeFromName(name) {
+  if (!name || typeof name !== "string") return null;
+  const match = name.match(/(\d+(?:\.\d+)?)\s*(ml|l|ltr|litres?|liters?|g|gm|gms|grams?|kg|kilo|pcs|pieces?|slice|slices)/i);
+  if (!match) return null;
+  const val = parseFloat(match[1]);
+  let unit = match[2].toLowerCase();
+  if (["l", "ltr", "litre", "litres", "liter", "liters"].includes(unit)) unit = "L";
+  else if (["ml"].includes(unit)) unit = "ml";
+  else if (["g", "gm", "gms", "gram", "grams"].includes(unit)) unit = "g";
+  else if (["kg", "kilo"].includes(unit)) unit = "kg";
+  else if (["pcs", "pieces", "piece", "slice", "slices"].includes(unit)) unit = "pcs";
+  return { val, unit };
+}
+
+// Convert standard metric quantities to common base (weight -> g, volume -> ml, count -> pcs)
+export function toBaseMetric(qty, unit) {
+  const u = String(unit || "").toLowerCase().trim();
+  const q = Number(qty) || 0;
+  if (u === "kg" || u === "kilo" || u === "kilogram") return { val: q * 1000, type: "weight" };
+  if (u === "g" || u === "gm" || u === "gram" || u === "grams") return { val: q, type: "weight" };
+  if (u === "l" || u === "ltr" || u === "litre" || u === "litres" || u === "liter" || u === "liters") return { val: q * 1000, type: "volume" };
+  if (u === "ml" || u === "millilitre" || u === "milliliter") return { val: q, type: "volume" };
+  if (u === "pcs" || u === "piece" || u === "pieces") return { val: q, type: "count" };
+  return { val: q, type: "custom" };
+}
+
+// Unit conversion and portion cost calculator
+export function computeIngredientCost(qty, unit, rawMaterial, overridePackQty, overridePackUnit) {
   if (!rawMaterial || !qty || qty <= 0) return 0;
-  const baseCost = Number(rawMaterial.costPerUnit) || 0;
-  const baseUnit = String(rawMaterial.unit || "pcs").toLowerCase().trim();
+  const baseCost = Number(rawMaterial.costPerUnit ?? rawMaterial.purchasePrice ?? rawMaterial.baseCost ?? 0);
+  const baseUnit = String(rawMaterial.unit || rawMaterial.baseUnit || rawMaterial.unitType || "pcs").toLowerCase().trim();
   const targetUnit = String(unit || baseUnit).toLowerCase().trim();
   const quantity = Number(qty) || 0;
 
-  // Liquid: Litre & ml
+  if (baseCost <= 0 || quantity <= 0) return 0;
+
+  // 1. Identical unit (e.g. g with g, ml with ml, pcs with pcs, packet with packet)
+  if (baseUnit === targetUnit) {
+    return quantity * baseCost;
+  }
+
+  // 2. Direct Liquid metric: Litre & ml
   if (baseUnit === "l" && targetUnit === "ml") {
     return (quantity / 1000) * baseCost;
   }
@@ -26,7 +61,7 @@ export function computeIngredientCost(qty, unit, rawMaterial) {
     return quantity * 1000 * baseCost;
   }
 
-  // Weight: Kilogram & gram
+  // 3. Direct Weight metric: Kilogram & gram
   if (baseUnit === "kg" && targetUnit === "g") {
     return (quantity / 1000) * baseCost;
   }
@@ -34,9 +69,72 @@ export function computeIngredientCost(qty, unit, rawMaterial) {
     return quantity * 1000 * baseCost;
   }
 
-  // Same unit (pcs, packet, kg with kg, L with L, etc.)
+  // 4. Packaged Goods (packet, box, bottle, can, tin, pouch, pcs used with sub-units like ml/g)
+  const isPackaged = ["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pouch", "bag", "carton", "jar", "pcs", "piece"].includes(baseUnit);
+  if (isPackaged) {
+    let packCapacity = Number(overridePackQty || rawMaterial.packQuantity || rawMaterial.packSizeVal || 0);
+    let packCapacityUnit = String(overridePackUnit || rawMaterial.packUnit || rawMaterial.packSizeUnit || "").toLowerCase().trim();
+
+    // Auto-detect from name if not specified (e.g., "Milk 500ml" -> 500 ml)
+    if ((!packCapacity || packCapacity <= 0) && rawMaterial.name) {
+      const parsed = parsePackSizeFromName(rawMaterial.name);
+      if (parsed) {
+        packCapacity = parsed.val;
+        packCapacityUnit = parsed.unit.toLowerCase();
+      }
+    }
+
+    // Smart default fallbacks if still unknown:
+    if (!packCapacity || packCapacity <= 0) {
+      if (targetUnit === "ml" || targetUnit === "l") {
+        packCapacity = 500; // Standard 500 ml milk / beverage packet
+        packCapacityUnit = "ml";
+      } else if (targetUnit === "g" || targetUnit === "kg") {
+        packCapacity = 100; // Standard 100 g coffee / spice powder packet
+        packCapacityUnit = "g";
+      } else {
+        packCapacity = 1;
+        packCapacityUnit = baseUnit;
+      }
+    }
+
+    // Convert both recipe qty and pack capacity to base metric
+    const ingMetric = toBaseMetric(quantity, targetUnit);
+    const packMetric = toBaseMetric(packCapacity, packCapacityUnit || targetUnit);
+
+    if (ingMetric.type === packMetric.type && packMetric.val > 0) {
+      const packetFraction = ingMetric.val / packMetric.val;
+      return packetFraction * baseCost;
+    }
+
+    if (packCapacity > 0) {
+      return (quantity / packCapacity) * baseCost;
+    }
+  }
+
+  // Fallback
   return quantity * baseCost;
 }
+
+// Dummy starter item names to filter out and purge
+const DUMMY_STARTER_NAMES = new Set([
+  "paper cups (250ml)",
+  "burger buns (sesame)",
+  "fresh mint & lemon",
+  "refined white sugar",
+  "cheese slices",
+  "veggie patty",
+  "tea leaves (ctc)",
+  "butter (salted)",
+  "cooking oil",
+  "farm fresh eggs",
+  "full cream milk",
+  "chicken patty",
+  "burger mayo & sauce",
+  "sandwich bread loaf",
+  "coffee powder / beans",
+  "burger takeaway box"
+]);
 
 // Starter Raw Materials for Cafes & Restaurants (1-Click Load if empty)
 const STARTER_RAW_MATERIALS = [
@@ -67,6 +165,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
   // Data states
   const [recipes, setRecipes] = useState([]);
   const [rawMaterials, setRawMaterials] = useState([]);
+  const [posInventoryItems, setPosInventoryItems] = useState([]);
   const [loading, setLoading] = useState(true);
 
   // Search & Filter
@@ -80,10 +179,14 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
   const [prepInstructions, setPrepInstructions] = useState("");
   const [savingRecipe, setSavingRecipe] = useState(false);
 
-  // Add Ingredient Row Form
+  // Add Ingredient Row Form & Visual Shelf Filter
   const [selectedRawId, setSelectedRawId] = useState("");
   const [ingredientQty, setIngredientQty] = useState("");
   const [ingredientUnit, setIngredientUnit] = useState("g");
+  const [ingredientPackQty, setIngredientPackQty] = useState("");
+  const [ingredientPackUnit, setIngredientPackUnit] = useState("ml");
+  const [recipeRawSearch, setRecipeRawSearch] = useState("");
+  const [recipeRawCategory, setRecipeRawCategory] = useState("All");
 
   // Raw Material Modal (Add/Edit)
   const [showRawModal, setShowRawModal] = useState(false);
@@ -94,6 +197,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
   const [rawCost, setRawCost] = useState("");
   const [rawStock, setRawStock] = useState("");
   const [rawMinAlert, setRawMinAlert] = useState("");
+  const [rawPackQty, setRawPackQty] = useState("");
+  const [rawPackUnit, setRawPackUnit] = useState("ml");
   const [savingRaw, setSavingRaw] = useState(false);
 
   // Restock Modal
@@ -112,17 +217,59 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
       return;
     }
 
-    // 1. Raw Materials Sync
+    // 1. Raw Materials Sync (filters and purges dummy items)
     const rawRef = collection(db, "users", currentUid, "raw_materials");
     const unsubRaw = onSnapshot(rawRef, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // Clean up any dummy starter materials from database
+      snap.docs.forEach((d) => {
+        const dName = (d.data()?.name || "").toLowerCase().trim();
+        if (DUMMY_STARTER_NAMES.has(dName)) {
+          deleteDoc(doc(db, "users", currentUid, "raw_materials", d.id)).catch(() => {});
+        }
+      });
+
+      const list = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((item) => {
+          const name = (item.name || "").toLowerCase().trim();
+          return !DUMMY_STARTER_NAMES.has(name);
+        });
       list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
       setRawMaterials(list);
     }, (err) => {
       console.warn("Raw materials sync error:", err);
     });
 
-    // 2. Recipes Sync
+    // 2. POS Inventory Sync (Chicken, Chinthu chicken, TATA Salt, bread etc. purchased in POS)
+    const invRef = collection(db, "users", currentUid, "inventory");
+    const unsubInv = onSnapshot(invRef, (snap) => {
+      const list = snap.docs
+        .map((d) => {
+          const data = d.data();
+          const itemName = data.itemName || data.name || "Stock Item";
+          return {
+            id: d.id,
+            name: itemName,
+            category: data.category || "Groceries",
+            unit: data.unitType || "kg",
+            costPerUnit: Number(data.purchasePrice || 0),
+            stockQuantity: Number(data.quantity || 0),
+            minAlertQuantity: 5,
+            image: data.image || data.imageUrl || "",
+            supplierName: data.supplierName || "Walk-in Supplier",
+            fromInventory: true,
+          };
+        })
+        .filter((item) => {
+          const name = (item.name || "").toLowerCase().trim();
+          return !DUMMY_STARTER_NAMES.has(name);
+        });
+      setPosInventoryItems(list);
+    }, (err) => {
+      console.warn("POS inventory sync error:", err);
+    });
+
+    // 3. Recipes Sync
     const recipesRef = collection(db, "users", currentUid, "recipes");
     const unsubRecipes = onSnapshot(recipesRef, (snap) => {
       const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -135,9 +282,41 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
 
     return () => {
       unsubRaw();
+      unsubInv();
       unsubRecipes();
     };
   }, [currentUid]);
+
+  // Combined real raw materials (raw_materials + POS inventory items without dummy data)
+  const combinedRawMaterials = useMemo(() => {
+    const map = new Map();
+    // 1. Add raw materials
+    rawMaterials.forEach((r) => {
+      const k = (r.name || "").toLowerCase().trim();
+      if (k && !DUMMY_STARTER_NAMES.has(k)) {
+        map.set(k, r);
+      }
+    });
+    // 2. Add POS inventory items (Chicken, Chinthu chicken, TATA Salt, bread, etc.)
+    posInventoryItems.forEach((p) => {
+      const k = (p.name || "").toLowerCase().trim();
+      if (k && !DUMMY_STARTER_NAMES.has(k)) {
+        if (!map.has(k)) {
+          map.set(k, p);
+        } else {
+          const existing = map.get(k);
+          map.set(k, {
+            ...existing,
+            stockQuantity: Number(existing.stockQuantity ?? p.stockQuantity ?? 0),
+            image: existing.image || p.image || "",
+          });
+        }
+      }
+    });
+    const list = Array.from(map.values());
+    list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    return list;
+  }, [rawMaterials, posInventoryItems]);
 
   // Map of recipe by productId for quick lookup
   const recipeMap = useMemo(() => {
@@ -172,12 +351,32 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
 
   // Low stock raw materials
   const lowStockMaterials = useMemo(() => {
-    return rawMaterials.filter((m) => {
+    return combinedRawMaterials.filter((m) => {
       const stock = Number(m.stockQuantity) || 0;
       const min = Number(m.minAlertQuantity) || 0;
       return stock <= min;
     });
-  }, [rawMaterials]);
+  }, [combinedRawMaterials]);
+
+  // Raw categories for recipe configurator
+  const rawCategories = useMemo(() => {
+    const set = new Set(["All"]);
+    combinedRawMaterials.forEach((r) => {
+      if (r.category) set.add(r.category);
+    });
+    return Array.from(set);
+  }, [combinedRawMaterials]);
+
+  // Filtered raw materials for recipe ingredient picker shelf
+  const filteredRawForRecipe = useMemo(() => {
+    return combinedRawMaterials.filter((r) => {
+      const matchSearch =
+        (r.name || "").toLowerCase().includes(recipeRawSearch.toLowerCase()) ||
+        (r.category || "").toLowerCase().includes(recipeRawSearch.toLowerCase());
+      const matchCat = recipeRawCategory === "All" || r.category === recipeRawCategory;
+      return matchSearch && matchCat;
+    });
+  }, [combinedRawMaterials, recipeRawSearch, recipeRawCategory]);
 
   // Quick Starter Loader
   const handleLoadStarterMaterials = async () => {
@@ -204,12 +403,99 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
     }
   };
 
+  // Select raw material and auto-detect best unit & pack size
+  const handleSelectRawMaterial = (raw) => {
+    if (!raw) return;
+    setSelectedRawId(raw.id);
+    const rUnit = String(raw.unit || "pcs").toLowerCase().trim();
+    const isLiquid = /milk|juice|water|oil|syrup|sauce|soda|beverage/i.test(raw.name || "");
+
+    let defaultUnit = "g";
+    if (rUnit === "l" || rUnit === "ml" || isLiquid) {
+      defaultUnit = "ml";
+    } else if (rUnit === "kg" || rUnit === "g") {
+      defaultUnit = "g";
+    } else if (rUnit === "pcs") {
+      defaultUnit = "pcs";
+    } else {
+      defaultUnit = isLiquid ? "ml" : "g";
+    }
+    setIngredientUnit(defaultUnit);
+
+    // Determine pack size from raw material, item name, or smart defaults
+    let pQty = raw.packQuantity || raw.packSizeVal || "";
+    let pUnit = raw.packUnit || raw.packSizeUnit || "";
+    if (!pQty && raw.name) {
+      const parsed = parsePackSizeFromName(raw.name);
+      if (parsed) {
+        pQty = parsed.val;
+        pUnit = parsed.unit;
+      }
+    }
+    if (!pQty) {
+      if (defaultUnit === "ml" || isLiquid) {
+        pQty = "500"; // e.g. 500 ml packet for milk
+        pUnit = "ml";
+      } else if (defaultUnit === "g") {
+        pQty = "100"; // e.g. 100 g packet for spices/powder
+        pUnit = "g";
+      }
+    }
+    setIngredientPackQty(pQty ? String(pQty) : "");
+    setIngredientPackUnit(pUnit || defaultUnit);
+  };
+
   // Open Recipe Modal for a Product
   const handleOpenRecipeModal = (product) => {
     setEditingRecipeProduct(product);
     const existing = recipeMap[String(product.id)];
     if (existing) {
-      setCurrentIngredients(existing.ingredients || []);
+      // Auto-sanitize existing ingredients to fix previously inflated unscaled costs
+      const sanitizedIngredients = (existing.ingredients || []).map((ing) => {
+        const raw = combinedRawMaterials.find((r) => r.id === ing.rawMaterialId) ||
+                    rawMaterials.find((r) => r.id === ing.rawMaterialId) ||
+                    combinedRawMaterials.find((r) => (r.name || "").toLowerCase().trim() === (ing.name || "").toLowerCase().trim()) ||
+                    { costPerUnit: ing.baseCost, unit: ing.baseUnit, packQuantity: ing.packQuantity, packUnit: ing.packUnit, name: ing.name };
+
+        let pQty = ing.packQuantity || raw.packQuantity || raw.packSizeVal;
+        let pUnit = ing.packUnit || raw.packUnit || raw.packSizeUnit;
+
+        if (!pQty && raw.name) {
+          const parsed = parsePackSizeFromName(raw.name);
+          if (parsed) {
+            pQty = parsed.val;
+            pUnit = parsed.unit;
+          }
+        }
+        if (!pQty) {
+          if (/milk|juice|water|oil|syrup/i.test(ing.name || "")) {
+            pQty = 500;
+            pUnit = "ml";
+          } else if (/coffee|powder|tea|spice|masala/i.test(ing.name || "")) {
+            pQty = 100;
+            pUnit = "g";
+          }
+        }
+
+        const calculatedCost = computeIngredientCost(
+          ing.quantity,
+          ing.unit,
+          raw,
+          pQty,
+          pUnit
+        );
+
+        return {
+          ...ing,
+          baseCost: Number(raw.costPerUnit || ing.baseCost || 0),
+          baseUnit: raw.unit || ing.baseUnit || "pcs",
+          packQuantity: pQty ? Number(pQty) : ing.packQuantity || null,
+          packUnit: pUnit || ing.packUnit || ing.unit,
+          cost: Number(calculatedCost.toFixed(2)),
+        };
+      });
+
+      setCurrentIngredients(sanitizedIngredients);
       setWastagePercent(existing.wastagePercent !== undefined ? existing.wastagePercent : 3);
       setPrepInstructions(existing.prepInstructions || "");
     } else {
@@ -219,15 +505,16 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
     }
     setSelectedRawId("");
     setIngredientQty("");
+    setIngredientPackQty("");
   };
 
   // Add Ingredient to Current Recipe
-  const handleAddIngredient = () => {
+  const handleAddIngredient = async () => {
     if (!selectedRawId) {
-      alert("Please select a raw material ingredient from the dropdown.");
+      alert("Please select a raw material ingredient from the shelf above.");
       return;
     }
-    const raw = rawMaterials.find((r) => r.id === selectedRawId);
+    const raw = combinedRawMaterials.find((r) => r.id === selectedRawId) || rawMaterials.find((r) => r.id === selectedRawId);
     if (!raw) return;
 
     const qty = parseFloat(ingredientQty);
@@ -236,7 +523,13 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
       return;
     }
 
-    const calculatedCost = computeIngredientCost(qty, ingredientUnit, raw);
+    const calculatedCost = computeIngredientCost(
+      qty,
+      ingredientUnit,
+      raw,
+      ingredientPackQty ? parseFloat(ingredientPackQty) : undefined,
+      ingredientPackUnit
+    );
 
     const newIng = {
       rawMaterialId: raw.id,
@@ -244,14 +537,55 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
       category: raw.category || "General",
       quantity: qty,
       unit: ingredientUnit,
-      baseUnit: raw.unit,
-      baseCost: Number(raw.costPerUnit) || 0,
+      baseUnit: raw.unit || "pcs",
+      baseCost: Number(raw.costPerUnit || raw.purchasePrice || 0),
+      packQuantity: ingredientPackQty ? parseFloat(ingredientPackQty) : null,
+      packUnit: ingredientPackUnit || ingredientUnit,
       cost: Number(calculatedCost.toFixed(2)),
+      image: raw.image || "",
     };
 
     setCurrentIngredients((prev) => [...prev, newIng]);
+
+    // Persist pack size to raw material in Firestore if not already saved
+    if (ingredientPackQty && currentUid && (!raw.packQuantity || raw.packQuantity !== parseFloat(ingredientPackQty))) {
+      try {
+        await updateDoc(doc(db, "users", currentUid, "raw_materials", raw.id), {
+          packQuantity: parseFloat(ingredientPackQty),
+          packUnit: ingredientPackUnit || ingredientUnit,
+          updatedAtMs: Date.now(),
+        });
+      } catch (_) {}
+    }
+
     setSelectedRawId("");
     setIngredientQty("");
+    setIngredientPackQty("");
+  };
+
+  // Inline update of pack capacity in recipe ingredients table
+  const handleUpdateIngredientPack = (index, newPackQty) => {
+    const pQty = parseFloat(newPackQty);
+    setCurrentIngredients((prev) =>
+      prev.map((ing, i) => {
+        if (i !== index) return ing;
+        const raw = combinedRawMaterials.find((r) => r.id === ing.rawMaterialId) ||
+                    rawMaterials.find((r) => r.id === ing.rawMaterialId) || ing;
+        const targetPackQty = pQty > 0 ? pQty : ing.packQuantity;
+        const newCost = computeIngredientCost(
+          ing.quantity,
+          ing.unit,
+          raw,
+          targetPackQty,
+          ing.packUnit || ing.unit
+        );
+        return {
+          ...ing,
+          packQuantity: targetPackQty,
+          cost: Number(newCost.toFixed(2)),
+        };
+      })
+    );
   };
 
   const handleRemoveIngredient = (index) => {
@@ -363,6 +697,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
         costPerUnit: cost,
         stockQuantity: parseFloat(rawStock) || 0,
         minAlertQuantity: parseFloat(rawMinAlert) || 0,
+        packQuantity: rawPackQty ? parseFloat(rawPackQty) : null,
+        packUnit: rawPackQty ? rawPackUnit : null,
         updatedAtMs: Date.now(),
       };
 
@@ -383,6 +719,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
       setRawCost("");
       setRawStock("");
       setRawMinAlert("");
+      setRawPackQty("");
+      setRawPackUnit("ml");
     } catch (err) {
       alert("Error saving ingredient: " + err.message);
     } finally {
@@ -831,7 +1169,16 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                   const recipe = recipeMap[String(product.id)];
                   const hasRecipe = !!(recipe && recipe.ingredients && recipe.ingredients.length > 0);
                   const price = Number(product.price || product.salesPrice || 0);
-                  const makingCost = hasRecipe ? Number(recipe.totalMakingCost || 0) : 0;
+                  let makingCost = hasRecipe ? Number(recipe.totalMakingCost || 0) : 0;
+                  if (hasRecipe && Array.isArray(recipe.ingredients) && recipe.ingredients.length > 0) {
+                    const rawSum = recipe.ingredients.reduce((sum, ing) => {
+                      const raw = combinedRawMaterials.find((r) => r.id === ing.rawMaterialId) ||
+                                  combinedRawMaterials.find((r) => (r.name || "").toLowerCase().trim() === (ing.name || "").toLowerCase().trim()) || ing;
+                      return sum + computeIngredientCost(ing.quantity, ing.unit, raw, ing.packQuantity, ing.packUnit);
+                    }, 0);
+                    const wastage = (rawSum * (Number(recipe.wastagePercent !== undefined ? recipe.wastagePercent : 3))) / 100;
+                    makingCost = Number((rawSum + wastage).toFixed(2));
+                  }
                   const profit = hasRecipe ? Number((price - makingCost).toFixed(2)) : 0;
                   const foodCostPct = hasRecipe && price > 0 ? Number(((makingCost / price) * 100).toFixed(1)) : 0;
                   const profitMarginPct = hasRecipe && price > 0 ? Number(((profit / price) * 100).toFixed(1)) : 0;
@@ -1020,6 +1367,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                   setRawCost("");
                   setRawStock("");
                   setRawMinAlert("");
+                  setRawPackQty("");
+                  setRawPackUnit("ml");
                   setShowRawModal(true);
                 }}
                 style={{
@@ -1042,29 +1391,13 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
             </div>
 
             {/* Raw Materials Table */}
-            {rawMaterials.length === 0 ? (
+            {combinedRawMaterials.length === 0 ? (
               <div style={{ textAlign: "center", padding: "60px 20px", backgroundColor: "#fff", borderRadius: "16px", border: "1px dashed #cbd5e1" }}>
                 <div style={{ fontSize: "40px", marginBottom: "8px" }}>🌾</div>
-                <div style={{ fontSize: "16px", fontWeight: "800", color: "#334155" }}>No Raw Materials Added Yet</div>
+                <div style={{ fontSize: "16px", fontWeight: "800", color: "#334155" }}>No Raw Materials or Stock Added Yet</div>
                 <p style={{ fontSize: "13px", color: "#64748b", margin: "6px 0 16px 0" }}>
-                  Add ingredients like Milk, Coffee Powder, Buns, Oil, etc., or load common cafe ingredients.
+                  Record stock purchases in POS or Purchase Report, or add custom restaurant ingredients.
                 </p>
-                <button
-                  type="button"
-                  onClick={handleLoadStarterMaterials}
-                  style={{
-                    backgroundColor: "#16a34a",
-                    color: "#fff",
-                    border: "none",
-                    padding: "10px 20px",
-                    borderRadius: "10px",
-                    fontWeight: "800",
-                    fontSize: "13px",
-                    cursor: "pointer",
-                  }}
-                >
-                  ✨ Load Starter Cafe Ingredients
-                </button>
               </div>
             ) : (
               <div style={{ backgroundColor: "#ffffff", borderRadius: "16px", border: "1.5px solid #e2e8f0", overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
@@ -1081,7 +1414,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                     </tr>
                   </thead>
                   <tbody>
-                    {rawMaterials.map((item) => {
+                    {combinedRawMaterials.map((item) => {
                       const stock = Number(item.stockQuantity) || 0;
                       const min = Number(item.minAlertQuantity) || 0;
                       const isLow = stock <= min;
@@ -1089,7 +1422,18 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                       return (
                         <tr key={item.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
                           <td style={{ padding: "12px 16px", fontWeight: "800", color: "#0f172a" }}>
-                            {item.name}
+                            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                              <img
+                                src={getGroceryImage(item.name, item.category, item.image)}
+                                alt={item.name}
+                                style={{ width: "36px", height: "36px", borderRadius: "8px", objectFit: "cover" }}
+                                onError={(e) => {
+                                  e.target.onerror = null;
+                                  e.target.src = getGroceryImage("grocery", "general");
+                                }}
+                              />
+                              <span>{item.name}</span>
+                            </div>
                           </td>
                           <td style={{ padding: "12px 16px" }}>
                             <span style={{ fontSize: "11px", backgroundColor: "#f1f5f9", color: "#475569", padding: "2px 8px", borderRadius: "6px", fontWeight: "700" }}>
@@ -1100,7 +1444,12 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                             {item.unit}
                           </td>
                           <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: "800", color: "#0f172a" }}>
-                            ₹{item.costPerUnit} / {item.unit}
+                            <div>₹{item.costPerUnit} / {item.unit}</div>
+                            {item.packQuantity ? (
+                              <div style={{ fontSize: "11px", color: "#ea580c", fontWeight: "700" }}>
+                                1 {item.unit} = {item.packQuantity} {item.packUnit}
+                              </div>
+                            ) : null}
                           </td>
                           <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: "900", color: isLow ? "#ea580c" : "#16a34a" }}>
                             {stock} {item.unit}
@@ -1150,6 +1499,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                                   setRawCost(String(item.costPerUnit || ""));
                                   setRawStock(String(item.stockQuantity || ""));
                                   setRawMinAlert(String(item.minAlertQuantity || ""));
+                                  setRawPackQty(item.packQuantity ? String(item.packQuantity) : "");
+                                  setRawPackUnit(item.packUnit || (item.unit === "L" || item.unit === "ml" ? "ml" : "g"));
                                   setShowRawModal(true);
                                 }}
                                 style={{
@@ -1493,123 +1844,372 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                 )}
               </div>
 
-              {/* Add Ingredient Section */}
+              {/* Visual Purchased Products / Ingredients Shelf ("intha purchasela irrukka products ellam show aakanum image oda") */}
               <div style={{ backgroundColor: "#f8fafc", borderRadius: "14px", border: "1.5px solid #e2e8f0", padding: "16px" }}>
-                <div style={{ fontSize: "13px", fontWeight: "800", color: "#0f172a", marginBottom: "10px" }}>
-                  + Add Ingredient from Raw Materials Store:
-                </div>
-
-                <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: "10px", alignItems: "center" }}>
-                  {/* Ingredient Select */}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
                   <div>
-                    <select
-                      value={selectedRawId}
-                      onChange={(e) => {
-                        setSelectedRawId(e.target.value);
-                        const raw = rawMaterials.find((r) => r.id === e.target.value);
-                        if (raw) {
-                          // Suggest matching unit
-                          if (raw.unit === "L") setIngredientUnit("ml");
-                          else if (raw.unit === "kg") setIngredientUnit("g");
-                          else setIngredientUnit(raw.unit);
-                        }
-                      }}
-                      style={{
-                        width: "100%",
-                        padding: "9px 12px",
-                        borderRadius: "8px",
-                        border: "1.5px solid #cbd5e1",
-                        fontSize: "13px",
-                        fontWeight: "700",
-                        backgroundColor: "#ffffff",
-                      }}
-                    >
-                      <option value="">-- Choose ingredient --</option>
-                      {rawMaterials.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.name} (₹{r.costPerUnit} / {r.unit})
-                        </option>
-                      ))}
-                    </select>
+                    <div style={{ fontSize: "13.5px", fontWeight: "900", color: "#0f172a" }}>
+                      🥘 Purchased Raw Materials & Ingredients Shelf:
+                    </div>
+                    <div style={{ fontSize: "11.5px", color: "#64748b", marginTop: "2px" }}>
+                      Click any purchased ingredient below to select it with its image and set required portion quantity.
+                    </div>
                   </div>
 
-                  {/* Quantity Input */}
-                  <div>
+                  {/* Search box for ingredients */}
+                  <div style={{ width: "200px" }}>
                     <input
-                      type="number"
-                      step="any"
-                      placeholder="Quantity (e.g. 150)"
-                      value={ingredientQty}
-                      onChange={(e) => setIngredientQty(e.target.value)}
+                      type="text"
+                      placeholder="🔍 Search ingredient..."
+                      value={recipeRawSearch}
+                      onChange={(e) => setRecipeRawSearch(e.target.value)}
                       style={{
                         width: "100%",
-                        padding: "9px 12px",
+                        padding: "6px 10px",
                         borderRadius: "8px",
                         border: "1.5px solid #cbd5e1",
-                        fontSize: "13px",
-                        fontWeight: "700",
-                        boxSizing: "border-box",
+                        fontSize: "12px",
+                        boxSizing: "border-box"
                       }}
                     />
                   </div>
-
-                  {/* Unit Select */}
-                  <div>
-                    <select
-                      value={ingredientUnit}
-                      onChange={(e) => setIngredientUnit(e.target.value)}
-                      style={{
-                        width: "100%",
-                        padding: "9px 12px",
-                        borderRadius: "8px",
-                        border: "1.5px solid #cbd5e1",
-                        fontSize: "13px",
-                        fontWeight: "700",
-                        backgroundColor: "#ffffff",
-                      }}
-                    >
-                      <option value="g">Gram (g)</option>
-                      <option value="kg">Kilogram (kg)</option>
-                      <option value="ml">Millilitre (ml)</option>
-                      <option value="L">Litre (L)</option>
-                      <option value="pcs">Pieces (pcs)</option>
-                      <option value="packet">Packet</option>
-                    </select>
-                  </div>
-
-                  {/* Add Button */}
-                  <div>
-                    <button
-                      type="button"
-                      onClick={handleAddIngredient}
-                      style={{
-                        backgroundColor: "#ea580c",
-                        color: "#fff",
-                        border: "none",
-                        padding: "9px 16px",
-                        borderRadius: "8px",
-                        fontWeight: "800",
-                        fontSize: "13px",
-                        cursor: "pointer",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      + Add Item
-                    </button>
-                  </div>
                 </div>
 
-                {/* Instant Cost Preview */}
-                {selectedRawId && ingredientQty && (
-                  <div style={{ marginTop: "8px", fontSize: "12px", color: "#c2410c", fontWeight: "700" }}>
-                    Cost Preview: {ingredientQty} {ingredientUnit} = ₹
-                    {computeIngredientCost(
-                      parseFloat(ingredientQty),
-                      ingredientUnit,
-                      rawMaterials.find((r) => r.id === selectedRawId)
-                    ).toFixed(2)}
+                {/* Category Pills */}
+                {rawCategories.length > 2 && (
+                  <div style={{ display: "flex", gap: "6px", overflowX: "auto", paddingBottom: "6px", marginBottom: "8px" }}>
+                    {rawCategories.map((cat) => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setRecipeRawCategory(cat)}
+                        style={{
+                          padding: "3px 10px",
+                          borderRadius: "12px",
+                          border: "1px solid",
+                          fontSize: "11px",
+                          fontWeight: "700",
+                          cursor: "pointer",
+                          backgroundColor: recipeRawCategory === cat ? "#0f172a" : "#ffffff",
+                          color: recipeRawCategory === cat ? "#ffffff" : "#475569",
+                          borderColor: recipeRawCategory === cat ? "#0f172a" : "#cbd5e1",
+                          whiteSpace: "nowrap"
+                        }}
+                      >
+                        {cat}
+                      </button>
+                    ))}
                   </div>
                 )}
+
+                {/* Visual Shelf Grid */}
+                {filteredRawForRecipe.length === 0 ? (
+                  <div style={{ padding: "20px", textAlign: "center", color: "#94a3b8", fontSize: "12px", backgroundColor: "#fff", borderRadius: "10px", border: "1px dashed #cbd5e1" }}>
+                    No ingredients found for "{recipeRawSearch}". Record purchases in Purchase Report or load starter ingredients!
+                  </div>
+                ) : (
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(135px, 1fr))",
+                    gap: "10px",
+                    maxHeight: "220px",
+                    overflowY: "auto",
+                    padding: "6px",
+                    backgroundColor: "#ffffff",
+                    borderRadius: "10px",
+                    border: "1px solid #e2e8f0"
+                  }}>
+                    {filteredRawForRecipe.map((r) => {
+                      const isSelected = selectedRawId === r.id;
+                      const img = getGroceryImage(r.name, r.category, r.image);
+                      return (
+                        <div
+                          key={r.id}
+                          onClick={() => handleSelectRawMaterial(r)}
+                          style={{
+                            borderRadius: "10px",
+                            border: isSelected ? "2.5px solid #ea580c" : "1.5px solid #e2e8f0",
+                            backgroundColor: isSelected ? "#fff7ed" : "#ffffff",
+                            overflow: "hidden",
+                            cursor: "pointer",
+                            display: "flex",
+                            flexDirection: "column",
+                            transition: "all 0.15s ease",
+                            boxShadow: isSelected ? "0 4px 12px rgba(234, 88, 12, 0.2)" : "0 1px 3px rgba(0,0,0,0.02)",
+                            position: "relative"
+                          }}
+                          title={`Click to select ${r.name}`}
+                        >
+                          <div style={{ position: "relative", height: "72px", width: "100%", backgroundColor: "#f1f5f9" }}>
+                            <img
+                              src={img}
+                              alt={r.name}
+                              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                              onError={(e) => {
+                                e.target.onerror = null;
+                                e.target.src = getGroceryImage("grocery", "general");
+                              }}
+                            />
+                            <span style={{
+                              position: "absolute",
+                              bottom: "4px",
+                              left: "4px",
+                              backgroundColor: "rgba(15, 23, 42, 0.78)",
+                              color: "#ffffff",
+                              padding: "1px 5px",
+                              borderRadius: "4px",
+                              fontSize: "9.5px",
+                              fontWeight: "800"
+                            }}>
+                              Stock: {r.stockQuantity} {r.unit}
+                            </span>
+                            {isSelected && (
+                              <span style={{
+                                position: "absolute",
+                                top: "4px",
+                                right: "4px",
+                                backgroundColor: "#ea580c",
+                                color: "#ffffff",
+                                width: "18px",
+                                height: "18px",
+                                borderRadius: "50%",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontSize: "11px",
+                                fontWeight: "900"
+                              }}>
+                                ✓
+                              </span>
+                            )}
+                          </div>
+
+                          <div style={{ padding: "6px 8px" }}>
+                            <div style={{
+                              fontSize: "12px",
+                              fontWeight: "800",
+                              color: isSelected ? "#c2410c" : "#0f172a",
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis"
+                            }} title={r.name}>
+                              {r.name}
+                            </div>
+                            <div style={{ fontSize: "11px", color: "#64748b", marginTop: "1px", fontWeight: "600" }}>
+                              ₹{r.costPerUnit} / {r.unit}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Selected Ingredient Input Row */}
+                {(() => {
+                  const selectedRaw = selectedRawId
+                    ? (combinedRawMaterials.find((r) => r.id === selectedRawId) || rawMaterials.find((r) => r.id === selectedRawId))
+                    : null;
+                  const isPackaged = selectedRaw && (["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pcs"].includes(String(selectedRaw.unit || "").toLowerCase()) || (selectedRaw.unit !== ingredientUnit && !["kg","g","l","ml"].includes(String(selectedRaw.unit || "").toLowerCase())));
+
+                  return (
+                    <div style={{
+                      marginTop: "12px",
+                      padding: "12px 14px",
+                      backgroundColor: "#ffffff",
+                      borderRadius: "10px",
+                      border: "1px solid #e2e8f0",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "10px"
+                    }}>
+                      <div style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        flexWrap: "wrap",
+                        gap: "10px"
+                      }}>
+                        {/* Selected Indicator */}
+                        <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: "180px" }}>
+                          {selectedRaw ? (
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              <img
+                                src={getGroceryImage(selectedRaw.name, selectedRaw.category, selectedRaw.image)}
+                                alt={selectedRaw.name}
+                                style={{ width: "36px", height: "36px", borderRadius: "8px", objectFit: "cover" }}
+                              />
+                              <div>
+                                <strong style={{ fontSize: "13.5px", color: "#0f172a", display: "block" }}>{selectedRaw.name}</strong>
+                                <span style={{ fontSize: "11px", color: "#64748b" }}>
+                                  Base Rate: <strong>₹{selectedRaw.costPerUnit}</strong> / {selectedRaw.unit}
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <span style={{ fontSize: "12px", color: "#94a3b8", fontWeight: "600" }}>
+                              👆 Click an ingredient card above to select
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Quantity Input + Unit Select + Pack Size + Add Button */}
+                        <div style={{ display: "flex", alignItems: "flex-end", gap: "8px", flexWrap: "wrap" }}>
+                          <div>
+                            <label style={{ display: "block", fontSize: "11px", fontWeight: "700", color: "#475569", marginBottom: "3px" }}>
+                              Recipe Qty:
+                            </label>
+                            <input
+                              type="number"
+                              step="any"
+                              placeholder="e.g. 8"
+                              value={ingredientQty}
+                              onChange={(e) => setIngredientQty(e.target.value)}
+                              style={{
+                                width: "105px",
+                                padding: "8px 10px",
+                                borderRadius: "8px",
+                                border: "1.5px solid #cbd5e1",
+                                fontSize: "13px",
+                                fontWeight: "700"
+                              }}
+                            />
+                          </div>
+
+                          <div>
+                            <label style={{ display: "block", fontSize: "11px", fontWeight: "700", color: "#475569", marginBottom: "3px" }}>
+                              Unit:
+                            </label>
+                            <select
+                              value={ingredientUnit}
+                              onChange={(e) => setIngredientUnit(e.target.value)}
+                              style={{
+                                padding: "8px 10px",
+                                borderRadius: "8px",
+                                border: "1.5px solid #cbd5e1",
+                                fontSize: "12.5px",
+                                fontWeight: "700",
+                                backgroundColor: "#fff"
+                              }}
+                            >
+                              <option value="ml">Millilitre (ml)</option>
+                              <option value="L">Litre (L)</option>
+                              <option value="g">Gram (g)</option>
+                              <option value="kg">Kilogram (kg)</option>
+                              <option value="pcs">Pieces (pcs)</option>
+                              <option value="packet">Packet</option>
+                            </select>
+                          </div>
+
+                          {/* Pack Size / Capacity specification when ingredient is packaged */}
+                          {isPackaged && (
+                            <div style={{
+                              backgroundColor: "#fff7ed",
+                              padding: "4px 8px",
+                              borderRadius: "8px",
+                              border: "1px solid #fed7aa",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "2px"
+                            }}>
+                              <label style={{ fontSize: "10.5px", fontWeight: "800", color: "#c2410c" }}>
+                                📦 1 {selectedRaw.unit || "packet"} =
+                              </label>
+                              <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  placeholder="500"
+                                  value={ingredientPackQty}
+                                  onChange={(e) => setIngredientPackQty(e.target.value)}
+                                  style={{
+                                    width: "65px",
+                                    padding: "6px 6px",
+                                    borderRadius: "6px",
+                                    border: "1px solid #fdba74",
+                                    fontSize: "12px",
+                                    fontWeight: "800",
+                                    textAlign: "center"
+                                  }}
+                                  title="Enter how many ml or grams are inside 1 packet"
+                                />
+                                <select
+                                  value={ingredientPackUnit}
+                                  onChange={(e) => setIngredientPackUnit(e.target.value)}
+                                  style={{
+                                    padding: "6px 6px",
+                                    borderRadius: "6px",
+                                    border: "1px solid #fdba74",
+                                    fontSize: "11.5px",
+                                    fontWeight: "700",
+                                    backgroundColor: "#fff"
+                                  }}
+                                >
+                                  <option value="ml">ml</option>
+                                  <option value="L">L</option>
+                                  <option value="g">g</option>
+                                  <option value="kg">kg</option>
+                                  <option value="pcs">pcs</option>
+                                </select>
+                              </div>
+                            </div>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={handleAddIngredient}
+                            style={{
+                              backgroundColor: "#ea580c",
+                              color: "#fff",
+                              border: "none",
+                              padding: "9px 16px",
+                              borderRadius: "8px",
+                              fontWeight: "800",
+                              fontSize: "13px",
+                              cursor: "pointer",
+                              boxShadow: "0 2px 6px rgba(234, 88, 12, 0.25)",
+                              height: "36px"
+                            }}
+                          >
+                            + Add to Recipe
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Instant Cost Preview with Exact Portion Price */}
+                      {selectedRaw && ingredientQty && (
+                        <div style={{
+                          padding: "8px 12px",
+                          backgroundColor: "#f0fdf4",
+                          borderRadius: "8px",
+                          border: "1px solid #bbf7d0",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: "8px"
+                        }}>
+                          <div style={{ fontSize: "12px", color: "#166534" }}>
+                            Rate: <strong>₹{selectedRaw.costPerUnit} / {selectedRaw.unit}</strong>
+                            {ingredientPackQty && (
+                              <span> • (₹{(selectedRaw.costPerUnit / parseFloat(ingredientPackQty)).toFixed(4)} per {ingredientPackUnit})</span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: "13.5px", color: "#15803d", fontWeight: "900" }}>
+                            Portion Cost for {ingredientQty} {ingredientUnit} = ₹
+                            {computeIngredientCost(
+                              parseFloat(ingredientQty),
+                              ingredientUnit,
+                              selectedRaw,
+                              ingredientPackQty ? parseFloat(ingredientPackQty) : undefined,
+                              ingredientPackUnit
+                            ).toFixed(2)}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Ingredients Table */}
@@ -1644,15 +2244,53 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                       <tbody>
                         {currentIngredients.map((ing, idx) => (
                           <tr key={idx} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={{ padding: "8px 12px", fontWeight: "700", color: "#0f172a" }}>{ing.name}</td>
+                            <td style={{ padding: "8px 12px", fontWeight: "700", color: "#0f172a" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <img
+                                  src={getGroceryImage(ing.name, ing.category, ing.image)}
+                                  alt={ing.name}
+                                  style={{ width: "28px", height: "28px", borderRadius: "6px", objectFit: "cover" }}
+                                  onError={(e) => {
+                                    e.target.onerror = null;
+                                    e.target.src = getGroceryImage("grocery", "general");
+                                  }}
+                                />
+                                <div>
+                                  <div style={{ fontWeight: "800", color: "#0f172a" }}>{ing.name}</div>
+                                  {ing.category && <div style={{ fontSize: "10px", color: "#64748b" }}>{ing.category}</div>}
+                                </div>
+                              </div>
+                            </td>
                             <td style={{ padding: "8px 12px", fontWeight: "800", color: "#0284c7" }}>
                               {ing.quantity} {ing.unit}
                             </td>
                             <td style={{ padding: "8px 12px", color: "#64748b" }}>
-                              ₹{ing.baseCost} / {ing.baseUnit}
+                              <div>₹{ing.baseCost} / {ing.baseUnit}</div>
+                              {(ing.packQuantity || ["packet", "pkt", "pack", "box", "bottle", "pcs"].includes(String(ing.baseUnit).toLowerCase())) && (
+                                <div style={{ fontSize: "11px", color: "#ea580c", fontWeight: "700", display: "flex", alignItems: "center", gap: "4px", marginTop: "3px" }}>
+                                  <span>1 {ing.baseUnit} =</span>
+                                  <input
+                                    type="number"
+                                    value={ing.packQuantity || ""}
+                                    placeholder="500"
+                                    onChange={(e) => handleUpdateIngredientPack(idx, e.target.value)}
+                                    style={{
+                                      width: "55px",
+                                      padding: "1px 4px",
+                                      fontSize: "11px",
+                                      fontWeight: "800",
+                                      borderRadius: "5px",
+                                      border: "1px solid #fdba74",
+                                      textAlign: "center"
+                                    }}
+                                    title="Edit pack size to adjust portion cost"
+                                  />
+                                  <span>{ing.packUnit || ing.unit}</span>
+                                </div>
+                              )}
                             </td>
-                            <td style={{ padding: "8px 12px", textAlign: "right", fontWeight: "900", color: "#ea580c" }}>
-                              ₹{ing.cost}
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontWeight: "900", color: "#ea580c", fontSize: "14px" }}>
+                              ₹{Number(ing.cost).toFixed(2)}
                             </td>
                             <td style={{ padding: "8px 12px", textAlign: "center" }}>
                               <button
@@ -1874,6 +2512,38 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                   style={{ width: "100%", padding: "9px 12px", borderRadius: "8px", border: "1.5px solid #cbd5e1", fontSize: "13px", boxSizing: "border-box" }}
                 />
               </div>
+
+              {["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pcs"].includes(String(rawUnit).toLowerCase()) && (
+                <div style={{ backgroundColor: "#fff7ed", padding: "10px 12px", borderRadius: "10px", border: "1px solid #fed7aa" }}>
+                  <label style={{ display: "block", fontSize: "12px", fontWeight: "800", color: "#c2410c", marginBottom: "4px" }}>
+                    📦 Pack Net Capacity / Volume (Optional)
+                  </label>
+                  <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "8px" }}>
+                    <input
+                      type="number"
+                      step="any"
+                      placeholder="e.g. 500 (for 500 ml packet)"
+                      value={rawPackQty}
+                      onChange={(e) => setRawPackQty(e.target.value)}
+                      style={{ width: "100%", padding: "8px 10px", borderRadius: "8px", border: "1px solid #fdba74", fontSize: "13px", boxSizing: "border-box" }}
+                    />
+                    <select
+                      value={rawPackUnit}
+                      onChange={(e) => setRawPackUnit(e.target.value)}
+                      style={{ width: "100%", padding: "8px 10px", borderRadius: "8px", border: "1px solid #fdba74", fontSize: "12.5px", fontWeight: "700", backgroundColor: "#fff" }}
+                    >
+                      <option value="ml">ml</option>
+                      <option value="L">L</option>
+                      <option value="g">g</option>
+                      <option value="kg">kg</option>
+                      <option value="pcs">pcs</option>
+                    </select>
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#9a3412", marginTop: "4px" }}>
+                    E.g. 1 packet of milk contains 500 ml. This lets recipes calculate exact portion costs for 8 ml, 50 ml, etc.
+                  </div>
+                </div>
+              )}
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
                 <div>

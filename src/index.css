@@ -12,3 +12,9 @@ body, html, #root {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   overflow-x: hidden;
 }
+
+@media print {
+  .no-print, header, nav, [role="navigation"] {
+    display: none !important;
+  }
+}

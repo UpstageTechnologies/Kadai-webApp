@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { getOrderClassification } from "../utils/restaurantOrderService";
+import { deductRecipeStock } from "../utils/recipeStockService";
 
 const getElapsedTime = (createdAtMs, timestamp) => {
   let date;
@@ -101,10 +102,21 @@ export default function KitchenDisplay() {
     if (!masterUid || !orderId) return;
 
     try {
+      const targetOrder = orders.find((o) => o.id === orderId);
+      const shouldDeduct = (newStatus === "completed" || newStatus === "served") && targetOrder && !targetOrder.ingredientsDeducted;
+      if (shouldDeduct && Array.isArray(targetOrder.items)) {
+        try {
+          deductRecipeStock(masterUid, targetOrder.items);
+        } catch (_) {}
+      }
+
       const updateData = {
         status: newStatus,
         updatedAt: serverTimestamp(),
       };
+      if (shouldDeduct) {
+        updateData.ingredientsDeducted = true;
+      }
       if (newStatus === "ready") {
         updateData.readyAt = serverTimestamp();
         updateData.readyAtMs = Date.now();
