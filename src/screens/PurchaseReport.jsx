@@ -1157,35 +1157,6 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
             color: #334155;
             margin-top: 4px;
           }
-          .summary-strip {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 8px;
-            margin-bottom: 12px;
-          }
-          .stat-box {
-            border: 1px solid #cbd5e1;
-            border-radius: 6px;
-            padding: 8px 10px;
-            background: #f8fafc;
-          }
-          .stat-label {
-            font-size: 9px;
-            font-weight: 800;
-            color: #64748b;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-          }
-          .stat-val {
-            font-size: 15px;
-            font-weight: 900;
-            color: #0f172a;
-            margin-top: 1px;
-          }
-          .stat-sub {
-            font-size: 8.5px;
-            color: #94a3b8;
-          }
           table {
             width: 100%;
             border-collapse: collapse;
@@ -1283,29 +1254,6 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
             <div class="report-sub-title">${reportSubText}</div>
             <div class="meta-pill">📅 Period: ${periodLabel}</div>
             <div style="font-size: 9px; color: #64748b; margin-top: 3px;">Printed: ${printDate} at ${printTime}</div>
-          </div>
-        </div>
-
-        <div class="summary-strip">
-          <div class="stat-box">
-            <div class="stat-label">Total Expenditure</div>
-            <div class="stat-val" style="color: #15803d;">₹${summary.totalSpend.toLocaleString("en-IN")}</div>
-            <div class="stat-sub">For filtered records</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Total Records</div>
-            <div class="stat-val">${filteredRecords.length} Invoices</div>
-            <div class="stat-sub">${summary.itemCount} distinct items</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Quantity Purchased</div>
-            <div class="stat-val">${summary.totalQty} Units</div>
-            <div class="stat-sub">Kilograms / Litres / Pcs</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Active Suppliers</div>
-            <div class="stat-val">${summary.supplierCount}</div>
-            <div class="stat-sub">Vendors recorded</div>
           </div>
         </div>
 
