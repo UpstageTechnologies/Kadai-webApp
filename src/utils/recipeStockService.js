@@ -1,37 +1,226 @@
-import { collection, getDocs, doc, updateDoc } from "firebase/firestore";
+import { collection, getDocs, doc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { db } from "./firebase";
+
+/**
+ * Formats a raw material stock quantity with human-friendly packet + sub-unit breakdown.
+ * Example: 9.8 packet with 500 ml pack -> "9 pkts + 400 ml" (total: 4,900 ml)
+ * Example: 4.5 packet with 100 g pack -> "4 pkts + 50 g" (total: 450 g)
+ */
+export function formatRawStockDisplay(stockQty, unit, packQty, packUnit) {
+  const qty = Number(stockQty) || 0;
+  const u = String(unit || "pcs").toLowerCase().trim();
+  const pQty = Number(packQty) || 0;
+  const pUnit = String(packUnit || "").toLowerCase().trim();
+
+  // If this item is sold in packets/boxes/cans and has a known sub-unit capacity (e.g. 500 ml, 100 g)
+  if (["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pcs"].includes(u) && pQty > 0 && pUnit) {
+    const fullPacks = Math.floor(qty);
+    const fraction = Number((qty - fullPacks).toFixed(4));
+    const fractionSubUnits = Math.round(fraction * pQty);
+    const totalSubUnits = Math.round(qty * pQty);
+
+    if (fullPacks === 0) {
+      return {
+        formatted: `${fractionSubUnits} ${pUnit}`,
+        detail: `${fractionSubUnits} ${pUnit} remaining`,
+        totalSubUnits: totalSubUnits,
+        subUnit: pUnit,
+        fullPacks: 0,
+        fractionSubUnits
+      };
+    }
+
+    if (fractionSubUnits === 0) {
+      return {
+        formatted: `${fullPacks} ${u} (${totalSubUnits.toLocaleString("en-IN")} ${pUnit})`,
+        detail: `${totalSubUnits.toLocaleString("en-IN")} ${pUnit} total (${fullPacks} sealed ${u})`,
+        totalSubUnits: totalSubUnits,
+        subUnit: pUnit,
+        fullPacks,
+        fractionSubUnits: 0
+      };
+    }
+
+    return {
+      formatted: `${fullPacks} ${u} + ${fractionSubUnits} ${pUnit}`,
+      detail: `${totalSubUnits.toLocaleString("en-IN")} ${pUnit} remaining (${fullPacks} sealed + ${fractionSubUnits} ${pUnit} open)`,
+      totalSubUnits: totalSubUnits,
+      subUnit: pUnit,
+      fullPacks,
+      fractionSubUnits
+    };
+  }
+
+  // Weight in kg / g
+  if (u === "kg") {
+    const kilos = Math.floor(qty);
+    const grams = Math.round((qty - kilos) * 1000);
+    return {
+      formatted: grams > 0 && kilos > 0 ? `${kilos} kg ${grams} g` : `${qty} kg`,
+      detail: `${Math.round(qty * 1000).toLocaleString("en-IN")} g total`,
+      totalSubUnits: Math.round(qty * 1000),
+      subUnit: "g",
+      fullPacks: kilos,
+      fractionSubUnits: grams
+    };
+  }
+
+  // Volume in L / ml
+  if (u === "l") {
+    const litres = Math.floor(qty);
+    const mls = Math.round((qty - litres) * 1000);
+    return {
+      formatted: mls > 0 && litres > 0 ? `${litres} L ${mls} ml` : `${qty} L`,
+      detail: `${Math.round(qty * 1000).toLocaleString("en-IN")} ml total`,
+      totalSubUnits: Math.round(qty * 1000),
+      subUnit: "ml",
+      fullPacks: litres,
+      fractionSubUnits: mls
+    };
+  }
+
+  return {
+    formatted: `${qty} ${u}`,
+    detail: `${qty} ${u}`,
+    totalSubUnits: qty,
+    subUnit: u,
+    fullPacks: qty,
+    fractionSubUnits: 0
+  };
+}
+
+/**
+ * Calculates Recipe Portion Yield, Output & Shortage Variance.
+ *
+ * Example:
+ * 1 packet of milk = 500 ml
+ * 1 coffee portion = 10 ml
+ * Expected Yield = 50 cups per packet
+ * If 1 packet was consumed but only 48 cups were served:
+ * Expected Output = 50 cups (500 ml)
+ * Actual Output = 48 cups (480 ml)
+ * Shortage = 2 cups (-20 ml)
+ * Shortage % = 4.0% Loss
+ */
+export function calculatePortionYieldAndShortage({
+  packCapacity = 500,
+  portionQty = 10,
+  packsUsed = 1,
+  actualPortionsServed = 48,
+  portionUnit = "ml",
+  packCost = 50
+}) {
+  const cap = Number(packCapacity) || 500;
+  const pQty = Number(portionQty) || 1;
+  const pUsed = Math.max(1, Number(packsUsed) || 1);
+  const actServed = Math.max(0, Number(actualPortionsServed) || 0);
+  const cost = Number(packCost) || 0;
+
+  // Expected yield per single pack
+  const yieldPerPack = pQty > 0 ? Number((cap / pQty).toFixed(1)) : 0;
+  
+  // Total expected portions from the packs used
+  const totalExpectedPortions = Math.round(yieldPerPack * pUsed);
+  const totalVolumeOrWeight = cap * pUsed;
+
+  // Actual consumption based on served portions
+  const actualVolumeUsed = actServed * pQty;
+
+  // Shortage (if fewer portions obtained than expected)
+  const shortagePortions = Math.max(0, totalExpectedPortions - actServed);
+  const shortageVolume = shortagePortions * pQty;
+  const shortagePercent = totalExpectedPortions > 0 ? Number(((shortagePortions / totalExpectedPortions) * 100).toFixed(1)) : 0;
+  
+  // Cost of the lost/shortage amount
+  const costPerPortion = totalExpectedPortions > 0 ? Number((cost / yieldPerPack).toFixed(2)) : 0;
+  const shortageLossAmount = Number((shortagePortions * costPerPortion).toFixed(2));
+
+  return {
+    yieldPerPack,
+    totalExpectedPortions,
+    totalVolumeOrWeight,
+    actualPortionsServed: actServed,
+    actualVolumeUsed,
+    shortagePortions,
+    shortageVolume,
+    shortagePercent,
+    costPerPortion,
+    shortageLossAmount,
+    portionUnit,
+    isShortage: shortagePortions > 0
+  };
+}
 
 /**
  * Deducts raw material ingredients from Firestore when a food order is completed.
  * Matches ordered items against configured recipes in users/{uid}/recipes.
- * Converts units (kg <-> g, L <-> ml, pcs) accurately and updates users/{uid}/raw_materials in real-time.
+ * Converts units (kg <-> g, L <-> ml, packet <-> ml/g) accurately and updates users/{uid}/raw_materials in real-time.
  *
  * @param {string} uid - Store owner UID
  * @param {Array} orderedItems - Array of items in the completed bill/order
  */
-export async function deductRecipeStock(uid, orderedItems) {
+export async function deductRecipeStock(uid, orderedItems, options = {}) {
   if (!uid || !Array.isArray(orderedItems) || orderedItems.length === 0) {
     return { success: false, reason: "No items or user" };
   }
+
+  const targetBranchId = typeof options === "string" ? options : (options?.branchId || null);
+  const isTargetPrimary = !targetBranchId || targetBranchId === "main_branch" || targetBranchId === "main_default" || targetBranchId === "BR-01";
+
+  const itemMatchesBranch = (data) => {
+    if (!targetBranchId) return true;
+    if (!data.branchId && !data.branchName) return isTargetPrimary;
+    return (
+      data.branchId === targetBranchId ||
+      (isTargetPrimary && (data.branchId === "main_branch" || data.branchId === "main_default" || data.branchId === "BR-01"))
+    );
+  };
 
   try {
     // 1. Fetch user's recipes
     const recipesRef = collection(db, "users", uid, "recipes");
     const recipesSnap = await getDocs(recipesRef);
 
-    // 2. Fetch user's raw materials (grocery stock)
+    // 2. Fetch user's shop inventory & raw materials
+    const invRef = collection(db, "users", uid, "inventory");
+    const invSnap = await getDocs(invRef);
+
     const rawRef = collection(db, "users", uid, "raw_materials");
     const rawSnap = await getDocs(rawRef);
 
-    if (rawSnap.empty) {
-      console.log("[recipeStockService] No raw materials found for UID:", uid);
-      return { success: false, reason: "No raw materials inventory" };
+    if (invSnap.empty && rawSnap.empty) {
+      console.log("[recipeStockService] No inventory or raw materials found for UID:", uid);
+      return { success: false, reason: "No inventory stock items" };
     }
 
     const rawMap = {};
-    rawSnap.forEach((d) => {
-      rawMap[d.id] = { id: d.id, ...d.data() };
-    });
+    if (!rawSnap.empty) {
+      rawSnap.forEach((d) => {
+        const data = d.data();
+        if (itemMatchesBranch(data)) {
+          rawMap[d.id] = { id: d.id, ...data };
+        }
+      });
+    }
+    if (!invSnap.empty) {
+      invSnap.forEach((d) => {
+        const data = d.data();
+        if (itemMatchesBranch(data)) {
+          const existing = rawMap[d.id];
+          rawMap[d.id] = {
+            id: d.id,
+            name: data.itemName || data.name || (existing ? existing.name : ""),
+            stockQuantity: data.quantity != null ? data.quantity : (existing ? existing.stockQuantity : 0),
+            unit: data.unitType || data.unit || (existing ? existing.unit : "pcs"),
+            costPerUnit: data.purchasePrice != null ? data.purchasePrice : (existing ? existing.costPerUnit : 0),
+            packQuantity: data.packQuantity || (existing ? existing.packQuantity : null),
+            packUnit: data.packUnit || (existing ? existing.packUnit : null),
+            ...data,
+            isInventory: true
+          };
+        }
+      });
+    }
 
     const recipeMap = {};
     if (!recipesSnap.empty) {
@@ -41,36 +230,56 @@ export async function deductRecipeStock(uid, orderedItems) {
         recipeMap[rId] = data;
         if (data.productId) recipeMap[String(data.productId)] = data;
         if (data.productName) {
-          recipeMap[data.productName.toLowerCase().trim()] = data;
+          const cleanP = data.productName.toLowerCase().trim();
+          recipeMap[cleanP] = data;
+          recipeMap[cleanP.replace(/[^\w\s]/g, "").trim()] = data;
+        }
+        if (data.name) {
+          const cleanN = data.name.toLowerCase().trim();
+          recipeMap[cleanN] = data;
+          recipeMap[cleanN.replace(/[^\w\s]/g, "").trim()] = data;
         }
       });
     }
 
-    // Map of raw material id -> total quantity to deduct (in base units of the raw material)
+    // Map of raw material id -> { deductBaseUnits, deductSubUnits, subUnit, dishNames }
     const deductions = {};
     const deductedItemsLog = [];
 
     for (const item of orderedItems) {
-      const pId = String(item.id || item.foodId || "");
+      const pId = String(item.id || item.foodId || item.barcode || "");
       const pName = String(item.name || item.itemName || "").toLowerCase().trim();
+      const pNameClean = pName.replace(/[^\w\s]/g, "").trim();
       const orderQty = Math.max(1, Number(item.qty || item.quantity || 1));
 
-      // Check if item has a recipe
-      const recipe = recipeMap[pId] || recipeMap[pName];
+      // Bulletproof matching: direct id -> direct name -> cleaned name -> substring match
+      let recipe = recipeMap[pId] || recipeMap[pName] || recipeMap[pNameClean];
+      if (!recipe) {
+        recipe = Object.values(recipeMap).find((r) => {
+          const rName = (r.productName || r.name || "").toLowerCase().trim();
+          return rName === pName || (pName && rName.includes(pName)) || (rName && pName.includes(rName));
+        });
+      }
+
       if (recipe && Array.isArray(recipe.ingredients) && recipe.ingredients.length > 0) {
         for (const ing of recipe.ingredients) {
           let rawId = ing.rawMaterialId;
           let raw = rawMap[rawId];
 
-          // If rawMaterialId not matched, fallback lookup by ingredient name
+          // Fallback lookup across raw materials by name
           if (!raw && ing.name) {
-            const found = Object.values(rawMap).find(
-              (r) => (r.name || "").toLowerCase().trim() === (ing.name || "").toLowerCase().trim()
-            );
-            if (found) {
-              rawId = found.id;
-              raw = found;
-            }
+            const ingClean = (ing.name || "").toLowerCase().trim();
+            const ingSimple = ingClean.replace(/[^\w\s]/g, "");
+            raw = Object.values(rawMap).find((r) => {
+              const rName = (r.name || "").toLowerCase().trim();
+              const rClean = rName.replace(/[^\w\s]/g, "");
+              return (
+                rName === ingClean ||
+                rClean === ingSimple ||
+                (ingClean.length > 3 && (rName.includes(ingClean) || ingClean.includes(rName)))
+              );
+            });
+            if (raw) rawId = raw.id;
           }
 
           if (!raw) continue;
@@ -81,8 +290,15 @@ export async function deductRecipeStock(uid, orderedItems) {
           const ingUnit = String(ing.unit || raw.unit || "").toLowerCase().trim();
           const rawUnit = String(raw.unit || "pcs").toLowerCase().trim();
 
+          // Sub-unit amount used per single portion
+          const singleSubUnitQty = ingQty;
+          const totalSubUnitAmount = Number((singleSubUnitQty * orderQty).toFixed(2));
+
           // Unit conversion to raw material base unit
           let convertedQty = ingQty;
+          let packCapacity = Number(ing.packQuantity || raw.packQuantity || raw.packSizeVal || 0);
+          let packCapacityUnit = String(ing.packUnit || raw.packUnit || raw.packSizeUnit || "").toLowerCase().trim();
+
           if (rawUnit === "kg" && ingUnit === "g") {
             convertedQty = ingQty / 1000;
           } else if (rawUnit === "g" && ingUnit === "kg") {
@@ -92,8 +308,6 @@ export async function deductRecipeStock(uid, orderedItems) {
           } else if (rawUnit === "ml" && ingUnit === "l") {
             convertedQty = ingQty * 1000;
           } else if (["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pcs"].includes(rawUnit)) {
-            let packCapacity = Number(ing.packQuantity || raw.packQuantity || raw.packSizeVal || 0);
-            let packCapacityUnit = String(ing.packUnit || raw.packUnit || raw.packSizeUnit || "").toLowerCase().trim();
             if (!packCapacity || packCapacity <= 0) {
               if (ingUnit === "ml" || ingUnit === "l") {
                 packCapacity = 500;
@@ -110,12 +324,28 @@ export async function deductRecipeStock(uid, orderedItems) {
             }
           }
 
-          const totalDeduct = Number((convertedQty * orderQty).toFixed(4));
-          deductions[rawId] = (deductions[rawId] || 0) + totalDeduct;
+          const totalDeductBase = Number((convertedQty * orderQty).toFixed(4));
+
+          if (!deductions[rawId]) {
+            deductions[rawId] = {
+              deductBaseUnits: 0,
+              deductSubUnits: 0,
+              subUnit: ingUnit,
+              packCapacity: packCapacity || null,
+              packUnit: packCapacityUnit || ingUnit,
+              dishNames: []
+            };
+          }
+
+          deductions[rawId].deductBaseUnits += totalDeductBase;
+          deductions[rawId].deductSubUnits += totalSubUnitAmount;
+          deductions[rawId].dishNames.push(`${item.name || item.itemName} (${orderQty})`);
+
           deductedItemsLog.push({
             dishName: item.name || item.itemName,
             ingredientName: raw.name,
-            deducted: totalDeduct,
+            deductedBase: totalDeductBase,
+            deductedSubUnit: `${totalSubUnitAmount} ${ingUnit}`,
             unit: raw.unit || "unit",
           });
         }
@@ -124,22 +354,31 @@ export async function deductRecipeStock(uid, orderedItems) {
 
     // Apply deductions to raw_materials in Firestore
     const updates = [];
-    for (const [rawId, amount] of Object.entries(deductions)) {
+    for (const [rawId, info] of Object.entries(deductions)) {
       const raw = rawMap[rawId];
       if (!raw) continue;
 
       const currentStock = Number(raw.stockQuantity || 0);
-      const newStock = Math.max(0, Number((currentStock - amount).toFixed(3)));
+      const newStock = Math.max(0, Number((currentStock - info.deductBaseUnits).toFixed(4)));
+
+      const prevTotalUsedSub = Number(raw.totalUsedSubUnits || 0);
+      const newTotalUsedSub = Number((prevTotalUsedSub + info.deductSubUnits).toFixed(2));
 
       const p = updateDoc(doc(db, "users", uid, "raw_materials", rawId), {
         stockQuantity: newStock,
-        lastDeductedAmount: amount,
+        totalUsedSubUnits: newTotalUsedSub,
+        lastDeductedAmount: info.deductBaseUnits,
+        lastDeductedSubUnits: `${info.deductSubUnits} ${info.subUnit}`,
+        lastDeductedDish: info.dishNames.join(", "),
+        packQuantity: info.packCapacity || raw.packQuantity || null,
+        packUnit: info.packUnit || raw.packUnit || null,
         lastDeductedAt: Date.now(),
         updatedAtMs: Date.now(),
-      });
+      }).catch(() => {});
       updates.push(p);
+
       console.log(
-        `[recipeStockService] Deducted ${amount} ${raw.unit} from "${raw.name}". Stock: ${currentStock} -> ${newStock}`
+        `[recipeStockService] Deducted ${info.deductSubUnits} ${info.subUnit} (${info.deductBaseUnits} ${raw.unit}) from "${raw.name}". Stock: ${currentStock} -> ${newStock}`
       );
     }
 
@@ -150,14 +389,15 @@ export async function deductRecipeStock(uid, orderedItems) {
       if (!invSnap.empty) {
         invSnap.forEach((invDoc) => {
           const invData = invDoc.data();
+          if (!itemMatchesBranch(invData)) return; // Only deduct matching branch's inventory!
           const invName = (invData.itemName || invData.name || "").toLowerCase().trim();
-          for (const [rawId, amount] of Object.entries(deductions)) {
+          for (const [rawId, info] of Object.entries(deductions)) {
             const raw = rawMap[rawId];
             if (!raw) continue;
             const rName = (raw.name || "").toLowerCase().trim();
             if (invName === rName || invDoc.id === rawId) {
               const curQty = Number(invData.quantity || 0);
-              const newQty = Math.max(0, Number((curQty - amount).toFixed(3)));
+              const newQty = Math.max(0, Number((curQty - info.deductBaseUnits).toFixed(4)));
               updates.push(
                 updateDoc(doc(db, "users", uid, "inventory", invDoc.id), {
                   quantity: newQty,
@@ -165,7 +405,7 @@ export async function deductRecipeStock(uid, orderedItems) {
                 })
               );
               console.log(
-                `[recipeStockService] Deducted ${amount} from inventory "${invName}". Quantity: ${curQty} -> ${newQty}`
+                `[recipeStockService] Deducted ${info.deductBaseUnits} from inventory "${invName}". Quantity: ${curQty} -> ${newQty}`
               );
             }
           }

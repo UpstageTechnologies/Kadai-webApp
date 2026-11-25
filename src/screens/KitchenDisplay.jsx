@@ -103,11 +103,13 @@ export default function KitchenDisplay() {
 
     try {
       const targetOrder = orders.find((o) => o.id === orderId);
-      const shouldDeduct = (newStatus === "completed" || newStatus === "served") && targetOrder && !targetOrder.ingredientsDeducted;
+      const shouldDeduct = (newStatus === "ready" || newStatus === "completed" || newStatus === "served") && targetOrder && !targetOrder.ingredientsDeducted;
       if (shouldDeduct && Array.isArray(targetOrder.items)) {
         try {
-          deductRecipeStock(masterUid, targetOrder.items);
-        } catch (_) {}
+          await deductRecipeStock(masterUid, targetOrder.items, { branchId: targetOrder.branchId || targetOrder.branch });
+        } catch (err) {
+          console.warn("[KitchenDisplay] deductRecipeStock notice:", err);
+        }
       }
 
       const updateData = {

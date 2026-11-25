@@ -1116,10 +1116,12 @@ export default function Dashboard({ initialTab = "sales" }) {
     if (!currentUid || !orderId) return;
     try {
       const targetKot = kitchenOrders.find((k) => k.id === orderId);
-      if (targetKot && Array.isArray(targetKot.items) && !targetKot.isPaid && !targetKot.ingredientsDeducted) {
+      if (targetKot && Array.isArray(targetKot.items) && !targetKot.ingredientsDeducted) {
         try {
-          deductRecipeStock(currentUid, targetKot.items);
-        } catch (_) {}
+          await deductRecipeStock(currentUid, targetKot.items, { branchId: targetKot.branchId || activeBranchId });
+        } catch (stockErr) {
+          console.warn("[Dashboard] KOT recipe deduction notice:", stockErr);
+        }
       }
 
       await updateDoc(doc(db, "users", currentUid, "kitchen_orders", orderId), {
@@ -1194,6 +1196,8 @@ export default function Dashboard({ initialTab = "sales" }) {
       totalAmount: safeTotalAmount,
       totalItems: safeTotalQty,
       masterUid: String(currentUid),
+      branchId: activeBranchId || "main_branch",
+      branchName: activeBranchName || "Main Branch",
       createdAtMs: nowMs,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -1734,7 +1738,7 @@ export default function Dashboard({ initialTab = "sales" }) {
 
         // Deduct raw material recipe ingredients from stock in real-time
         try {
-          deductRecipeStock(currentUid, sanitizedBillItems);
+          await deductRecipeStock(currentUid, sanitizedBillItems, { branchId: activeBranchId || "main_branch" });
         } catch (stockErr) {
           console.warn("Recipe stock deduction notice:", stockErr);
         }
@@ -1828,6 +1832,8 @@ export default function Dashboard({ initialTab = "sales" }) {
               totalItems: currentBill.reduce((sum, i) => sum + (Number(i.qty) || 1), 0),
               masterUid: String(currentUid),
               billNo: bNo,
+              branchId: activeBranchId || "main_branch",
+              branchName: activeBranchName || "Main Branch",
               billedAtMs: Date.now(),
               createdAtMs: Date.now(),
               createdAt: serverTimestamp(),
@@ -2949,7 +2955,7 @@ export default function Dashboard({ initialTab = "sales" }) {
             onClick={() => { setActiveTab("waste"); setProfileDropdownOpen(false); }}
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "waste" ? "#fff7ed" : "transparent", color: activeTab === "waste" ? "#fc8019" : "#334155" }}
           >
-            📉 Waste & Spoilage Tracking
+            📊 Profit, Loss &amp; Waste Tracking
           </button>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <a 
@@ -3951,10 +3957,14 @@ export default function Dashboard({ initialTab = "sales" }) {
           />
         )}
 
-        {/* WASTE & SPOILAGE MANAGEMENT TAB (SHOP & RESTAURANT) */}
+        {/* PROFIT, LOSS & WASTE MANAGEMENT TAB (SHOP & RESTAURANT) */}
         {activeTab === "waste" && (
           <WasteManagement
             userProfile={userProfile}
+            isRestaurant={isRestaurant}
+            isGlobalMode={isGlobalMode}
+            activeBranchId={activeBranchId}
+            activeBranchName={activeBranchName}
             onBack={() => setActiveTab("sales")}
           />
         )}
@@ -3965,6 +3975,10 @@ export default function Dashboard({ initialTab = "sales" }) {
             userProfile={userProfile}
             isRestaurant={isRestaurant}
             isGlobalMode={isGlobalMode}
+            activeBranchId={activeBranchId}
+            activeBranchName={activeBranchName}
+            branchesList={branchesList}
+            onSelectBranch={handleSelectBranch}
             onBack={() => setActiveTab("sales")}
           />
         )}

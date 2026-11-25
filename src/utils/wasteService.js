@@ -1,11 +1,10 @@
 import {
   collection,
   doc,
+  addDoc,
   runTransaction,
   serverTimestamp,
   onSnapshot,
-  query,
-  orderBy
 } from "firebase/firestore";
 
 /**
@@ -211,7 +210,7 @@ export async function logWasteRecord({
   return await runTransaction(db, async (transaction) => {
     const itemSnap = await transaction.get(itemRef);
     let currentStock = 0;
-    let cost = 0;
+    let cost;
     let resolvedName = productName || "Unnamed Item";
     let resolvedUnit = unitType || "Qty";
     let resolvedCat = category || "General";
@@ -389,5 +388,500 @@ export function subscribeWasteRecords(db, uid, onData, onError) {
   return () => {
     unsubWaste();
     unsubExpired();
+  };
+}
+
+/**
+ * Safely parses a Firestore timestamp, Date, number, or date string into a Date object.
+ */
+export function parseRecordDate(record) {
+  if (!record) return new Date();
+  if (record.parsedDate instanceof Date && !isNaN(record.parsedDate.getTime())) {
+    return record.parsedDate;
+  }
+  const ts = record.createdAt;
+  if (ts?.toDate) return ts.toDate();
+  if (ts?.seconds) return new Date(ts.seconds * 1000);
+  if (ts) {
+    const parsed = new Date(ts);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  if (record.createdAtMs) {
+    const parsed = new Date(record.createdAtMs);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date();
+}
+
+/**
+ * Checks whether a date matches a given timeframe filter ("all" | "today" | "yesterday" | "week" | "month").
+ */
+export function matchesTimeframe(date, timeFilter = "all", now = new Date()) {
+  if (!timeFilter || timeFilter === "all") return true;
+  if (!(date instanceof Date) || isNaN(date.getTime())) return false;
+
+  if (timeFilter === "today") {
+    return date.toDateString() === now.toDateString();
+  }
+  if (timeFilter === "yesterday") {
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    return date.toDateString() === yesterday.toDateString();
+  }
+  if (timeFilter === "week") {
+    const oneWeekAgo = new Date(now);
+    oneWeekAgo.setDate(now.getDate() - 7);
+    return date >= oneWeekAgo;
+  }
+  if (timeFilter === "month") {
+    return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
+  }
+  return true;
+}
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * Computes Revenue, Cost of Goods Sold (COGS), and Gross Profit for a single sale record.
+ * Resolves item costs from the sale item itself, or falls back to recipeCostMap / productCostMap.
+ */
+export function computeSaleProfitBreakdown(sale, productCostMap = {}, recipeCostMap = {}) {
+  if (!sale) {
+    return { revenue: 0, cost: 0, grossProfit: 0, marginPct: 0, itemCount: 0, itemsSummary: [] };
+  }
+
+  const revenue = Number(sale.totalAmount ?? sale.total ?? 0) || 0;
+  const items = Array.isArray(sale.items) ? sale.items : [];
+
+  let itemsCost = 0;
+  let itemsRevenue = 0;
+  let totalQty = 0;
+  let hasResolvedItemCost = false;
+  const itemsSummary = [];
+
+  for (const item of items) {
+    if (!item) continue;
+    const qty = Math.max(0, Number(item.qty ?? item.quantity ?? 1) || 1);
+    const sellPrice = Number(item.salesPrice ?? item.price ?? 0) || 0;
+    const itemId = String(item.id || item.productId || item.barcode || "").trim();
+    const itemName = String(item.itemName || item.name || "Item").trim();
+    const nameKey = itemName.toLowerCase();
+
+    let unitCost = Number(item.makingCost ?? item.costPrice ?? item.purchasePrice ?? 0) || 0;
+    if (unitCost <= 0 && itemId && recipeCostMap[itemId] > 0) {
+      unitCost = Number(recipeCostMap[itemId]) || 0;
+    }
+    if (unitCost <= 0 && nameKey && recipeCostMap[nameKey] > 0) {
+      unitCost = Number(recipeCostMap[nameKey]) || 0;
+    }
+    if (unitCost <= 0 && itemId && productCostMap[itemId] > 0) {
+      unitCost = Number(productCostMap[itemId]) || 0;
+    }
+    if (unitCost <= 0 && nameKey && productCostMap[nameKey] > 0) {
+      unitCost = Number(productCostMap[nameKey]) || 0;
+    }
+
+    if (unitCost > 0) hasResolvedItemCost = true;
+
+    const lineRevenue = sellPrice * qty;
+    const lineCost = unitCost * qty;
+    itemsRevenue += lineRevenue;
+    itemsCost += lineCost;
+    totalQty += qty;
+
+    itemsSummary.push({
+      name: itemName,
+      qty,
+      revenue: round2(lineRevenue),
+      cost: round2(lineCost),
+      grossProfit: round2(lineRevenue - lineCost),
+    });
+  }
+
+  const effectiveRevenue = revenue > 0 ? revenue : itemsRevenue;
+  let cost;
+  let grossProfit;
+
+  if (hasResolvedItemCost) {
+    cost = itemsCost;
+    grossProfit = effectiveRevenue - cost;
+  } else if (sale.profit !== undefined && sale.profit !== null && Number.isFinite(Number(sale.profit))) {
+    grossProfit = Number(sale.profit);
+    cost = Math.max(0, effectiveRevenue - grossProfit);
+  } else {
+    cost = 0;
+    grossProfit = effectiveRevenue;
+  }
+
+  const marginPct = effectiveRevenue > 0 ? (grossProfit / effectiveRevenue) * 100 : 0;
+
+  return {
+    revenue: round2(effectiveRevenue),
+    cost: round2(cost),
+    grossProfit: round2(grossProfit),
+    marginPct: Math.round(marginPct * 10) / 10,
+    itemCount: totalQty || items.length || 1,
+    itemsSummary,
+  };
+}
+
+/**
+ * Aggregates Profit & Loss statistics combining Sales Revenue, COGS, and Waste/Spoilage Loss.
+ */
+export function calculateProfitAndLossStats({
+  sales = [],
+  wasteRecords = [],
+  productCostMap = {},
+  recipeCostMap = {},
+  timeFilter = "all",
+  searchQuery = "",
+}) {
+  const now = new Date();
+  const isToday = (d) =>
+    d.getDate() === now.getDate() &&
+    d.getMonth() === now.getMonth() &&
+    d.getFullYear() === now.getFullYear();
+  const isCurrentMonth = (d) =>
+    d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+
+  let lifetimeRevenue = 0;
+  let lifetimeCogs = 0;
+  let lifetimeGrossProfit = 0;
+  let todayRevenue = 0;
+  let todayCogs = 0;
+  let todayGrossProfit = 0;
+  let todayOrdersCount = 0;
+  let monthRevenue = 0;
+  let monthCogs = 0;
+  let monthGrossProfit = 0;
+  let monthOrdersCount = 0;
+
+  let filteredRevenue = 0;
+  let filteredCogs = 0;
+  let filteredGrossProfit = 0;
+
+  const profitItemMap = {};
+  const dailyMap = {};
+  const normalizedSales = [];
+
+  const getDayKey = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  };
+
+  const ensureDayBucket = (d) => {
+    const key = getDayKey(d);
+    if (!dailyMap[key]) {
+      dailyMap[key] = {
+        dateKey: key,
+        dateLabel: d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }),
+        timestamp: new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(),
+        ordersCount: 0,
+        wasteCount: 0,
+        revenue: 0,
+        cogs: 0,
+        grossProfit: 0,
+        wasteLoss: 0,
+        netProfit: 0,
+      };
+    }
+    return dailyMap[key];
+  };
+
+  for (const sale of sales) {
+    if (!sale) continue;
+    const d = parseRecordDate(sale);
+    const breakdown = computeSaleProfitBreakdown(sale, productCostMap, recipeCostMap);
+
+    lifetimeRevenue += breakdown.revenue;
+    lifetimeCogs += breakdown.cost;
+    lifetimeGrossProfit += breakdown.grossProfit;
+
+    if (isToday(d)) {
+      todayRevenue += breakdown.revenue;
+      todayCogs += breakdown.cost;
+      todayGrossProfit += breakdown.grossProfit;
+      todayOrdersCount += 1;
+    }
+    if (isCurrentMonth(d)) {
+      monthRevenue += breakdown.revenue;
+      monthCogs += breakdown.cost;
+      monthGrossProfit += breakdown.grossProfit;
+      monthOrdersCount += 1;
+    }
+
+    if (!matchesTimeframe(d, timeFilter, now)) continue;
+
+    if (normalizedQuery) {
+      const billNo = String(sale.billNo || sale.invoiceId || "").toLowerCase();
+      const customer = String(sale.customerName || "").toLowerCase();
+      const notes = String(sale.notes || "").toLowerCase();
+      const itemNames = breakdown.itemsSummary.map((i) => i.name.toLowerCase()).join(" ");
+      if (
+        !billNo.includes(normalizedQuery) &&
+        !customer.includes(normalizedQuery) &&
+        !notes.includes(normalizedQuery) &&
+        !itemNames.includes(normalizedQuery)
+      ) {
+        continue;
+      }
+    }
+
+    filteredRevenue += breakdown.revenue;
+    filteredCogs += breakdown.cost;
+    filteredGrossProfit += breakdown.grossProfit;
+
+    const dayBucket = ensureDayBucket(d);
+    dayBucket.ordersCount += 1;
+    dayBucket.revenue += breakdown.revenue;
+    dayBucket.cogs += breakdown.cost;
+    dayBucket.grossProfit += breakdown.grossProfit;
+
+    for (const item of breakdown.itemsSummary) {
+      const key = item.name;
+      if (!profitItemMap[key]) {
+        profitItemMap[key] = {
+          name: item.name,
+          qtySold: 0,
+          revenue: 0,
+          cost: 0,
+          grossProfit: 0,
+        };
+      }
+      profitItemMap[key].qtySold += item.qty;
+      profitItemMap[key].revenue += item.revenue;
+      profitItemMap[key].cost += item.cost;
+      profitItemMap[key].grossProfit += item.grossProfit;
+    }
+
+    normalizedSales.push({
+      id: sale.id,
+      billNo: sale.billNo || sale.invoiceId || sale.id?.slice(0, 8) || "SALE",
+      parsedDate: d,
+      customerName: sale.customerName || "Walk-in Customer",
+      paymentMode: sale.paymentMode || sale.paymentMethod || "CASH",
+      orderType: sale.orderType || (sale.source === "profit_tracker" ? "Manual Entry" : "POS Sale"),
+      notes: sale.notes || "",
+      isManual: sale.source === "profit_tracker",
+      ...breakdown,
+    });
+  }
+
+  let todayWasteLoss = 0;
+  let monthWasteLoss = 0;
+  let filteredWasteLoss = 0;
+
+  for (const w of wasteRecords) {
+    if (!w) continue;
+    const d = parseRecordDate(w);
+    const loss = Number(w.totalLoss) || 0;
+
+    if (isToday(d)) todayWasteLoss += loss;
+    if (isCurrentMonth(d)) monthWasteLoss += loss;
+
+    if (!matchesTimeframe(d, timeFilter, now)) continue;
+    if (normalizedQuery) {
+      const name = String(w.productName || w.itemName || "").toLowerCase();
+      const cat = String(w.category || "").toLowerCase();
+      const reason = String(w.reason || "").toLowerCase();
+      const notes = String(w.notes || "").toLowerCase();
+      if (
+        !name.includes(normalizedQuery) &&
+        !cat.includes(normalizedQuery) &&
+        !reason.includes(normalizedQuery) &&
+        !notes.includes(normalizedQuery)
+      ) {
+        continue;
+      }
+    }
+
+    filteredWasteLoss += loss;
+    const dayBucket = ensureDayBucket(d);
+    dayBucket.wasteCount += 1;
+    dayBucket.wasteLoss += loss;
+  }
+
+  const dailyTrend = Object.values(dailyMap)
+    .map((day) => ({
+      ...day,
+      revenue: round2(day.revenue),
+      cogs: round2(day.cogs),
+      grossProfit: round2(day.grossProfit),
+      wasteLoss: round2(day.wasteLoss),
+      netProfit: round2(day.grossProfit - day.wasteLoss),
+    }))
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  const topProfitItems = Object.values(profitItemMap)
+    .sort((a, b) => b.grossProfit - a.grossProfit)
+    .slice(0, 5)
+    .map((item) => ({
+      ...item,
+      qtySold: round2(item.qtySold),
+      revenue: round2(item.revenue),
+      cost: round2(item.cost),
+      grossProfit: round2(item.grossProfit),
+      marginPct: item.revenue > 0 ? Math.round((item.grossProfit / item.revenue) * 1000) / 10 : 0,
+    }));
+
+  normalizedSales.sort((a, b) => b.parsedDate.getTime() - a.parsedDate.getTime());
+
+  const netProfit = round2(filteredGrossProfit - filteredWasteLoss);
+  const todayNetProfit = round2(todayGrossProfit - todayWasteLoss);
+  const monthNetProfit = round2(monthGrossProfit - monthWasteLoss);
+  const profitMarginPct = filteredRevenue > 0 ? Math.round((netProfit / filteredRevenue) * 1000) / 10 : 0;
+  const wasteImpactPct = filteredRevenue > 0 ? Math.round((filteredWasteLoss / filteredRevenue) * 1000) / 10 : 0;
+
+  return {
+    revenue: round2(filteredRevenue),
+    cogs: round2(filteredCogs),
+    grossProfit: round2(filteredGrossProfit),
+    wasteLoss: round2(filteredWasteLoss),
+    netProfit,
+    profitMarginPct,
+    wasteImpactPct,
+    ordersCount: normalizedSales.length,
+    todayRevenue: round2(todayRevenue),
+    todayCogs: round2(todayCogs),
+    todayGrossProfit: round2(todayGrossProfit),
+    todayWasteLoss: round2(todayWasteLoss),
+    todayNetProfit,
+    todayOrdersCount,
+    monthRevenue: round2(monthRevenue),
+    monthCogs: round2(monthCogs),
+    monthGrossProfit: round2(monthGrossProfit),
+    monthWasteLoss: round2(monthWasteLoss),
+    monthNetProfit,
+    monthOrdersCount,
+    lifetimeRevenue: round2(lifetimeRevenue),
+    lifetimeCogs: round2(lifetimeCogs),
+    lifetimeGrossProfit: round2(lifetimeGrossProfit),
+    topProfitItems,
+    dailyTrend,
+    filteredSales: normalizedSales,
+  };
+}
+
+/**
+ * Subscribes to real-time sales records for profit & revenue tracking.
+ */
+export function subscribeSalesRecords(db, uid, onData, onError) {
+  if (!db || !uid) return () => {};
+  const salesColRef = collection(db, "users", uid, "sales");
+  return onSnapshot(
+    salesColRef,
+    (snap) => {
+      const list = snap.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          ...data,
+          parsedDate: parseRecordDate(data),
+        };
+      });
+      list.sort((a, b) => b.parsedDate.getTime() - a.parsedDate.getTime());
+      onData(list);
+    },
+    (err) => {
+      console.warn("[WasteService] Sales listener notice:", err);
+      if (onError) onError(err);
+    }
+  );
+}
+
+/**
+ * Records a manual sale / profit entry into `users/{uid}/sales` so it stays unified with POS analytics.
+ */
+export async function logManualProfitSale({
+  db,
+  uid,
+  itemId = "",
+  itemName,
+  quantity = 1,
+  sellingPrice,
+  costPrice = 0,
+  customerName = "Walk-in Customer",
+  paymentMode = "CASH",
+  notes = "",
+  isRestaurant = false,
+  appMode = "local",
+  branchId = "main_branch",
+  branchName = "Main Branch",
+}) {
+  if (!uid || typeof uid !== "string" || !uid.trim()) {
+    throw new Error("User must be authenticated to record profit.");
+  }
+  const cleanName = String(itemName || "").trim();
+  if (!cleanName) {
+    throw new Error("Item or income description is required.");
+  }
+  const qty = Number(quantity);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    throw new Error("Quantity must be greater than zero.");
+  }
+  const sell = Number(sellingPrice);
+  if (!Number.isFinite(sell) || sell <= 0) {
+    throw new Error("Selling price / revenue per unit must be greater than zero.");
+  }
+  const cost = Number(costPrice);
+  if (!Number.isFinite(cost) || cost < 0) {
+    throw new Error("Cost price cannot be negative.");
+  }
+
+  const totalRevenue = round2(sell * qty);
+  const totalCost = round2(cost * qty);
+  const totalProfit = round2(totalRevenue - totalCost);
+
+  const now = new Date();
+  const billNo = `PROFIT-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(Date.now()).slice(-4)}`;
+  const billDate = now.toLocaleDateString("en-GB");
+
+  const payload = {
+    billNo,
+    invoiceId: billNo,
+    billDate,
+    items: [
+      {
+        id: itemId || `manual_${Date.now()}`,
+        name: cleanName,
+        itemName: cleanName,
+        price: sell,
+        salesPrice: sell,
+        purchasePrice: cost,
+        makingCost: cost,
+        qty,
+        notes: notes.trim(),
+      },
+    ],
+    total: totalRevenue,
+    totalAmount: totalRevenue,
+    profit: totalProfit,
+    customerName: customerName.trim() || "Walk-in Customer",
+    orderType: "manual_profit",
+    paymentMode: String(paymentMode || "CASH").toUpperCase(),
+    paymentMethod: String(paymentMode || "cash").toLowerCase(),
+    notes: notes.trim(),
+    source: "profit_tracker",
+    isGlobalMode: appMode === "global",
+    appMode,
+    isRestaurant,
+    shopType: isRestaurant ? "restaurant" : "retail",
+    branchId: branchId || "main_branch",
+    branchName: branchName || "Main Branch",
+    createdAt: serverTimestamp(),
+  };
+
+  const docRef = await addDoc(collection(db, "users", uid, "sales"), payload);
+  return {
+    success: true,
+    id: docRef.id,
+    totalRevenue,
+    totalCost,
+    totalProfit,
+    ...payload,
   };
 }

@@ -1,41 +1,77 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-import { collection, onSnapshot, doc, getDoc } from "firebase/firestore";
+import { useState, useEffect, useMemo } from "react";
+import { collection, onSnapshot } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import {
   WASTE_REASONS,
   calculateWasteStats,
+  calculateProfitAndLossStats,
   logWasteRecord,
+  logManualProfitSale,
+  matchesTimeframe,
   subscribeWasteRecords,
+  subscribeSalesRecords,
 } from "../utils/wasteService";
 
-export default function WasteManagement({ onBack, userProfile = {} }) {
+const formatINR = (value) =>
+  Number(value || 0).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+export default function WasteManagement({
+  userProfile = {},
+  isRestaurant: propIsRestaurant,
+  isGlobalMode: propIsGlobalMode,
+  activeBranchId,
+  activeBranchName,
+}) {
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
 
   // Shop & Business Mode
-  const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
-  const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
+  const [shopType] = useState(() => localStorage.getItem("shop_type") || "");
+  const isRestaurant =
+    propIsRestaurant !== undefined
+      ? propIsRestaurant
+      : (shopType || "").trim().toLowerCase() === "restaurant";
   const [appMode] = useState(() => localStorage.getItem("app_mode") || "local");
-  const isGlobalMode = appMode === "global";
+  const isGlobalMode = propIsGlobalMode !== undefined ? propIsGlobalMode : appMode === "global";
 
   // Data States
   const [wasteRecords, setWasteRecords] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [salesRecords, setSalesRecords] = useState([]);
+  const [loading, setLoading] = useState(() => Boolean(currentUid));
+  const [salesLoading, setSalesLoading] = useState(() => Boolean(currentUid));
   const [products, setProducts] = useState([]);
   const [rawMaterials, setRawMaterials] = useState([]);
+  const [recipes, setRecipes] = useState([]);
 
-  // Filter States
+  // Filter & View States
   const [timeFilter, setTimeFilter] = useState("all"); // "today" | "yesterday" | "week" | "month" | "all"
   const [reasonFilter, setReasonFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [activeLedgerTab, setActiveLedgerTab] = useState("daily"); // "daily" | "sales" | "waste"
 
-  // Modal States
+  // Waste Modal States
   const [showLogModal, setShowLogModal] = useState(false);
   const [savingWaste, setSavingWaste] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [successToast, setSuccessToast] = useState("");
 
-  // Log Form States
+  // Profit Modal States
+  const [showProfitModal, setShowProfitModal] = useState(false);
+  const [savingProfit, setSavingProfit] = useState(false);
+  const [profitError, setProfitError] = useState("");
+  const [profitSelectedProductId, setProfitSelectedProductId] = useState("custom");
+  const [profitItemName, setProfitItemName] = useState("");
+  const [profitQty, setProfitQty] = useState("1");
+  const [profitSellPrice, setProfitSellPrice] = useState("");
+  const [profitCostPrice, setProfitCostPrice] = useState("");
+  const [profitCustomer, setProfitCustomer] = useState("");
+  const [profitPaymentMode, setProfitPaymentMode] = useState("CASH");
+  const [profitNotes, setProfitNotes] = useState("");
+
+  // Log Waste Form States
   const [selectedItemSource, setSelectedItemSource] = useState(isRestaurant ? "raw_materials" : "products");
   const [selectedItemId, setSelectedItemId] = useState("");
   const [wastedQty, setWastedQty] = useState("");
@@ -43,16 +79,11 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
   const [wasteNotes, setWasteNotes] = useState("");
   const [reportedByName, setReportedByName] = useState(() => localStorage.getItem("staff_name") || userProfile.name || "Owner");
 
-  // Print / Export Slip State
-  const [showPrintSlip, setShowPrintSlip] = useState(false);
-  const printRef = useRef(null);
-
-  // 1. Subscribe to Waste Records
+  // 1. Subscribe to Waste & Sales Records
   useEffect(() => {
     if (!currentUid) return;
 
-    setLoading(true);
-    const unsubscribe = subscribeWasteRecords(
+    const unsubscribeWaste = subscribeWasteRecords(
       db,
       currentUid,
       (records) => {
@@ -65,10 +96,26 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
       }
     );
 
-    return () => unsubscribe();
+    const unsubscribeSales = subscribeSalesRecords(
+      db,
+      currentUid,
+      (sales) => {
+        setSalesRecords(sales);
+        setSalesLoading(false);
+      },
+      (err) => {
+        console.error("Sales sync error:", err);
+        setSalesLoading(false);
+      }
+    );
+
+    return () => {
+      unsubscribeWaste();
+      unsubscribeSales();
+    };
   }, [currentUid]);
 
-  // 2. Fetch inventory products for selection
+  // 2. Fetch inventory products, recipes & raw materials for cost/profit & waste selection
   useEffect(() => {
     if (!currentUid) return;
 
@@ -81,18 +128,28 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
     const unsubProducts = onSnapshot(collection(db, "users", currentUid, inventoryCol), (snap) => {
       const items = snap.docs.map((d) => {
         const data = d.data();
+        const sellingPrice = Number(data.price ?? data.salesPrice ?? 0);
+        const trueCost = Number(data.makingCost ?? data.purchasePrice ?? data.costPrice ?? 0);
+        const wasteCost = trueCost > 0 ? trueCost : sellingPrice;
         return {
           id: d.id,
           name: data.itemName || data.name || "Unnamed Item",
           category: data.category || (isRestaurant ? "Main Course" : "General"),
           quantity: Number(data.quantity || 0),
-          purchasePrice: Number(data.purchasePrice ?? data.costPrice ?? data.price ?? 0),
+          sellingPrice,
+          costPrice: trueCost,
+          purchasePrice: wasteCost,
           unitType: data.unitType || data.unit || "Qty",
           image: data.image || data.imageUrl || "",
           type: "product",
         };
       });
       setProducts(items);
+    });
+
+    const unsubRecipes = onSnapshot(collection(db, "users", currentUid, "recipes"), (snap) => {
+      const recipeList = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setRecipes(recipeList);
     });
 
     // If restaurant, also fetch raw materials
@@ -118,18 +175,53 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
 
     return () => {
       unsubProducts();
+      unsubRecipes();
       unsubRaw();
     };
   }, [currentUid, isRestaurant, isGlobalMode]);
 
-  // Selected item object for live form preview
+  // Lookup maps for accurate COGS / Profit resolution
+  const productCostMap = useMemo(() => {
+    const map = {};
+    for (const p of products) {
+      if (p.costPrice > 0) {
+        map[p.id] = p.costPrice;
+        map[p.name.toLowerCase()] = p.costPrice;
+      }
+    }
+    return map;
+  }, [products]);
+
+  const recipeCostMap = useMemo(() => {
+    const map = {};
+    for (const r of recipes) {
+      const cost = Number(r.totalMakingCost || 0);
+      if (cost > 0) {
+        if (r.productId) map[String(r.productId)] = cost;
+        if (r.id) map[String(r.id)] = cost;
+        if (r.productName) map[String(r.productName).toLowerCase()] = cost;
+      }
+    }
+    return map;
+  }, [recipes]);
+
+  // Filter sales to current business mode (matching Dashboard logic)
+  const modeFilteredSales = useMemo(() => {
+    return salesRecords.filter((o) => {
+      if (isRestaurant) return true;
+      const isOrdGlobal = o.isGlobalMode === true || o.appMode === "global";
+      return isGlobalMode ? isOrdGlobal : !isOrdGlobal;
+    });
+  }, [salesRecords, isRestaurant, isGlobalMode]);
+
+  // Selected item object for live waste form preview
   const currentSelectedItem = useMemo(() => {
     if (!selectedItemId) return null;
     const pool = selectedItemSource === "raw_materials" ? rawMaterials : products;
     return pool.find((i) => i.id === selectedItemId) || null;
   }, [selectedItemId, selectedItemSource, products, rawMaterials]);
 
-  // Live calculated loss in modal
+  // Live calculated loss in waste modal
   const modalCalculatedLoss = useMemo(() => {
     if (!currentSelectedItem || !wastedQty) return 0;
     const qty = Number(wastedQty);
@@ -138,44 +230,47 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
     return Math.round(cost * qty * 100) / 100;
   }, [currentSelectedItem, wastedQty]);
 
-  // Overall statistics
+  // Live calculated profit in profit modal
+  const modalProfitPreview = useMemo(() => {
+    const qty = Number(profitQty) || 0;
+    const sell = Number(profitSellPrice) || 0;
+    const cost = Number(profitCostPrice) || 0;
+    if (qty <= 0 || sell <= 0) {
+      return { revenue: 0, cost: 0, profit: 0, marginPct: 0 };
+    }
+    const revenue = Math.round(sell * qty * 100) / 100;
+    const totalCost = Math.round(cost * qty * 100) / 100;
+    const profit = Math.round((revenue - totalCost) * 100) / 100;
+    const marginPct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : 0;
+    return { revenue, cost: totalCost, profit, marginPct };
+  }, [profitQty, profitSellPrice, profitCostPrice]);
+
+  // Overall Waste statistics
   const stats = useMemo(() => {
     return calculateWasteStats(wasteRecords);
   }, [wasteRecords]);
 
+  // Combined Profit, Revenue, COGS & Waste Loss statistics
+  const pnlStats = useMemo(() => {
+    return calculateProfitAndLossStats({
+      sales: modeFilteredSales,
+      wasteRecords,
+      productCostMap,
+      recipeCostMap,
+      timeFilter,
+      searchQuery,
+    });
+  }, [modeFilteredSales, wasteRecords, productCostMap, recipeCostMap, timeFilter, searchQuery]);
+
   // Filtered waste records
   const filteredRecords = useMemo(() => {
     const now = new Date();
-    const todayStr = now.toDateString();
-
-    const yesterday = new Date();
-    yesterday.setDate(now.getDate() - 1);
-    const yesterdayStr = yesterday.toDateString();
-
-    const oneWeekAgo = new Date();
-    oneWeekAgo.setDate(now.getDate() - 7);
-
     return wasteRecords.filter((rec) => {
       const d = rec.parsedDate || new Date();
-
-      // Time filter
-      if (timeFilter === "today" && d.toDateString() !== todayStr) return false;
-      if (timeFilter === "yesterday" && d.toDateString() !== yesterdayStr) return false;
-      if (timeFilter === "week" && d < oneWeekAgo) return false;
-      if (
-        timeFilter === "month" &&
-        (d.getMonth() !== now.getMonth() || d.getFullYear() !== now.getFullYear())
-      ) {
-        return false;
-      }
-
-      // Reason filter
+      if (!matchesTimeframe(d, timeFilter, now)) return false;
       if (reasonFilter !== "all" && rec.reason !== reasonFilter) return false;
-
-      // Type filter
       if (typeFilter !== "all" && rec.itemType !== typeFilter) return false;
 
-      // Search query
       if (searchQuery.trim()) {
         const query = searchQuery.toLowerCase();
         const name = (rec.productName || rec.itemName || "").toLowerCase();
@@ -200,6 +295,90 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
   const currentViewLoss = useMemo(() => {
     return filteredRecords.reduce((sum, r) => sum + (Number(r.totalLoss) || 0), 0);
   }, [filteredRecords]);
+
+  // Handle selecting a product inside the Log Profit modal
+  const handleSelectProfitProduct = (prodId) => {
+    setProfitSelectedProductId(prodId);
+    if (prodId === "custom") {
+      setProfitItemName("");
+      setProfitSellPrice("");
+      setProfitCostPrice("");
+      return;
+    }
+    const found = products.find((p) => p.id === prodId);
+    if (found) {
+      const recipeCost = recipeCostMap[found.id] || recipeCostMap[found.name.toLowerCase()] || 0;
+      const resolvedCost = found.costPrice > 0 ? found.costPrice : recipeCost;
+      setProfitItemName(found.name);
+      setProfitSellPrice(found.sellingPrice > 0 ? String(found.sellingPrice) : "");
+      setProfitCostPrice(resolvedCost > 0 ? String(resolvedCost) : "0");
+    }
+  };
+
+  // Handle Manual Profit / Sale Submission
+  const handleLogProfitSubmit = async (e) => {
+    e.preventDefault();
+    setProfitError("");
+
+    const qty = Number(profitQty);
+    const sell = Number(profitSellPrice);
+    const cost = profitCostPrice === "" ? 0 : Number(profitCostPrice);
+
+    if (!profitItemName.trim()) {
+      setProfitError("Please enter an item or sale description.");
+      return;
+    }
+    if (isNaN(qty) || qty <= 0) {
+      setProfitError("Please enter a valid quantity greater than zero.");
+      return;
+    }
+    if (isNaN(sell) || sell <= 0) {
+      setProfitError("Please enter a valid selling price greater than zero.");
+      return;
+    }
+    if (isNaN(cost) || cost < 0) {
+      setProfitError("Cost price cannot be negative.");
+      return;
+    }
+
+    setSavingProfit(true);
+    try {
+      const res = await logManualProfitSale({
+        db,
+        uid: currentUid,
+        itemId: profitSelectedProductId !== "custom" ? profitSelectedProductId : "",
+        itemName: profitItemName,
+        quantity: qty,
+        sellingPrice: sell,
+        costPrice: cost,
+        customerName: profitCustomer,
+        paymentMode: profitPaymentMode,
+        notes: profitNotes,
+        isRestaurant,
+        appMode,
+        branchId: activeBranchId || "main_branch",
+        branchName: activeBranchName || "Main Branch",
+      });
+
+      setSavingProfit(false);
+      setShowProfitModal(false);
+      setProfitSelectedProductId("custom");
+      setProfitItemName("");
+      setProfitQty("1");
+      setProfitSellPrice("");
+      setProfitCostPrice("");
+      setProfitCustomer("");
+      setProfitNotes("");
+      setSuccessToast(
+        `Recorded sale ₹${formatINR(res.totalRevenue)} (Profit: +₹${formatINR(res.totalProfit)})!`
+      );
+      setTimeout(() => setSuccessToast(""), 4000);
+    } catch (err) {
+      console.error("Error logging profit sale:", err);
+      setProfitError(err.message || "Failed to log profit entry.");
+      setSavingProfit(false);
+    }
+  };
 
   // Handle Log Waste Submission
   const handleLogWasteSubmit = async (e) => {
@@ -264,47 +443,108 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
     }
   };
 
-  // Print Loss Report
+  // Print Profit & Loss / Waste Report
   const handlePrint = () => {
     window.print();
   };
 
-  // Export CSV
+  // Export CSV (exports active ledger view: Daily P&L, Sales & Profit, or Waste Records)
   const handleExportCsv = () => {
-    if (filteredRecords.length === 0) {
-      alert("No waste records to export.");
-      return;
+    let headers;
+    let rows;
+    let filePrefix;
+
+    if (activeLedgerTab === "daily") {
+      if (pnlStats.dailyTrend.length === 0) {
+        alert("No daily profit or waste records to export.");
+        return;
+      }
+      filePrefix = "Daily_Profit_Loss_Report";
+      headers = [
+        "Date",
+        "Orders",
+        "Revenue (INR)",
+        "COGS (INR)",
+        "Gross Profit (INR)",
+        "Waste Incidents",
+        "Waste Loss (INR)",
+        "Net Profit (INR)",
+      ];
+      rows = pnlStats.dailyTrend.map((d) => [
+        `"${d.dateLabel}"`,
+        d.ordersCount,
+        d.revenue.toFixed(2),
+        d.cogs.toFixed(2),
+        d.grossProfit.toFixed(2),
+        d.wasteCount,
+        d.wasteLoss.toFixed(2),
+        d.netProfit.toFixed(2),
+      ]);
+    } else if (activeLedgerTab === "sales") {
+      if (pnlStats.filteredSales.length === 0) {
+        alert("No sales/profit records to export.");
+        return;
+      }
+      filePrefix = "Sales_Profit_Report";
+      headers = [
+        "Bill No",
+        "Date",
+        "Customer",
+        "Order Type",
+        "Payment Mode",
+        "Items Count",
+        "Revenue (INR)",
+        "Cost / COGS (INR)",
+        "Gross Profit (INR)",
+        "Margin %",
+      ];
+      rows = pnlStats.filteredSales.map((s) => [
+        `"${s.billNo}"`,
+        s.parsedDate ? s.parsedDate.toISOString().replace("T", " ").substring(0, 19) : "",
+        `"${(s.customerName || "").replace(/"/g, '""')}"`,
+        `"${s.orderType}"`,
+        `"${s.paymentMode}"`,
+        s.itemCount,
+        s.revenue.toFixed(2),
+        s.cost.toFixed(2),
+        s.grossProfit.toFixed(2),
+        s.marginPct.toFixed(1),
+      ]);
+    } else {
+      if (filteredRecords.length === 0) {
+        alert("No waste records to export.");
+        return;
+      }
+      filePrefix = "Waste_Loss_Report";
+      headers = [
+        "Record ID",
+        "Date",
+        "Item Name",
+        "Category",
+        "Type",
+        "Quantity Wasted",
+        "Unit",
+        "Unit Cost (INR)",
+        "Total Loss (INR)",
+        "Reason",
+        "Notes",
+        "Reported By",
+      ];
+      rows = filteredRecords.map((r) => [
+        r.id,
+        r.parsedDate ? r.parsedDate.toISOString().replace("T", " ").substring(0, 19) : "",
+        `"${(r.productName || r.itemName || "").replace(/"/g, '""')}"`,
+        `"${(r.category || "").replace(/"/g, '""')}"`,
+        r.itemType || "shop_product",
+        r.wastedQuantity || r.expiredQuantity || 0,
+        r.unitType || "Qty",
+        Number(r.unitCost || r.purchasePrice || 0).toFixed(2),
+        Number(r.totalLoss || 0).toFixed(2),
+        `"${(r.reason || "").replace(/"/g, '""')}"`,
+        `"${(r.notes || "").replace(/"/g, '""')}"`,
+        `"${(r.reportedBy || "").replace(/"/g, '""')}"`,
+      ]);
     }
-
-    const headers = [
-      "Record ID",
-      "Date",
-      "Item Name",
-      "Category",
-      "Type",
-      "Quantity Wasted",
-      "Unit",
-      "Unit Cost (INR)",
-      "Total Loss (INR)",
-      "Reason",
-      "Notes",
-      "Reported By",
-    ];
-
-    const rows = filteredRecords.map((r) => [
-      r.id,
-      r.parsedDate ? r.parsedDate.toISOString().replace("T", " ").substring(0, 19) : "",
-      `"${(r.productName || r.itemName || "").replace(/"/g, '""')}"`,
-      `"${(r.category || "").replace(/"/g, '""')}"`,
-      r.itemType || "shop_product",
-      r.wastedQuantity || r.expiredQuantity || 0,
-      r.unitType || "Qty",
-      Number(r.unitCost || r.purchasePrice || 0).toFixed(2),
-      Number(r.totalLoss || 0).toFixed(2),
-      `"${(r.reason || "").replace(/"/g, '""')}"`,
-      `"${(r.notes || "").replace(/"/g, '""')}"`,
-      `"${(r.reportedBy || "").replace(/"/g, '""')}"`,
-    ]);
 
     const csvContent =
       "data:text/csv;charset=utf-8," +
@@ -313,7 +553,7 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `Waste_Report_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute("download", `${filePrefix}_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -339,19 +579,20 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
       <div style={styles.header}>
         <div style={styles.headerLeft}>
           <div style={styles.headerIconBox}>
-            <span style={{ fontSize: "24px" }}>📉</span>
+            <span style={{ fontSize: "24px" }}>📊</span>
           </div>
           <div>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
               <h1 style={styles.title}>
-                {isRestaurant ? "Food Waste & Kitchen Spoilage" : "Waste & Spoilage Management"}
+                {isRestaurant ? "Profit, Loss & Kitchen Waste" : "Profit, Loss & Waste Tracking"}
               </h1>
               <span style={isRestaurant ? styles.restaurantBadge : styles.shopBadge}>
                 {isRestaurant ? "🍳 Restaurant / Kitchen" : "🏪 Retail Shop"}
               </span>
+              <span style={styles.profitPillBadge}>📈 Live P&amp;L Sync</span>
             </div>
             <p style={styles.subtitle}>
-              Track product spoilage, expired stock, kitchen errors, and calculate the true cost of inventory loss.
+              Track sales revenue, gross &amp; net profit alongside product spoilage, kitchen errors, and inventory loss.
             </p>
           </div>
         </div>
@@ -361,7 +602,7 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
             type="button"
             onClick={handleExportCsv}
             style={styles.secondaryBtn}
-            title="Download CSV for accounting & tax write-off"
+            title="Download CSV for the active report tab"
           >
             <span>📥 Export CSV</span>
           </button>
@@ -370,9 +611,20 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
             type="button"
             onClick={handlePrint}
             style={styles.secondaryBtn}
-            title="Print Waste Loss Audit Slip"
+            title="Print Profit, Loss & Waste Report"
           >
             <span>🖨️ Print Report</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setProfitError("");
+              setShowProfitModal(true);
+            }}
+            style={styles.profitPrimaryBtn}
+          >
+            <span>+ Log Sale / Profit</span>
           </button>
 
           <button
@@ -388,60 +640,212 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
         </div>
       </div>
 
-      {/* 4 KPI SUMMARY CARDS */}
+      {/* 4 P&L + WASTE KPI SUMMARY CARDS (Respects active time filter) */}
       <div style={styles.kpiGrid}>
-        {/* KPI 1: Total Loss */}
+        {/* KPI 1: Net Profit (After Waste) */}
+        <div
+          style={{
+            ...styles.kpiCard,
+            borderLeft: `4px solid ${pnlStats.netProfit >= 0 ? "#10b981" : "#ef4444"}`,
+          }}
+        >
+          <div style={styles.kpiTop}>
+            <span style={styles.kpiLabel}>Net Profit (After Waste)</span>
+            <span style={styles.kpiIcon}>{pnlStats.netProfit >= 0 ? "📈" : "📉"}</span>
+          </div>
+          <div
+            style={{
+              ...styles.kpiValue,
+              color: pnlStats.netProfit >= 0 ? "#059669" : "#ef4444",
+            }}
+          >
+            {pnlStats.netProfit < 0 ? "-" : ""}₹{formatINR(Math.abs(pnlStats.netProfit))}
+          </div>
+          <div style={styles.kpiSub}>
+            Margin: <strong>{pnlStats.profitMarginPct}%</strong> • Today: ₹{formatINR(pnlStats.todayNetProfit)}
+          </div>
+        </div>
+
+        {/* KPI 2: Total Revenue (Sales) */}
+        <div style={{ ...styles.kpiCard, borderLeft: "4px solid #3b82f6" }}>
+          <div style={styles.kpiTop}>
+            <span style={styles.kpiLabel}>Sales Revenue</span>
+            <span style={styles.kpiIcon}>💰</span>
+          </div>
+          <div style={{ ...styles.kpiValue, color: "#2563eb" }}>
+            ₹{formatINR(pnlStats.revenue)}
+          </div>
+          <div style={styles.kpiSub}>
+            {pnlStats.ordersCount} bills • Today: ₹{formatINR(pnlStats.todayRevenue)}
+          </div>
+        </div>
+
+        {/* KPI 3: Gross Profit (Before Waste) */}
+        <div style={{ ...styles.kpiCard, borderLeft: "4px solid #0d9488" }}>
+          <div style={styles.kpiTop}>
+            <span style={styles.kpiLabel}>Gross Profit (Before Waste)</span>
+            <span style={styles.kpiIcon}>💹</span>
+          </div>
+          <div style={{ ...styles.kpiValue, color: "#0f766e" }}>
+            ₹{formatINR(pnlStats.grossProfit)}
+          </div>
+          <div style={styles.kpiSub}>
+            Item Cost (COGS): ₹{formatINR(pnlStats.cogs)} • Month: ₹{formatINR(pnlStats.monthGrossProfit)}
+          </div>
+        </div>
+
+        {/* KPI 4: Waste & Spoilage Loss */}
         <div style={{ ...styles.kpiCard, borderLeft: "4px solid #ef4444" }}>
           <div style={styles.kpiTop}>
-            <span style={styles.kpiLabel}>Total Financial Loss</span>
+            <span style={styles.kpiLabel}>Waste &amp; Spoilage Loss</span>
             <span style={styles.kpiIcon}>💸</span>
           </div>
           <div style={{ ...styles.kpiValue, color: "#ef4444" }}>
-            ₹{stats.totalLoss.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            ₹{formatINR(pnlStats.wasteLoss)}
           </div>
-          <div style={styles.kpiSub}>Lifetime operational shrinkage expense</div>
-        </div>
-
-        {/* KPI 2: Today's Loss */}
-        <div style={{ ...styles.kpiCard, borderLeft: "4px solid #f97316" }}>
-          <div style={styles.kpiTop}>
-            <span style={styles.kpiLabel}>Today's Waste Loss</span>
-            <span style={styles.kpiIcon}>📅</span>
+          <div style={styles.kpiSub}>
+            Today: ₹{formatINR(stats.todayLoss)} • Lifetime: ₹{formatINR(stats.totalLoss)} ({stats.totalQuantity} units)
           </div>
-          <div style={{ ...styles.kpiValue, color: "#ea580c" }}>
-            ₹{stats.todayLoss.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </div>
-          <div style={styles.kpiSub}>{stats.todayQuantity} units recorded today</div>
-        </div>
-
-        {/* KPI 3: Month's Loss */}
-        <div style={{ ...styles.kpiCard, borderLeft: "4px solid #8b5cf6" }}>
-          <div style={styles.kpiTop}>
-            <span style={styles.kpiLabel}>This Month's Loss</span>
-            <span style={styles.kpiIcon}>📆</span>
-          </div>
-          <div style={{ ...styles.kpiValue, color: "#7c3aed" }}>
-            ₹{stats.monthLoss.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </div>
-          <div style={styles.kpiSub}>{stats.monthQuantity} units lost this month</div>
-        </div>
-
-        {/* KPI 4: Total Wasted Items */}
-        <div style={{ ...styles.kpiCard, borderLeft: "4px solid #06b6d4" }}>
-          <div style={styles.kpiTop}>
-            <span style={styles.kpiLabel}>Total Units Wasted</span>
-            <span style={styles.kpiIcon}>📦</span>
-          </div>
-          <div style={{ ...styles.kpiValue, color: "#0891b2" }}>
-            {stats.totalQuantity.toLocaleString("en-IN")}
-          </div>
-          <div style={styles.kpiSub}>Across {wasteRecords.length} recorded incidents</div>
         </div>
       </div>
 
-      {/* 2 VISUAL INSIGHTS CARDS */}
+      {/* PROFIT vs WASTE BREAKDOWN BAR */}
+      <div style={styles.pnlBannerCard}>
+        <div style={styles.pnlBannerTop}>
+          <div>
+            <span style={styles.pnlBannerTitle}>Revenue Allocation &amp; Profit Health</span>
+            <span style={styles.pnlBannerSub}>
+              {" "}
+              (COGS + Waste Loss vs Net Profit)
+            </span>
+          </div>
+          <div style={styles.pnlQuickPills}>
+            <span style={styles.pnlQuickPillGreen}>
+              Today Net: {pnlStats.todayNetProfit < 0 ? "-" : "+"}₹{formatINR(Math.abs(pnlStats.todayNetProfit))}
+            </span>
+            <span style={styles.pnlQuickPillBlue}>
+              This Month Net: {pnlStats.monthNetProfit < 0 ? "-" : "+"}₹{formatINR(Math.abs(pnlStats.monthNetProfit))}
+            </span>
+            <span style={styles.pnlQuickPillRed}>
+              Waste Impact: {pnlStats.wasteImpactPct}% of sales
+            </span>
+          </div>
+        </div>
+
+        {pnlStats.revenue > 0 ? (
+          <>
+            <div style={styles.stackedBarBg}>
+              <div
+                style={{
+                  ...styles.stackedBarSegment,
+                  width: `${Math.min(100, Math.max(0, (pnlStats.cogs / pnlStats.revenue) * 100))}%`,
+                  backgroundColor: "#f59e0b",
+                }}
+                title={`Item Cost (COGS): ₹${formatINR(pnlStats.cogs)}`}
+              />
+              <div
+                style={{
+                  ...styles.stackedBarSegment,
+                  width: `${Math.min(100, Math.max(0, (pnlStats.wasteLoss / pnlStats.revenue) * 100))}%`,
+                  backgroundColor: "#ef4444",
+                }}
+                title={`Waste & Spoilage Loss: ₹${formatINR(pnlStats.wasteLoss)}`}
+              />
+              <div
+                style={{
+                  ...styles.stackedBarSegment,
+                  width: `${Math.min(100, Math.max(0, (Math.max(0, pnlStats.netProfit) / pnlStats.revenue) * 100))}%`,
+                  backgroundColor: "#10b981",
+                }}
+                title={`Net Profit: ₹${formatINR(pnlStats.netProfit)}`}
+              />
+            </div>
+            <div style={styles.stackedLegend}>
+              <span style={styles.legendItem}>
+                <span style={{ ...styles.legendDot, backgroundColor: "#f59e0b" }} />
+                Item Cost (COGS): ₹{formatINR(pnlStats.cogs)}
+              </span>
+              <span style={styles.legendItem}>
+                <span style={{ ...styles.legendDot, backgroundColor: "#ef4444" }} />
+                Waste Loss: ₹{formatINR(pnlStats.wasteLoss)}
+              </span>
+              <span style={styles.legendItem}>
+                <span style={{ ...styles.legendDot, backgroundColor: "#10b981" }} />
+                Net Profit: ₹{formatINR(pnlStats.netProfit)} ({pnlStats.profitMarginPct}%)
+              </span>
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: "12px", color: "#64748b", marginTop: "6px" }}>
+            Record a POS bill or tap <strong>+ Log Sale / Profit</strong> to visualize your Revenue vs. Cost vs. Waste breakdown.
+          </div>
+        )}
+      </div>
+
+      {/* 4 VISUAL INSIGHTS CARDS (PROFIT + WASTE) */}
       <div style={styles.analyticsGrid}>
-        {/* Analytics 1: Reason Breakdown */}
+        {/* Analytics 1: Top 5 Profitable Items */}
+        <div style={styles.analyticsCard}>
+          <div style={styles.cardHeader}>
+            <h3 style={styles.cardTitle}>🏆 Top 5 Most Profitable Items</h3>
+            <span style={styles.cardHint}>Highest gross profit generators</span>
+          </div>
+          <div style={styles.topItemsList}>
+            {pnlStats.topProfitItems.length === 0 ? (
+              <div style={styles.emptyNotice}>No sales profit data for this period yet.</div>
+            ) : (
+              pnlStats.topProfitItems.map((item, idx) => (
+                <div key={idx} style={styles.topItemRow}>
+                  <div style={{ ...styles.rankBadge, backgroundColor: "#10b981" }}>#{idx + 1}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={styles.topItemName}>{item.name}</div>
+                    <div style={styles.topItemSub}>
+                      Sold: {item.qtySold} • Revenue: ₹{formatINR(item.revenue)} • Margin: {item.marginPct}%
+                    </div>
+                  </div>
+                  <div style={styles.topItemProfit}>+₹{formatINR(item.grossProfit)}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Analytics 2: Recent Daily Profit vs Waste */}
+        <div style={styles.analyticsCard}>
+          <div style={styles.cardHeader}>
+            <h3 style={styles.cardTitle}>⚖️ Daily Net Profit vs. Waste</h3>
+            <span style={styles.cardHint}>Latest active days at a glance</span>
+          </div>
+          <div style={styles.topItemsList}>
+            {pnlStats.dailyTrend.length === 0 ? (
+              <div style={styles.emptyNotice}>No daily profit or waste activity yet.</div>
+            ) : (
+              pnlStats.dailyTrend.slice(0, 5).map((day) => (
+                <div key={day.dateKey} style={styles.topItemRow}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={styles.topItemName}>{day.dateLabel}</div>
+                    <div style={styles.topItemSub}>
+                      Sales: ₹{formatINR(day.revenue)} • Gross: ₹{formatINR(day.grossProfit)} • Waste:{" "}
+                      <span style={{ color: "#ef4444", fontWeight: "600" }}>
+                        -₹{formatINR(day.wasteLoss)}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      ...styles.topItemProfit,
+                      color: day.netProfit >= 0 ? "#059669" : "#ef4444",
+                    }}
+                  >
+                    {day.netProfit >= 0 ? "+" : "-"}₹{formatINR(Math.abs(day.netProfit))}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Analytics 3: Reason Breakdown */}
         <div style={styles.analyticsCard}>
           <div style={styles.cardHeader}>
             <h3 style={styles.cardTitle}>📊 Waste Loss by Reason Breakdown</h3>
@@ -481,7 +885,7 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
           </div>
         </div>
 
-        {/* Analytics 2: Top Financial Loss Products (Pareto 80/20) */}
+        {/* Analytics 4: Top Financial Loss Products (Pareto 80/20) */}
         <div style={styles.analyticsCard}>
           <div style={styles.cardHeader}>
             <h3 style={styles.cardTitle}>🔥 Top 5 High-Loss Items (Pareto Impact)</h3>
@@ -542,7 +946,7 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search by product, ingredient, or reason..."
+            placeholder="Search by product, bill no, customer, or reason..."
             style={styles.searchInput}
           />
           {searchQuery && (
@@ -552,46 +956,285 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
           )}
         </div>
 
-        {/* Reason Dropdown Filter */}
-        <select
-          value={reasonFilter}
-          onChange={(e) => setReasonFilter(e.target.value)}
-          style={styles.selectFilter}
-        >
-          <option value="all">All Reasons</option>
-          {WASTE_REASONS.map((r) => (
-            <option key={r.id} value={r.label}>
-              {r.icon} {r.label}
-            </option>
-          ))}
-        </select>
+        {/* Waste-specific dropdowns shown when viewing Waste Log */}
+        {activeLedgerTab === "waste" && (
+          <>
+            <select
+              value={reasonFilter}
+              onChange={(e) => setReasonFilter(e.target.value)}
+              style={styles.selectFilter}
+            >
+              <option value="all">All Reasons</option>
+              {WASTE_REASONS.map((r) => (
+                <option key={r.id} value={r.label}>
+                  {r.icon} {r.label}
+                </option>
+              ))}
+            </select>
 
-        {/* Item Type Dropdown Filter (for Restaurant) */}
-        {isRestaurant && (
-          <select
-            value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value)}
-            style={styles.selectFilter}
-          >
-            <option value="all">All Item Types</option>
-            <option value="restaurant_raw_material">Kitchen Ingredients</option>
-            <option value="restaurant_food_item">Prepared Dishes</option>
-            <option value="shop_product">Retail Products</option>
-          </select>
+            {isRestaurant && (
+              <select
+                value={typeFilter}
+                onChange={(e) => setTypeFilter(e.target.value)}
+                style={styles.selectFilter}
+              >
+                <option value="all">All Item Types</option>
+                <option value="restaurant_raw_material">Kitchen Ingredients</option>
+                <option value="restaurant_food_item">Prepared Dishes</option>
+                <option value="shop_product">Retail Products</option>
+              </select>
+            )}
+          </>
         )}
       </div>
 
-      {/* FILTER ACTIVE SUMMARY */}
-      <div style={styles.filterSummary}>
-        <span>
-          Showing <strong>{filteredRecords.length}</strong> incidents (Filtered Total Loss:{" "}
-          <strong style={{ color: "#ef4444" }}>₹{currentViewLoss.toFixed(2)}</strong>)
-        </span>
+      {/* LEDGER VIEW TABS + SUMMARY */}
+      <div style={styles.ledgerTabBar}>
+        <div style={styles.ledgerTabs}>
+          <button
+            type="button"
+            onClick={() => setActiveLedgerTab("daily")}
+            style={{
+              ...styles.ledgerTabBtn,
+              ...(activeLedgerTab === "daily" ? styles.ledgerTabBtnActive : {}),
+            }}
+          >
+            ⚖️ Daily P&amp;L Summary ({pnlStats.dailyTrend.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveLedgerTab("sales")}
+            style={{
+              ...styles.ledgerTabBtn,
+              ...(activeLedgerTab === "sales" ? styles.ledgerTabBtnActive : {}),
+            }}
+          >
+            💰 Profit &amp; Sales Log ({pnlStats.filteredSales.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveLedgerTab("waste")}
+            style={{
+              ...styles.ledgerTabBtn,
+              ...(activeLedgerTab === "waste" ? styles.ledgerTabBtnActive : {}),
+            }}
+          >
+            🗑️ Waste &amp; Loss Log ({filteredRecords.length})
+          </button>
+        </div>
+
+        <div style={styles.filterSummary}>
+          <span>
+            Net Profit:{" "}
+            <strong style={{ color: pnlStats.netProfit >= 0 ? "#059669" : "#ef4444" }}>
+              {pnlStats.netProfit < 0 ? "-" : "+"}₹{formatINR(Math.abs(pnlStats.netProfit))}
+            </strong>{" "}
+            • Sales: <strong style={{ color: "#2563eb" }}>₹{formatINR(pnlStats.revenue)}</strong> • Waste:{" "}
+            <strong style={{ color: "#ef4444" }}>₹{formatINR(currentViewLoss)}</strong>
+          </span>
+        </div>
       </div>
 
-      {/* WASTE AUDIT LOG TABLE */}
+      {/* LEDGER TABLE CARD */}
       <div style={styles.tableCard}>
-        {loading ? (
+        {activeLedgerTab === "daily" ? (
+          loading && salesLoading ? (
+            <div style={styles.tableLoader}>⏳ Loading profit &amp; waste summary...</div>
+          ) : pnlStats.dailyTrend.length === 0 ? (
+            <div style={styles.emptyTable}>
+              <div style={{ fontSize: "40px", marginBottom: "8px" }}>📊</div>
+              <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155" }}>
+                No profit or waste records found for this period
+              </div>
+              <p style={{ fontSize: "13px", color: "#64748b", margin: "6px 0 16px" }}>
+                Sales billed in POS appear here automatically, or record a sale/waste entry directly.
+              </p>
+              <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProfitError("");
+                    setShowProfitModal(true);
+                  }}
+                  style={styles.profitPrimaryBtn}
+                >
+                  + Log Sale / Profit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setErrorMessage("");
+                    setShowLogModal(true);
+                  }}
+                  style={styles.primaryBtn}
+                >
+                  + Log Wastage Now
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={styles.table}>
+                <thead>
+                  <tr style={styles.thRow}>
+                    <th style={styles.th}>Date</th>
+                    <th style={styles.th}>Orders</th>
+                    <th style={styles.th}>Sales Revenue</th>
+                    <th style={styles.th}>Item Cost (COGS)</th>
+                    <th style={styles.th}>Gross Profit</th>
+                    <th style={styles.th}>Waste Loss</th>
+                    <th style={styles.th}>Net Profit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pnlStats.dailyTrend.map((day) => (
+                    <tr key={day.dateKey} style={styles.tr}>
+                      <td style={{ ...styles.tdDate, fontWeight: "700", color: "#0f172a" }}>
+                        {day.dateLabel}
+                      </td>
+                      <td style={styles.td}>{day.ordersCount} bills</td>
+                      <td style={{ ...styles.td, fontWeight: "700", color: "#2563eb" }}>
+                        ₹{formatINR(day.revenue)}
+                      </td>
+                      <td style={styles.tdCost}>₹{formatINR(day.cogs)}</td>
+                      <td style={{ ...styles.td, fontWeight: "700", color: "#0f766e" }}>
+                        +₹{formatINR(day.grossProfit)}
+                      </td>
+                      <td style={styles.tdLoss}>
+                        {day.wasteLoss > 0 ? `- ₹${formatINR(day.wasteLoss)}` : "₹0.00"}
+                        {day.wasteCount > 0 ? (
+                          <span style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "500" }}>
+                            {" "}
+                            ({day.wasteCount})
+                          </span>
+                        ) : null}
+                      </td>
+                      <td
+                        style={{
+                          ...styles.td,
+                          fontWeight: "800",
+                          color: day.netProfit >= 0 ? "#059669" : "#ef4444",
+                        }}
+                      >
+                        {day.netProfit >= 0 ? "+" : "-"}₹{formatINR(Math.abs(day.netProfit))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : activeLedgerTab === "sales" ? (
+          salesLoading ? (
+            <div style={styles.tableLoader}>⏳ Loading sales &amp; profit records...</div>
+          ) : pnlStats.filteredSales.length === 0 ? (
+            <div style={styles.emptyTable}>
+              <div style={{ fontSize: "40px", marginBottom: "8px" }}>💰</div>
+              <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155" }}>
+                No sales / profit records found
+              </div>
+              <p style={{ fontSize: "13px", color: "#64748b", margin: "6px 0 16px" }}>
+                POS checkout bills sync here automatically. You can also tap &quot;+ Log Sale / Profit&quot; to record an entry.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setProfitError("");
+                  setShowProfitModal(true);
+                }}
+                style={styles.profitPrimaryBtn}
+              >
+                + Log Sale / Profit
+              </button>
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={styles.table}>
+                <thead>
+                  <tr style={styles.thRow}>
+                    <th style={styles.th}>Date &amp; Time</th>
+                    <th style={styles.th}>Bill No / Items</th>
+                    <th style={styles.th}>Customer / Type</th>
+                    <th style={styles.th}>Payment</th>
+                    <th style={styles.th}>Revenue</th>
+                    <th style={styles.th}>Cost (COGS)</th>
+                    <th style={styles.th}>Gross Profit</th>
+                    <th style={styles.th}>Margin</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pnlStats.filteredSales.map((sale) => {
+                    const dateStr = sale.parsedDate
+                      ? sale.parsedDate.toLocaleDateString("en-IN", {
+                          day: "2-digit",
+                          month: "short",
+                          year: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })
+                      : "Recent";
+                    const itemsText =
+                      sale.itemsSummary.length > 0
+                        ? sale.itemsSummary
+                            .slice(0, 2)
+                            .map((i) => `${i.name} ×${i.qty}`)
+                            .join(", ") +
+                          (sale.itemsSummary.length > 2
+                            ? ` +${sale.itemsSummary.length - 2} more`
+                            : "")
+                        : `${sale.itemCount} item(s)`;
+
+                    return (
+                      <tr key={sale.id} style={styles.tr}>
+                        <td style={styles.tdDate}>{dateStr}</td>
+                        <td style={styles.tdItem}>
+                          <div style={styles.itemTitle}>#{sale.billNo}</div>
+                          <div style={styles.itemCategory}>{itemsText}</div>
+                        </td>
+                        <td style={styles.td}>
+                          <div style={{ fontWeight: "600", color: "#334155" }}>
+                            {sale.customerName}
+                          </div>
+                          <span style={styles.typeBadge}>
+                            {sale.isManual ? "Manual Profit Log" : sale.orderType}
+                          </span>
+                        </td>
+                        <td style={styles.td}>
+                          <span style={styles.typeBadge}>{sale.paymentMode}</span>
+                        </td>
+                        <td style={{ ...styles.td, fontWeight: "700", color: "#2563eb" }}>
+                          ₹{formatINR(sale.revenue)}
+                        </td>
+                        <td style={styles.tdCost}>₹{formatINR(sale.cost)}</td>
+                        <td
+                          style={{
+                            ...styles.td,
+                            fontWeight: "800",
+                            color: sale.grossProfit >= 0 ? "#059669" : "#ef4444",
+                          }}
+                        >
+                          {sale.grossProfit >= 0 ? "+" : "-"}₹{formatINR(Math.abs(sale.grossProfit))}
+                        </td>
+                        <td style={styles.td}>
+                          <span
+                            style={{
+                              ...styles.reasonBadge,
+                              backgroundColor: sale.grossProfit >= 0 ? "#dcfce7" : "#fee2e2",
+                              color: sale.grossProfit >= 0 ? "#15803d" : "#b91c1c",
+                              borderColor: sale.grossProfit >= 0 ? "#86efac" : "#fca5a5",
+                            }}
+                          >
+                            {sale.marginPct}%
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : loading ? (
           <div style={styles.tableLoader}>⏳ Loading waste records...</div>
         ) : filteredRecords.length === 0 ? (
           <div style={styles.emptyTable}>
@@ -929,6 +1572,186 @@ export default function WasteManagement({ onBack, userProfile = {} }) {
           </div>
         </div>
       )}
+
+      {/* MODAL: LOG SALE / PROFIT ENTRY */}
+      {showProfitModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowProfitModal(false)}>
+          <div style={styles.modalBox} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "22px" }}>💰</span>
+                <h3 style={styles.modalTitle}>Log Sale &amp; Profit Entry</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowProfitModal(false)}
+                style={styles.modalCloseBtn}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleLogProfitSubmit} style={styles.modalForm}>
+              {profitError && <div style={styles.modalError}>{profitError}</div>}
+
+              <div style={styles.formGroup}>
+                <label style={styles.formLabel}>Select Product / Dish (Optional Quick Fill)</label>
+                <select
+                  value={profitSelectedProductId}
+                  onChange={(e) => handleSelectProfitProduct(e.target.value)}
+                  style={styles.formInput}
+                >
+                  <option value="custom">-- Custom Item / Daily Summary --</option>
+                  {products.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name} (Sell: ₹{item.sellingPrice} | Cost: ₹
+                      {item.costPrice > 0
+                        ? item.costPrice
+                        : recipeCostMap[item.id] || recipeCostMap[item.name.toLowerCase()] || 0}
+                      )
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={styles.formGroup}>
+                <label style={styles.formLabel}>Item / Sale Description *</label>
+                <input
+                  type="text"
+                  value={profitItemName}
+                  onChange={(e) => setProfitItemName(e.target.value)}
+                  placeholder="e.g. Chicken Biryani, Catering Order, or Offline Sale"
+                  style={styles.formInput}
+                  required
+                />
+              </div>
+
+              <div style={styles.formRow2}>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Quantity *</label>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0.01"
+                    value={profitQty}
+                    onChange={(e) => setProfitQty(e.target.value)}
+                    style={styles.formInput}
+                    required
+                  />
+                </div>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Payment Mode</label>
+                  <select
+                    value={profitPaymentMode}
+                    onChange={(e) => setProfitPaymentMode(e.target.value)}
+                    style={styles.formInput}
+                  >
+                    <option value="CASH">Cash</option>
+                    <option value="UPI">UPI / QR</option>
+                    <option value="CARD">Card</option>
+                    <option value="OTHER">Other</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style={styles.formRow2}>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Selling Price / Unit (₹) *</label>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0.01"
+                    value={profitSellPrice}
+                    onChange={(e) => setProfitSellPrice(e.target.value)}
+                    placeholder="e.g. 180"
+                    style={styles.formInput}
+                    required
+                  />
+                </div>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Cost Price / Unit (₹)</label>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    value={profitCostPrice}
+                    onChange={(e) => setProfitCostPrice(e.target.value)}
+                    placeholder="e.g. 95"
+                    style={styles.formInput}
+                  />
+                </div>
+              </div>
+
+              {modalProfitPreview.revenue > 0 && (
+                <div style={styles.profitCalcBox}>
+                  <div style={styles.lossCalcRow}>
+                    <span>Total Revenue:</span>
+                    <strong>₹{formatINR(modalProfitPreview.revenue)}</strong>
+                  </div>
+                  <div style={styles.lossCalcRow}>
+                    <span>Total Cost (COGS):</span>
+                    <strong>₹{formatINR(modalProfitPreview.cost)}</strong>
+                  </div>
+                  <div style={{ ...styles.lossDivider, backgroundColor: "#86efac" }} />
+                  <div
+                    style={{
+                      ...styles.lossCalcRow,
+                      fontSize: "16px",
+                      color: modalProfitPreview.profit >= 0 ? "#15803d" : "#b91c1c",
+                    }}
+                  >
+                    <span>Gross Profit ({modalProfitPreview.marginPct}%):</span>
+                    <strong>
+                      {modalProfitPreview.profit >= 0 ? "+" : "-"}₹
+                      {formatINR(Math.abs(modalProfitPreview.profit))}
+                    </strong>
+                  </div>
+                </div>
+              )}
+
+              <div style={styles.formGroup}>
+                <label style={styles.formLabel}>Customer / Source (Optional)</label>
+                <input
+                  type="text"
+                  value={profitCustomer}
+                  onChange={(e) => setProfitCustomer(e.target.value)}
+                  placeholder="Walk-in Customer / Swiggy / Bulk Order"
+                  style={styles.formInput}
+                />
+              </div>
+
+              <div style={styles.formGroup}>
+                <label style={styles.formLabel}>Notes (Optional)</label>
+                <textarea
+                  value={profitNotes}
+                  onChange={(e) => setProfitNotes(e.target.value)}
+                  placeholder="Optional note about this sale or profit entry"
+                  rows={2}
+                  style={styles.formTextarea}
+                />
+              </div>
+
+              <div style={styles.modalFooter}>
+                <button
+                  type="button"
+                  onClick={() => setShowProfitModal(false)}
+                  style={styles.modalCancelBtn}
+                  disabled={savingProfit}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  style={styles.profitSubmitBtn}
+                  disabled={savingProfit || !profitItemName.trim() || !profitSellPrice}
+                >
+                  {savingProfit ? "Saving Entry..." : "Confirm & Record Profit"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -972,7 +1795,7 @@ const styles = {
     width: "52px",
     height: "52px",
     borderRadius: "14px",
-    backgroundColor: "#fee2e2",
+    backgroundColor: "#ecfdf5",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1007,11 +1830,34 @@ const styles = {
     borderRadius: "6px",
     border: "1px solid #fde68a",
   },
+  profitPillBadge: {
+    backgroundColor: "#ecfdf5",
+    color: "#059669",
+    fontSize: "11px",
+    fontWeight: "700",
+    padding: "3px 8px",
+    borderRadius: "6px",
+    border: "1px solid #a7f3d0",
+  },
   headerActions: {
     display: "flex",
     alignItems: "center",
     gap: "10px",
     flexWrap: "wrap",
+  },
+  profitPrimaryBtn: {
+    backgroundColor: "#10b981",
+    color: "#ffffff",
+    border: "none",
+    padding: "10px 18px",
+    borderRadius: "10px",
+    fontWeight: "700",
+    fontSize: "13px",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    boxShadow: "0 2px 8px rgba(16, 185, 129, 0.3)",
   },
   primaryBtn: {
     backgroundColor: "#ef4444",
@@ -1529,5 +2375,154 @@ const styles = {
     fontSize: "13px",
     cursor: "pointer",
     boxShadow: "0 2px 6px rgba(239, 68, 68, 0.3)",
+  },
+  profitSubmitBtn: {
+    padding: "10px 20px",
+    borderRadius: "8px",
+    border: "none",
+    backgroundColor: "#10b981",
+    color: "#ffffff",
+    fontWeight: "700",
+    fontSize: "13px",
+    cursor: "pointer",
+    boxShadow: "0 2px 6px rgba(16, 185, 129, 0.3)",
+  },
+  profitCalcBox: {
+    padding: "14px 16px",
+    backgroundColor: "#ecfdf5",
+    borderRadius: "10px",
+    border: "1px solid #a7f3d0",
+    marginBottom: "16px",
+  },
+  formRow2: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "12px",
+  },
+  pnlBannerCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: "14px",
+    padding: "16px 20px",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+    border: "1px solid #e2e8f0",
+    marginBottom: "24px",
+  },
+  pnlBannerTop: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: "10px",
+    marginBottom: "12px",
+  },
+  pnlBannerTitle: {
+    fontSize: "14px",
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  pnlBannerSub: {
+    fontSize: "12px",
+    color: "#64748b",
+  },
+  pnlQuickPills: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
+  },
+  pnlQuickPillGreen: {
+    fontSize: "12px",
+    fontWeight: "700",
+    color: "#047857",
+    backgroundColor: "#ecfdf5",
+    border: "1px solid #a7f3d0",
+    padding: "4px 10px",
+    borderRadius: "999px",
+  },
+  pnlQuickPillBlue: {
+    fontSize: "12px",
+    fontWeight: "700",
+    color: "#1d4ed8",
+    backgroundColor: "#eff6ff",
+    border: "1px solid #bfdbfe",
+    padding: "4px 10px",
+    borderRadius: "999px",
+  },
+  pnlQuickPillRed: {
+    fontSize: "12px",
+    fontWeight: "700",
+    color: "#b91c1c",
+    backgroundColor: "#fef2f2",
+    border: "1px solid #fecaca",
+    padding: "4px 10px",
+    borderRadius: "999px",
+  },
+  stackedBarBg: {
+    display: "flex",
+    width: "100%",
+    height: "10px",
+    borderRadius: "999px",
+    overflow: "hidden",
+    backgroundColor: "#f1f5f9",
+    marginBottom: "10px",
+  },
+  stackedBarSegment: {
+    height: "100%",
+    transition: "width 0.4s ease",
+  },
+  stackedLegend: {
+    display: "flex",
+    alignItems: "center",
+    gap: "18px",
+    flexWrap: "wrap",
+    fontSize: "12px",
+    color: "#475569",
+    fontWeight: "600",
+  },
+  legendItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  },
+  legendDot: {
+    width: "10px",
+    height: "10px",
+    borderRadius: "50%",
+    display: "inline-block",
+  },
+  topItemProfit: {
+    fontSize: "14px",
+    fontWeight: "800",
+    color: "#059669",
+    whiteSpace: "nowrap",
+  },
+  ledgerTabBar: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: "12px",
+    marginBottom: "14px",
+  },
+  ledgerTabs: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
+  },
+  ledgerTabBtn: {
+    padding: "8px 14px",
+    borderRadius: "10px",
+    border: "1px solid #cbd5e1",
+    backgroundColor: "#ffffff",
+    color: "#475569",
+    fontSize: "13px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+  ledgerTabBtnActive: {
+    backgroundColor: "#0f172a",
+    color: "#ffffff",
+    borderColor: "#0f172a",
   },
 };

@@ -2267,25 +2267,32 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                             <td style={{ padding: "8px 12px", color: "#64748b" }}>
                               <div>₹{ing.baseCost} / {ing.baseUnit}</div>
                               {(ing.packQuantity || ["packet", "pkt", "pack", "box", "bottle", "pcs"].includes(String(ing.baseUnit).toLowerCase())) && (
-                                <div style={{ fontSize: "11px", color: "#ea580c", fontWeight: "700", display: "flex", alignItems: "center", gap: "4px", marginTop: "3px" }}>
-                                  <span>1 {ing.baseUnit} =</span>
-                                  <input
-                                    type="number"
-                                    value={ing.packQuantity || ""}
-                                    placeholder="500"
-                                    onChange={(e) => handleUpdateIngredientPack(idx, e.target.value)}
-                                    style={{
-                                      width: "55px",
-                                      padding: "1px 4px",
-                                      fontSize: "11px",
-                                      fontWeight: "800",
-                                      borderRadius: "5px",
-                                      border: "1px solid #fdba74",
-                                      textAlign: "center"
-                                    }}
-                                    title="Edit pack size to adjust portion cost"
-                                  />
-                                  <span>{ing.packUnit || ing.unit}</span>
+                                <div style={{ marginTop: "4px" }}>
+                                  <div style={{ fontSize: "11px", color: "#ea580c", fontWeight: "700", display: "flex", alignItems: "center", gap: "4px" }}>
+                                    <span>1 {ing.baseUnit} =</span>
+                                    <input
+                                      type="number"
+                                      value={ing.packQuantity || ""}
+                                      placeholder="500"
+                                      onChange={(e) => handleUpdateIngredientPack(idx, e.target.value)}
+                                      style={{
+                                        width: "55px",
+                                        padding: "1px 4px",
+                                        fontSize: "11px",
+                                        fontWeight: "800",
+                                        borderRadius: "5px",
+                                        border: "1px solid #fdba74",
+                                        textAlign: "center"
+                                      }}
+                                      title="Edit pack size to adjust portion cost"
+                                    />
+                                    <span>{ing.packUnit || ing.unit}</span>
+                                  </div>
+                                  {Number(ing.quantity) > 0 && Number(ing.packQuantity || 500) > 0 && (
+                                    <div style={{ fontSize: "10.5px", color: "#16a34a", fontWeight: "800", marginTop: "2px" }}>
+                                      🎯 Yield: ~{Math.floor(Number(ing.packQuantity || 500) / Number(ing.quantity))} portions / {ing.baseUnit}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </td>

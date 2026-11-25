@@ -6,10 +6,13 @@ import {
   updateDoc,
   deleteDoc,
   doc,
+  setDoc,
   serverTimestamp
 } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { getGroceryImage, GROCERY_IMAGE_PRESETS } from "../utils/groceryImages";
+import { formatRawStockDisplay, calculatePortionYieldAndShortage } from "../utils/recipeStockService";
+import { logWasteRecord } from "../utils/wasteService";
 
 // Dummy starter item names to filter out and purge
 const DUMMY_STARTER_NAMES = new Set([
@@ -55,12 +58,87 @@ const DEFAULT_SHOP_CATEGORIES = [
   "Hardware"
 ];
 
-export default function PurchaseReport({ userProfile = {}, isRestaurant = false, isGlobalMode = false, onBack }) {
-  // Mode: "restaurant" (Groceries & Ingredients) vs "shop" (Stock & Products)
-  const [reportMode, setReportMode] = useState(() => (isRestaurant ? "restaurant" : "shop"));
+export default function PurchaseReport({
+  userProfile = {},
+  isRestaurant = false,
+  isGlobalMode = false,
+  activeBranchId: propActiveBranchId,
+  activeBranchName: propActiveBranchName,
+  branchesList: propBranchesList = [],
+  onSelectBranch,
+  onBack
+}) {
+  // Unified single Shop Inventory mode ("restaurent groceries & food incredients intha option vendam ella stockkum shopinventorylaye add aagattum")
+  const [reportMode, setReportMode] = useState("shop");
   
   // View mode: "cards" (Card Grid View like Menu items) vs "table" (Invoices log)
   const [viewMode, setViewMode] = useState("cards");
+
+  // Multi-Branch Management State
+  const [internalBranchId, setInternalBranchId] = useState(() => propActiveBranchId || localStorage.getItem("active_branch_id") || "main_branch");
+  const [internalBranchName, setInternalBranchName] = useState(() => propActiveBranchName || localStorage.getItem("active_branch_name") || "Main Branch");
+  const [branches, setBranches] = useState(propBranchesList || []);
+
+  const currentUid = auth.currentUser?.uid || localStorage.getItem("uid") || "";
+  const storeName = userProfile.storeName || "Upstage Kadai";
+
+  // Synchronize branch from Dashboard prop or localStorage
+  useEffect(() => {
+    if (propActiveBranchId) {
+      setInternalBranchId(propActiveBranchId);
+    }
+  }, [propActiveBranchId]);
+
+  useEffect(() => {
+    if (propActiveBranchName) {
+      setInternalBranchName(propActiveBranchName);
+    }
+  }, [propActiveBranchName]);
+
+  // Listen to branches in Firestore if not passed
+  useEffect(() => {
+    if (propBranchesList && propBranchesList.length > 0) {
+      setBranches(propBranchesList);
+    } else if (currentUid) {
+      const unsub = onSnapshot(collection(db, "users", currentUid, "branches"), (snap) => {
+        let list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        list.sort((a, b) => (a.isPrimary || a.id === "main_branch" ? -1 : 1));
+        setBranches(list);
+      });
+      return () => unsub();
+    }
+  }, [propBranchesList, currentUid]);
+
+  const isPrimaryBranchId = (bId) => {
+    if (!bId || bId === "main_branch" || bId === "main_default" || bId === "BR-01") return true;
+    const b = branches.find((item) => item.id === bId);
+    return b?.isPrimary === true;
+  };
+
+  // Branch isolation matcher: ensures each branch has its own stock & purchases
+  const itemMatchesBranch = (item, bId) => {
+    if (!bId || bId === "all") return true;
+    const targetIsPrimary = isPrimaryBranchId(bId);
+
+    // If item has no branchId or branchName, it belongs to the primary/main branch
+    if (!item.branchId && !item.branchName) {
+      return targetIsPrimary;
+    }
+
+    if (item.branchId) {
+      if (item.branchId === bId) return true;
+      if (targetIsPrimary && (item.branchId === "main_branch" || item.branchId === "main_default" || item.branchId === "BR-01")) {
+        return true;
+      }
+    }
+
+    if (item.branchName) {
+      const targetBranch = branches.find((b) => b.id === bId);
+      if (targetBranch && item.branchName === targetBranch.name) return true;
+    }
+
+    return false;
+  };
 
   // Data states
   const [purchasesList, setPurchasesList] = useState([]);
@@ -78,6 +156,11 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
 
   // Selected item for Detail Modal ("antha item a click panna show aakura mathiri")
   const [selectedItemDetail, setSelectedItemDetail] = useState(null);
+  const [userRecipes, setUserRecipes] = useState([]);
+  const [reconcilePacksUsed, setReconcilePacksUsed] = useState(1);
+  const [reconcileActualServed, setReconcileActualServed] = useState(48);
+  const [reconcilingShortage, setReconcilingShortage] = useState(false);
+  const [reconcileSuccessMsg, setReconcileSuccessMsg] = useState("");
 
   // Add Purchase Modal State
   const [showAddModal, setShowAddModal] = useState(false);
@@ -111,9 +194,23 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
   const [webSearchQuery, setWebSearchQuery] = useState("");
   const [webSearchResults, setWebSearchResults] = useState([]);
   const [webSearchLoading, setWebSearchLoading] = useState(false);
+  const [webSearchTarget, setWebSearchTarget] = useState("purchase"); // "purchase" | "edit"
 
-  const currentUid = auth.currentUser?.uid || localStorage.getItem("uid") || "";
-  const storeName = userProfile.storeName || "Upstage Kadai";
+  // Edit Item Modal State ("dei apram ithula oru edit optionum set panniru da")
+  const [editingItem, setEditingItem] = useState(null);
+  const [editItemName, setEditItemName] = useState("");
+  const [editCategory, setEditCategory] = useState("Groceries");
+  const [showEditAddCategory, setShowEditAddCategory] = useState(false);
+  const [newEditCategoryInput, setNewEditCategoryInput] = useState("");
+  const [editStockQty, setEditStockQty] = useState("");
+  const [editUnit, setEditUnit] = useState("kg");
+  const [editRate, setEditRate] = useState("");
+  const [editPackCapacity, setEditPackCapacity] = useState("");
+  const [editPackUnit, setEditPackUnit] = useState("ml");
+  const [editMinAlert, setEditMinAlert] = useState("5");
+  const [editSupplier, setEditSupplier] = useState("");
+  const [editImage, setEditImage] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
 
   // Switch unit and sync smart input values
   const handleUnitChange = (newUnit) => {
@@ -247,7 +344,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
     setFormBillNo(`PUR-${randomSuffix}`);
     setFormItemName("");
     setSelectedExistingId("");
-    setFormCategory(reportMode === "restaurant" ? "Groceries" : "Stock");
+    setFormCategory("Stock");
     setShowAddCategoryInline(false);
     setNewCategoryInput("");
     setFormQty("");
@@ -258,7 +355,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
     setFormPackCount("");
     setFormPackSizeVal("");
     setFormPackSizeUnit("ml");
-    setFormUnit(reportMode === "restaurant" ? "kg" : "pcs");
+    setFormUnit("pcs");
     setFormRate("");
     setFormSupplier("");
     setFormPaymentMode("Cash");
@@ -275,9 +372,9 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
     setSelectedExistingId(item.id || "");
     const itemName = item.name || item.itemName || "";
     setFormItemName(itemName);
-    setFormCategory(item.category || (reportMode === "restaurant" ? "Groceries" : "Stock"));
+    setFormCategory(item.category || "Stock");
     setShowAddCategoryInline(false);
-    const unit = item.unit || item.unitType || (reportMode === "restaurant" ? "kg" : "pcs");
+    const unit = item.unit || item.unitType || "pcs";
     setFormUnit(unit);
     setFormRate(
       item.costPerUnit != null ? String(item.costPerUnit) : item.purchasePrice != null ? String(item.purchasePrice) : ""
@@ -398,24 +495,40 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       setCustomCategories(cats);
     }, () => {});
 
+    // E. Listen to user recipes for portion yield & shortage calculations
+    const recipesRef = collection(db, "users", currentUid, "recipes");
+    const unsubRecipes = onSnapshot(
+      recipesRef,
+      (snapshot) => {
+        const rList = snapshot.docs.map((d) => ({
+          id: d.id,
+          ...d.data()
+        }));
+        setUserRecipes(rList);
+      },
+      (err) => {
+        console.warn("Recipes listener notice:", err);
+      }
+    );
+
     return () => {
       unsubPurchases();
       unsubRaw();
       unsubInv();
       unsubCat();
+      unsubRecipes();
     };
   }, [currentUid, isGlobalMode]);
 
   // Combined available categories for dropdown
   const availableCategories = useMemo(() => {
-    const base = reportMode === "restaurant" ? DEFAULT_RESTAURANT_CATEGORIES : DEFAULT_SHOP_CATEGORIES;
-    const set = new Set([...base, ...customCategories]);
+    const set = new Set([...DEFAULT_SHOP_CATEGORIES, ...DEFAULT_RESTAURANT_CATEGORIES, ...customCategories]);
     // Also include any categories from existing items
-    [...rawMaterialsList, ...shopProductsList].forEach((it) => {
+    [...shopProductsList, ...rawMaterialsList].forEach((it) => {
       if (it.category) set.add(it.category);
     });
     return Array.from(set);
-  }, [reportMode, customCategories, rawMaterialsList, shopProductsList]);
+  }, [customCategories, shopProductsList, rawMaterialsList]);
 
   // Handle adding a brand new category from modal dropdown
   const handleAddNewCategory = async () => {
@@ -460,8 +573,9 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
   };
 
   // Handle Web Image Search (Multi-Source: Curated Presets, Open Food Facts, Wikipedia, Wikimedia)
-  const handleOpenWebImageSearch = (initialQuery = "") => {
-    const q = initialQuery.trim() || formItemName.trim() || "groceries";
+  const handleOpenWebImageSearch = (initialQuery = "", target = "purchase") => {
+    setWebSearchTarget(target);
+    const q = initialQuery.trim() || (target === "edit" ? editItemName.trim() : formItemName.trim()) || "groceries";
     setWebSearchQuery(q);
     setWebSearchModalOpen(true);
     executeWebImageSearch(q);
@@ -624,7 +738,12 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
     setSavingPurchase(true);
 
     try {
-      // 1. Create Purchase record in Firestore
+      // Resolve active branch for this purchase
+      const activeB = branches.find((b) => b.id === internalBranchId) || branches.find((b) => b.isPrimary || b.id === "main_branch") || { id: "main_branch", name: "Main Branch" };
+      const branchIdToSave = internalBranchId && internalBranchId !== "all" ? internalBranchId : activeB.id;
+      const branchNameToSave = activeB.name || internalBranchName || "Main Branch";
+
+      // 1. Create Purchase record in Firestore tagged with branchId
       const purchaseData = {
         billNo: formBillNo.trim() || `PUR-${Date.now().toString().slice(-6)}`,
         invoiceId: formBillNo.trim() || `PUR-${Date.now().toString().slice(-6)}`,
@@ -643,6 +762,8 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
         date: formDate,
         image: resolvedImage,
         notes: formNotes.trim(),
+        branchId: branchIdToSave,
+        branchName: branchNameToSave,
         createdAt: serverTimestamp(),
         recordedBy: userProfile.name || "Owner"
       };
@@ -656,6 +777,8 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
         invoiceId: purchaseData.billNo,
         supplierName: purchaseData.supplierName,
         paymentMode: formPaymentMode,
+        branchId: branchIdToSave,
+        branchName: branchNameToSave,
         items: [
           {
             itemName: name,
@@ -669,107 +792,100 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
         createdAt: serverTimestamp()
       });
 
-      // 2. Automatically update or create stock in inventory & raw materials
-      if (reportMode === "restaurant") {
-        let existingRaw = selectedExistingId ? rawMaterialsList.find((r) => r.id === selectedExistingId) : null;
-        if (!existingRaw) {
-          existingRaw = rawMaterialsList.find((r) => r.name?.toLowerCase().trim() === name.toLowerCase());
-        }
+      // 2. Automatically update or create stock in Shop Inventory (users/{uid}/inventory) scoped to this branch
+      const invCol = isGlobalMode ? "global_inventory" : "inventory";
+      
+      // Match existing items only within the SAME branch!
+      const branchShopProducts = shopProductsList.filter((p) => itemMatchesBranch(p, branchIdToSave));
+      const branchRawMaterials = rawMaterialsList.filter((r) => itemMatchesBranch(r, branchIdToSave));
 
-        if (existingRaw) {
-          const newStock = Number(((Number(existingRaw.stockQuantity) || 0) + qtyNum).toFixed(2));
-          await updateDoc(doc(db, "users", currentUid, "raw_materials", existingRaw.id), {
+      let existingProd = selectedExistingId ? branchShopProducts.find((p) => p.id === selectedExistingId) : null;
+      if (!existingProd) {
+        existingProd = branchShopProducts.find((p) => (p.itemName || p.name)?.toLowerCase().trim() === name.toLowerCase());
+      }
+      if (!existingProd) {
+        existingProd = branchRawMaterials.find((r) => r.id === selectedExistingId || (r.name || "").toLowerCase().trim() === name.toLowerCase());
+      }
+
+      if (existingProd) {
+        const curStock = Number(existingProd.quantity != null ? existingProd.quantity : (existingProd.stockQuantity || 0));
+        const newStock = Number((curStock + qtyNum).toFixed(2));
+        await updateDoc(doc(db, "users", currentUid, invCol, existingProd.id), {
+          name: name,
+          itemName: name,
+          quantity: newStock,
+          purchasePrice: rateNum,
+          costPrice: rateNum,
+          category: formCategory.trim() || existingProd.category || "Stock",
+          unitType: formUnit.trim() || existingProd.unitType || existingProd.unit || "pcs",
+          packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : (existingProd.packQuantity || null),
+          packUnit: formPackSizeVal ? formPackSizeUnit : (existingProd.packUnit || null),
+          supplierName: formSupplier.trim() || existingProd.supplierName || "Vendor",
+          image: resolvedImage || existingProd.image || "",
+          branchId: branchIdToSave,
+          branchName: branchNameToSave,
+          updatedAt: serverTimestamp()
+        });
+
+        // Dual-write to raw_materials if doc exists
+        try {
+          await updateDoc(doc(db, "users", currentUid, "raw_materials", existingProd.id), {
+            name: name,
             stockQuantity: newStock,
             costPerUnit: rateNum,
-            supplierName: formSupplier.trim() || existingRaw.supplierName || "",
-            image: resolvedImage || existingRaw.image || "",
-            packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : (existingRaw.packQuantity || null),
-            packUnit: formPackSizeVal ? formPackSizeUnit : (existingRaw.packUnit || null),
+            packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : (existingProd.packQuantity || null),
+            packUnit: formPackSizeVal ? formPackSizeUnit : (existingProd.packUnit || null),
+            supplierName: formSupplier.trim() || existingProd.supplierName || "",
+            image: resolvedImage || existingProd.image || "",
+            branchId: branchIdToSave,
+            branchName: branchNameToSave,
             updatedAtMs: Date.now()
           });
-        } else {
-          await addDoc(collection(db, "users", currentUid, "raw_materials"), {
+        } catch (_) {}
+      } else {
+        const newDocRef = await addDoc(collection(db, "users", currentUid, invCol), {
+          name: name,
+          itemName: name,
+          category: formCategory.trim() || "Stock",
+          unitType: formUnit.trim() || "pcs",
+          quantity: qtyNum,
+          purchasePrice: rateNum,
+          costPrice: rateNum,
+          salesPrice: rateNum,
+          price: rateNum,
+          packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : null,
+          packUnit: formPackSizeVal ? formPackSizeUnit : null,
+          image: resolvedImage,
+          supplierName: formSupplier.trim() || "Vendor",
+          branchId: branchIdToSave,
+          branchName: branchNameToSave,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+
+        // Dual-write to raw_materials with same ID for recipe compatibility
+        try {
+          await setDoc(doc(db, "users", currentUid, "raw_materials", newDocRef.id), {
             name: name,
             category: formCategory.trim() || "Groceries",
             unit: formUnit.trim() || "kg",
             costPerUnit: rateNum,
             stockQuantity: qtyNum,
-            minStockAlert: 5,
             packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : null,
             packUnit: formPackSizeVal ? formPackSizeUnit : null,
             image: resolvedImage,
-            supplierName: formSupplier.trim() || "Market / Vendor",
+            supplierName: formSupplier.trim() || "Vendor",
+            branchId: branchIdToSave,
+            branchName: branchNameToSave,
             createdAtMs: Date.now(),
             updatedAtMs: Date.now()
           });
-        }
-
-        // Also sync in inventory so mobile app & shop inventory see it
-        const invCol = isGlobalMode ? "global_inventory" : "inventory";
-        let existingProd = shopProductsList.find((p) => (p.itemName || p.name)?.toLowerCase().trim() === name.toLowerCase());
-        if (existingProd) {
-          const newQty = Number(((Number(existingProd.quantity) || 0) + qtyNum).toFixed(2));
-          await updateDoc(doc(db, "users", currentUid, invCol, existingProd.id), {
-            quantity: newQty,
-            purchasePrice: rateNum,
-            packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : (existingProd.packQuantity || null),
-            packUnit: formPackSizeVal ? formPackSizeUnit : (existingProd.packUnit || null),
-            image: resolvedImage || existingProd.image || "",
-            supplierName: formSupplier.trim() || existingProd.supplierName || ""
-          });
-        } else {
-          await addDoc(collection(db, "users", currentUid, invCol), {
-            name: name,
-            itemName: name,
-            category: formCategory.trim() || "Groceries",
-            unitType: formUnit.trim() || "kg",
-            purchasePrice: rateNum,
-            salesPrice: rateNum,
-            price: rateNum,
-            quantity: qtyNum,
-            packQuantity: formPackSizeVal ? parseFloat(formPackSizeVal) : null,
-            packUnit: formPackSizeVal ? formPackSizeUnit : null,
-            image: resolvedImage,
-            supplierName: formSupplier.trim() || "Vendor",
-            createdAt: serverTimestamp()
-          });
-        }
-      } else {
-        const invCol = isGlobalMode ? "global_inventory" : "inventory";
-        let existingProd = selectedExistingId ? shopProductsList.find((p) => p.id === selectedExistingId) : null;
-        if (!existingProd) {
-          existingProd = shopProductsList.find((p) => (p.itemName || p.name)?.toLowerCase().trim() === name.toLowerCase());
-        }
-
-        if (existingProd) {
-          const newStock = Number(((Number(existingProd.quantity) || 0) + qtyNum).toFixed(2));
-          await updateDoc(doc(db, "users", currentUid, invCol, existingProd.id), {
-            quantity: newStock,
-            purchasePrice: rateNum,
-            supplierName: formSupplier.trim() || existingProd.supplierName || "",
-            image: resolvedImage || existingProd.image || "",
-            updatedAt: serverTimestamp()
-          });
-        } else {
-          await addDoc(collection(db, "users", currentUid, invCol), {
-            name: name,
-            itemName: name,
-            category: formCategory.trim() || "General",
-            unitType: formUnit.trim() || "pcs",
-            purchasePrice: rateNum,
-            salesPrice: Number((rateNum * 1.25).toFixed(2)),
-            price: Number((rateNum * 1.25).toFixed(2)),
-            quantity: qtyNum,
-            image: resolvedImage,
-            supplierName: formSupplier.trim() || "Vendor",
-            createdAt: serverTimestamp()
-          });
-        }
+        } catch (_) {}
       }
 
       setSavingPurchase(false);
       setShowAddModal(false);
-      alert(`✅ Purchase of ₹${totalAmt.toLocaleString("en-IN")} recorded successfully!\nStock for "${name}" increased by +${qtyNum} ${formUnit}.`);
+      alert(`✅ Purchase of ₹${totalAmt.toLocaleString("en-IN")} recorded successfully for "${branchNameToSave}"!\nStock for "${name}" increased by +${qtyNum} ${formUnit}.`);
     } catch (err) {
       console.error("Save purchase error:", err);
       setSavingPurchase(false);
@@ -777,36 +893,215 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
     }
   };
 
-  // Combine actual purchase records + stock valuation items for Table View
-  const combinedRecords = useMemo(() => {
-    const modePurchases = purchasesList.filter((p) => {
-      if (!p.type) return true;
-      return p.type === reportMode;
-    });
+  // Open Edit Item Modal ("dei apram ithula oru edit optionum set panniru da")
+  const openEditItemModal = (item) => {
+    if (!item) return;
+    setEditingItem(item);
+    setEditItemName(item.name || item.itemName || "");
+    setEditCategory(item.category || "Stock");
+    setShowEditAddCategory(false);
+    setNewEditCategoryInput("");
+    setEditStockQty(String(item.stockQuantity != null ? item.stockQuantity : (item.quantity ?? 0)));
+    setEditUnit(item.unit || item.unitType || "pcs");
+    setEditRate(String(item.costPerUnit != null ? item.costPerUnit : (item.purchasePrice ?? 0)));
+    setEditPackCapacity(String(item.packQuantity || item.packCapacity || ""));
+    setEditPackUnit(item.packUnit || item.packSubUnit || "ml");
+    setEditMinAlert(String(item.minStockAlert || item.minAlertQuantity || 5));
+    setEditSupplier(item.supplierName || item.latestSupplier || "");
+    setEditImage(item.image || "");
+  };
 
-    if (modePurchases.length === 0) {
-      const sourceItems = reportMode === "restaurant" ? [...rawMaterialsList, ...shopProductsList] : shopProductsList;
-      return sourceItems.map((it) => ({
+  // Add category inline from Edit modal
+  const handleAddNewEditCategory = async () => {
+    const name = newEditCategoryInput.trim();
+    if (!name) return;
+    setEditCategory(name);
+    setShowEditAddCategory(false);
+    setNewEditCategoryInput("");
+
+    if (currentUid) {
+      try {
+        const catCol = isGlobalMode ? "global_categories" : "categories";
+        await addDoc(collection(db, "users", currentUid, catCol), {
+          name: name,
+          createdAt: serverTimestamp()
+        });
+      } catch (err) {
+        console.warn("Category save notice:", err);
+      }
+    }
+  };
+
+  // Save changes to edited item in Shop Inventory
+  const handleSaveEditedItem = async (e) => {
+    e?.preventDefault();
+    if (!currentUid || !editingItem) return;
+    const name = editItemName.trim();
+    if (!name) {
+      alert("Please enter an item name.");
+      return;
+    }
+
+    setSavingEdit(true);
+    try {
+      const stockQtyNum = Number(editStockQty) || 0;
+      const rateNum = Number(editRate) || 0;
+      const minAlertNum = Number(editMinAlert) || 5;
+      const packCapNum = editPackCapacity ? parseFloat(editPackCapacity) : null;
+      const resolvedImg = editImage.trim() || getGroceryImage(name, editCategory);
+      
+      const activeB = branches.find((b) => b.id === internalBranchId) || branches.find((b) => b.isPrimary || b.id === "main_branch") || { id: "main_branch", name: "Main Branch" };
+      const branchIdToSave = editingItem.branchId || (internalBranchId !== "all" ? internalBranchId : activeB.id);
+      const branchNameToSave = editingItem.branchName || branches.find((b) => b.id === branchIdToSave)?.name || internalBranchName || "Main Branch";
+
+      // Save directly to Shop Inventory
+      const invCol = isGlobalMode ? "global_inventory" : "inventory";
+      const invRef = doc(db, "users", currentUid, invCol, editingItem.id);
+      try {
+        await updateDoc(invRef, {
+          name: name,
+          itemName: name,
+          category: editCategory.trim() || "Stock",
+          unitType: editUnit.trim() || "pcs",
+          quantity: stockQtyNum,
+          purchasePrice: rateNum,
+          costPrice: rateNum,
+          packQuantity: packCapNum,
+          packUnit: packCapNum ? editPackUnit : null,
+          minAlertQuantity: minAlertNum,
+          supplierName: editSupplier.trim() || "Vendor",
+          image: resolvedImg,
+          branchId: branchIdToSave,
+          branchName: branchNameToSave,
+          updatedAt: serverTimestamp()
+        });
+      } catch (invErr) {
+        // If doc only existed in raw_materials, create in inventory
+        await setDoc(invRef, {
+          name: name,
+          itemName: name,
+          category: editCategory.trim() || "Stock",
+          unitType: editUnit.trim() || "pcs",
+          quantity: stockQtyNum,
+          purchasePrice: rateNum,
+          costPrice: rateNum,
+          packQuantity: packCapNum,
+          packUnit: packCapNum ? editPackUnit : null,
+          minAlertQuantity: minAlertNum,
+          supplierName: editSupplier.trim() || "Vendor",
+          image: resolvedImg,
+          branchId: branchIdToSave,
+          branchName: branchNameToSave,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+      }
+
+      // Dual-sync to raw_materials if doc exists
+      try {
+        await updateDoc(doc(db, "users", currentUid, "raw_materials", editingItem.id), {
+          name: name,
+          category: editCategory.trim() || "Groceries",
+          unit: editUnit.trim() || "kg",
+          stockQuantity: stockQtyNum,
+          costPerUnit: rateNum,
+          packQuantity: packCapNum,
+          packUnit: packCapNum ? editPackUnit : null,
+          minStockAlert: minAlertNum,
+          supplierName: editSupplier.trim() || "Vendor",
+          image: resolvedImg,
+          branchId: branchIdToSave,
+          branchName: branchNameToSave,
+          updatedAtMs: Date.now()
+        });
+      } catch (_) {}
+
+      // Update selectedItemDetail if it was open
+      if (selectedItemDetail && selectedItemDetail.id === editingItem.id) {
+        setSelectedItemDetail((prev) => ({
+          ...prev,
+          name: name,
+          category: editCategory.trim(),
+          unit: editUnit.trim(),
+          stockQuantity: stockQtyNum,
+          costPerUnit: rateNum,
+          supplierName: editSupplier.trim(),
+          image: resolvedImg,
+          packCapacity: packCapNum,
+          packSubUnit: editPackUnit
+        }));
+      }
+
+      setSavingEdit(false);
+      setEditingItem(null);
+      alert(`✅ Item "${name}" updated successfully!`);
+    } catch (err) {
+      console.error("Save edited item error:", err);
+      setSavingEdit(false);
+      alert("Error updating item: " + err.message);
+    }
+  };
+
+  // Delete item from inventory
+  const handleDeleteItem = async () => {
+    if (!currentUid || !editingItem) return;
+    const confirmDelete = window.confirm(
+      `Are you sure you want to delete "${editingItem.name}" from inventory? This cannot be undone.`
+    );
+    if (!confirmDelete) return;
+
+    setSavingEdit(true);
+    try {
+      const invCol = isGlobalMode ? "global_inventory" : "inventory";
+      try {
+        await deleteDoc(doc(db, "users", currentUid, invCol, editingItem.id));
+      } catch (_) {}
+      try {
+        await deleteDoc(doc(db, "users", currentUid, "raw_materials", editingItem.id));
+      } catch (_) {}
+
+      if (selectedItemDetail && selectedItemDetail.id === editingItem.id) {
+        setSelectedItemDetail(null);
+      }
+      setSavingEdit(false);
+      setEditingItem(null);
+      alert(`🗑️ "${editingItem.name}" deleted successfully.`);
+    } catch (err) {
+      console.error("Delete item error:", err);
+      setSavingEdit(false);
+      alert("Error deleting item: " + err.message);
+    }
+  };
+
+  // Combine actual purchase records + stock valuation items for Table View (Branch Filtered)
+  const combinedRecords = useMemo(() => {
+    const branchPurchases = purchasesList.filter((p) => itemMatchesBranch(p, internalBranchId));
+    const branchShopProducts = shopProductsList.filter((p) => itemMatchesBranch(p, internalBranchId));
+
+    if (branchPurchases.length === 0) {
+      return branchShopProducts.map((it) => ({
         id: `stock-${it.id}`,
         billNo: "INITIAL-STOCK",
         itemName: it.name || it.itemName || "Stock Item",
-        category: it.category || (reportMode === "restaurant" ? "Groceries" : "Stock"),
-        type: reportMode,
-        qty: Number(it.stockQuantity != null ? it.stockQuantity : (it.quantity || 0)),
-        unit: it.unit || it.unitType || "unit",
-        rate: Number(it.costPerUnit != null ? it.costPerUnit : (it.purchasePrice || 0)),
-        totalAmount: Number(((Number(it.stockQuantity ?? it.quantity ?? 0)) * (Number(it.costPerUnit ?? it.purchasePrice ?? 0))).toFixed(2)),
+        category: it.category || "Stock",
+        type: "shop",
+        qty: Number(it.quantity != null ? it.quantity : (it.stockQuantity || 0)),
+        unit: it.unitType || it.unit || "unit",
+        rate: Number(it.purchasePrice != null ? it.purchasePrice : (it.costPerUnit || 0)),
+        totalAmount: Number(((Number(it.quantity ?? it.stockQuantity ?? 0)) * (Number(it.purchasePrice ?? it.costPerUnit ?? 0))).toFixed(2)),
         supplierName: it.supplierName || "Local Market",
         paymentMode: "Stock On Hand",
-        purchaseDate: it.updatedAtMs ? new Date(it.updatedAtMs).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
-        parsedDate: it.updatedAtMs ? new Date(it.updatedAtMs) : new Date(),
+        purchaseDate: it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+        parsedDate: it.updatedAt ? new Date(it.updatedAt) : new Date(),
         isStockOnHand: true,
-        image: it.image
+        image: it.image,
+        branchId: it.branchId,
+        branchName: it.branchName
       }));
     }
 
-    return modePurchases;
-  }, [purchasesList, rawMaterialsList, shopProductsList, reportMode]);
+    return branchPurchases;
+  }, [purchasesList, shopProductsList, internalBranchId, branches]);
 
   // Filtered Invoices/Records based on search, date range, and payment mode
   const filteredRecords = useMemo(() => {
@@ -820,7 +1115,8 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
         const matchSupplier = (rec.supplierName || "").toLowerCase().includes(q);
         const matchBill = (rec.billNo || "").toLowerCase().includes(q);
         const matchCat = (rec.category || "").toLowerCase().includes(q);
-        if (!matchName && !matchSupplier && !matchBill && !matchCat) return false;
+        const matchBranch = (rec.branchName || "").toLowerCase().includes(q);
+        if (!matchName && !matchSupplier && !matchBill && !matchCat && !matchBranch) return false;
       }
 
       if (paymentFilter !== "all" && rec.paymentMode !== paymentFilter) {
@@ -848,32 +1144,35 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
   }, [combinedRecords, searchQuery, dateFilter, customStartDate, customEndDate, paymentFilter]);
 
   // Aggregated Product/Stock Cards for the Card Grid View
-  // IMPORTANT: Only shows actual items purchased in the POS app / entered by user (Zero dummy items!)
+  // IMPORTANT: Single unified Shop Inventory (Branch Isolated & Zero dummy items!)
   const aggregatedCards = useMemo(() => {
-    // When in restaurant mode: include actual rawMaterialsList (without dummy items), 
-    // PLUS shopProductsList (inventory items from POS like Chicken, Chinthu chicken, TATA Salt, bread)
-    const baseItems = reportMode === "restaurant"
-      ? [...rawMaterialsList, ...shopProductsList]
-      : shopProductsList;
+    const branchShopProducts = shopProductsList.filter((p) => itemMatchesBranch(p, internalBranchId));
+    const branchRawMaterials = rawMaterialsList.filter((r) => itemMatchesBranch(r, internalBranchId));
+    const baseItems = [...branchShopProducts, ...branchRawMaterials];
+    const branchPurchases = purchasesList.filter((p) => itemMatchesBranch(p, internalBranchId));
     const cardsMap = new Map();
 
     baseItems.forEach((item) => {
       const name = (item.name || item.itemName || "").trim();
       if (!name) return;
       if (DUMMY_STARTER_NAMES.has(name.toLowerCase())) return; // Filter out dummy starter items!
-      const key = name.toLowerCase();
+      const key = (internalBranchId === "all" ? `${item.branchId || "main"}_` : "") + name.toLowerCase();
 
       if (!cardsMap.has(key)) {
         cardsMap.set(key, {
           id: item.id,
           name: name,
-          category: item.category || (reportMode === "restaurant" ? "Groceries" : "Stock"),
-          stockQuantity: item.stockQuantity != null ? Number(item.stockQuantity || 0) : Number(item.quantity || 0),
-          unit: item.unit || item.unitType || (reportMode === "restaurant" ? "kg" : "pcs"),
-          costPerUnit: item.costPerUnit != null ? Number(item.costPerUnit || 0) : Number(item.purchasePrice || 0),
+          category: item.category || "Stock",
+          stockQuantity: item.quantity != null ? Number(item.quantity || 0) : Number(item.stockQuantity || 0),
+          unit: item.unitType || item.unit || "pcs",
+          costPerUnit: item.purchasePrice != null ? Number(item.purchasePrice || 0) : Number(item.costPerUnit || 0),
           image: item.image || item.imageUrl || "",
           supplierName: item.supplierName || "",
-          minStockAlert: Number(item.minStockAlert || item.minAlertQuantity || 5),
+          minStockAlert: Number(item.minAlertQuantity || item.minStockAlert || 5),
+          packQuantity: item.packQuantity || null,
+          packUnit: item.packUnit || null,
+          branchId: item.branchId || internalBranchId,
+          branchName: item.branchName || branches.find(b => b.id === (item.branchId || internalBranchId))?.name || internalBranchName,
           totalPurchasedQty: 0,
           totalSpent: 0,
           suppliers: new Set(item.supplierName ? [item.supplierName] : []),
@@ -882,26 +1181,27 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       }
     });
 
-    // Populate purchase history and total bought from purchasesList
-    purchasesList.forEach((p) => {
+    // Populate purchase history and total bought from branchPurchases
+    branchPurchases.forEach((p) => {
       const pName = (p.itemName || "").trim();
       if (!pName) return;
       if (DUMMY_STARTER_NAMES.has(pName.toLowerCase())) return;
-      if (p.type && p.type !== reportMode) return;
 
-      const key = pName.toLowerCase();
+      const key = (internalBranchId === "all" ? `${p.branchId || "main"}_` : "") + pName.toLowerCase();
       let card = cardsMap.get(key);
       if (!card) {
         card = {
           id: p.id,
           name: pName,
-          category: p.category || (reportMode === "restaurant" ? "Groceries" : "Stock"),
+          category: p.category || "Stock",
           stockQuantity: Number(p.qty || 0),
-          unit: p.unit || (reportMode === "restaurant" ? "kg" : "pcs"),
+          unit: p.unit || "pcs",
           costPerUnit: Number(p.rate || 0),
           image: p.image || "",
           supplierName: p.supplierName || "",
           minStockAlert: 5,
+          branchId: p.branchId || internalBranchId,
+          branchName: p.branchName || branches.find(b => b.id === (p.branchId || internalBranchId))?.name || internalBranchName,
           totalPurchasedQty: 0,
           totalSpent: 0,
           suppliers: new Set(),
@@ -922,8 +1222,39 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       const totalSpend = c.totalSpent > 0 ? c.totalSpent : Number((c.stockQuantity * c.costPerUnit).toFixed(2));
       const suppliersArr = Array.from(c.suppliers).filter(Boolean);
 
+      // Find if this ingredient is used in any recipe
+      const matchingRecipeIng = userRecipes
+        .flatMap((r) => (r.ingredients || []).map((ing) => ({ ...ing, dishName: r.dishName || r.name })))
+        .find((ing) => {
+          const iName = (ing.name || "").toLowerCase().trim();
+          const cardName = c.name.toLowerCase().trim();
+          return iName === cardName || (ing.rawMaterialId && ing.rawMaterialId === c.id);
+        });
+
+      const packCapacity = c.packQuantity || matchingRecipeIng?.packQuantity || (c.name.toLowerCase().includes("milk") ? 500 : (c.unit === "kg" || c.unit === "L") ? 1000 : 500);
+      const packSubUnit = c.packUnit || matchingRecipeIng?.packUnit || (c.name.toLowerCase().includes("milk") ? "ml" : ["kg", "g"].includes(c.unit) ? "g" : ["l", "ml"].includes(c.unit) ? "ml" : "ml");
+
+      const stockFormatted = formatRawStockDisplay(
+        c.stockQuantity,
+        c.unit,
+        packCapacity,
+        packSubUnit
+      );
+
+      const totalPurchasedFormatted = formatRawStockDisplay(
+        totalPurchased,
+        c.unit,
+        packCapacity,
+        packSubUnit
+      );
+
       return {
         ...c,
+        packCapacity,
+        packSubUnit,
+        stockFormatted,
+        totalPurchasedFormatted,
+        recipeInfo: matchingRecipeIng || null,
         totalPurchasedQty: Number(totalPurchased.toFixed(2)),
         totalSpent: Math.round(totalSpend),
         suppliersList: suppliersArr.length > 0 ? suppliersArr : [c.supplierName || "Walk-in Supplier"],
@@ -938,12 +1269,13 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       return list.filter((c) =>
         c.name.toLowerCase().includes(q) ||
         c.category.toLowerCase().includes(q) ||
+        (c.branchName && c.branchName.toLowerCase().includes(q)) ||
         c.suppliersList.some((s) => s.toLowerCase().includes(q))
       );
     }
 
     return list.sort((a, b) => a.name.localeCompare(b.name));
-  }, [rawMaterialsList, shopProductsList, purchasesList, reportMode, searchQuery]);
+  }, [rawMaterialsList, shopProductsList, purchasesList, searchQuery, userRecipes, internalBranchId, branches]);
 
   // Summary Metrics
   const summary = useMemo(() => {
@@ -1017,7 +1349,8 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
   // Generate Clean Standalone HTML for Official Purchase Invoice Report
   const generatePurchaseReportPrintHtml = () => {
     const sName = userProfile.storeName || userProfile.businessName || "Turf Cafe";
-    const bName = userProfile.branchName || userProfile.branch || "";
+    const activeB = branches.find((b) => b.id === internalBranchId);
+    const bName = internalBranchId === "all" ? "All Outlets Combined" : (activeB?.name || internalBranchName || userProfile.branchName || "");
     const phone = userProfile.phone || userProfile.phoneNumber || "";
     const gstin = userProfile.gstNumber || userProfile.gstin || "";
     const address = userProfile.address || "";
@@ -1375,31 +1708,11 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       {/* Top Header Bar */}
       <div style={styles.header}>
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          {onBack && (
-            <button type="button" onClick={onBack} style={styles.backBtn}>
-              ← Back
-            </button>
-          )}
           <div>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
               <span style={{ fontSize: "22px" }}>📊</span>
-              <h1 style={styles.title}>
-                {reportMode === "restaurant" ? "Restaurant Grocery Purchase Report" : "Shop Stock Purchase Report"}
-              </h1>
-              <span style={{
-                ...styles.modeBadge,
-                backgroundColor: reportMode === "restaurant" ? "#fef3c7" : "#e0e7ff",
-                color: reportMode === "restaurant" ? "#b45309" : "#4338ca",
-                border: `1px solid ${reportMode === "restaurant" ? "#fde68a" : "#c7d2fe"}`
-              }}>
-                {reportMode === "restaurant" ? "🥘 Groceries & Kitchen Supplies" : "🏪 Shop Stock & Retail"}
-              </span>
+              <h1 style={styles.title}>Shop Inventory & Purchase Report</h1>
             </div>
-            <p style={styles.subtitle}>
-              {reportMode === "restaurant"
-                ? "Track food ingredients, groceries, spices & raw materials purchased to prepare dishes"
-                : "Track retail goods, inventory stocks & supplier purchases with date-wise reports"}
-            </p>
           </div>
         </div>
 
@@ -1420,55 +1733,6 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
         </div>
       </div>
 
-      {/* Mode Switcher Tabs: Restaurant Groceries vs Shop Stock */}
-      <div className="no-print" style={styles.modeTabsWrapper}>
-        <button
-          type="button"
-          onClick={() => setReportMode("restaurant")}
-          style={{
-            ...styles.modeTab,
-            backgroundColor: reportMode === "restaurant" ? "#16a34a" : "#ffffff",
-            color: reportMode === "restaurant" ? "#ffffff" : "#475569",
-            borderColor: reportMode === "restaurant" ? "#16a34a" : "#e2e8f0"
-          }}
-        >
-          <span style={{ fontSize: "16px" }}>🥘</span>
-          <span style={{ fontWeight: "700" }}>Restaurant Groceries & Food Ingredients</span>
-          <span style={{
-            fontSize: "11px",
-            padding: "2px 8px",
-            borderRadius: "12px",
-            backgroundColor: reportMode === "restaurant" ? "rgba(255,255,255,0.25)" : "#f1f5f9",
-            color: reportMode === "restaurant" ? "#ffffff" : "#64748b"
-          }}>
-            {aggregatedCards.length} Items
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setReportMode("shop")}
-          style={{
-            ...styles.modeTab,
-            backgroundColor: reportMode === "shop" ? "#4f46e5" : "#ffffff",
-            color: reportMode === "shop" ? "#ffffff" : "#475569",
-            borderColor: reportMode === "shop" ? "#4f46e5" : "#e2e8f0"
-          }}
-        >
-          <span style={{ fontSize: "16px" }}>🏪</span>
-          <span style={{ fontWeight: "700" }}>Shop Inventory & Product Stocks</span>
-          <span style={{
-            fontSize: "11px",
-            padding: "2px 8px",
-            borderRadius: "12px",
-            backgroundColor: reportMode === "shop" ? "rgba(255,255,255,0.25)" : "#f1f5f9",
-            color: reportMode === "shop" ? "#ffffff" : "#64748b"
-          }}>
-            {shopProductsList.length} Items
-          </span>
-        </button>
-      </div>
-
       {/* Summary Stat Cards */}
       <div style={styles.statsGrid}>
         <div style={styles.statCard}>
@@ -1482,11 +1746,11 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
 
         <div style={styles.statCard}>
           <div style={styles.statHeader}>
-            <span style={styles.statLabel}>{reportMode === "restaurant" ? "Groceries / Ingredients" : "Stock Items"}</span>
+            <span style={styles.statLabel}>Total Inventory Items</span>
             <span style={{ fontSize: "20px" }}>📦</span>
           </div>
-          <div style={styles.statValue}>{summary.itemCount}</div>
-          <div style={styles.statSub}>Items purchased in POS</div>
+          <div style={styles.statValue}>{aggregatedCards.length}</div>
+          <div style={styles.statSub}>Items in Shop Inventory</div>
         </div>
 
         <div style={styles.statCard}>
@@ -1495,7 +1759,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
             <span style={{ fontSize: "20px" }}>⚖️</span>
           </div>
           <div style={styles.statValue}>{summary.totalQty}</div>
-          <div style={styles.statSub}>{reportMode === "restaurant" ? "Kilograms / Litres / Units" : "Total Product Units"}</div>
+          <div style={styles.statSub}>Total Units / Weight in Inventory</div>
         </div>
 
         <div style={styles.statCard}>
@@ -1661,16 +1925,18 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
           ) : aggregatedCards.length === 0 ? (
             <div style={{ textAlign: "center", padding: "60px", backgroundColor: "#fff", borderRadius: "14px", border: "1px dashed #cbd5e1" }}>
               <div style={{ fontSize: "36px", marginBottom: "8px" }}>🛒</div>
-              <div style={{ fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>No Purchased Items Found</div>
+              <div style={{ fontSize: "16px", fontWeight: "800", color: "#0f172a" }}>
+                No Purchased Stock Found in {branches.find(b => b.id === internalBranchId)?.name || internalBranchName || "Selected Outlet"}
+              </div>
               <p style={{ color: "#64748b", fontSize: "13px", marginTop: "4px" }}>
-                Click "+ Record Purchase" to log your groceries or stock purchases!
+                This branch has its own isolated stock inventory. Click below to record purchases or stock specifically for this branch!
               </p>
               <button
                 type="button"
                 onClick={openNewPurchaseModal}
                 style={{ ...styles.recordBtn, marginTop: "12px", display: "inline-flex" }}
               >
-                ➕ Record First Purchase
+                ➕ Record First Purchase for {branches.find(b => b.id === internalBranchId)?.name || internalBranchName}
               </button>
             </div>
           ) : (
@@ -1708,8 +1974,30 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                           backgroundColor: isLow ? "rgba(220, 38, 38, 0.88)" : "rgba(15, 23, 42, 0.78)"
                         }}
                       >
-                        {isLow ? `⚠️ Low: ${item.stockQuantity} ${item.unit}` : `Stock: ${item.stockQuantity} ${item.unit}`}
+                        {isLow
+                          ? `⚠️ Low: ${item.stockFormatted?.formatted || `${item.stockQuantity} ${item.unit}`}`
+                          : `Stock: ${item.stockFormatted?.formatted || `${item.stockQuantity} ${item.unit}`}`}
                       </span>
+
+                      {/* Outlet Badge when viewing All Branches */}
+                      {internalBranchId === "all" && item.branchName && (
+                        <span
+                          style={{
+                            position: "absolute",
+                            top: "8px",
+                            left: "8px",
+                            backgroundColor: "rgba(79, 70, 229, 0.92)",
+                            color: "#ffffff",
+                            padding: "2px 7px",
+                            borderRadius: "6px",
+                            fontSize: "9.5px",
+                            fontWeight: "800",
+                            boxShadow: "0 2px 4px rgba(0,0,0,0.15)"
+                          }}
+                        >
+                          📍 {item.branchName}
+                        </span>
+                      )}
 
                       {/* Category Tag Top Right */}
                       <span
@@ -1737,34 +2025,40 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                           {item.name}
                         </h4>
 
-                        {/* Prominent Available Quantity display right under image */}
-                        <div style={{ marginTop: "4px", display: "flex", alignItems: "baseline", gap: "6px", flexWrap: "wrap" }}>
+                        {/* Medium Stock Available Row */}
+                        <div style={{ marginTop: "4px", display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "6px" }}>
                           <span style={{ fontSize: "11px", fontWeight: "700", color: "#64748b", textTransform: "uppercase" }}>
                             Available:
                           </span>
-                          <span style={{ fontSize: "15px", fontWeight: "900", color: isLow ? "#dc2626" : "#16a34a" }}>
-                            {item.stockQuantity} <span style={{ fontSize: "12px", fontWeight: "700" }}>{item.unit}</span>
+                          <span style={{ fontSize: "13.5px", fontWeight: "900", color: isLow ? "#dc2626" : "#16a34a" }}>
+                            {item.stockFormatted?.formatted || `${item.stockQuantity} ${item.unit}`}
                           </span>
-                          {item.measurementDetail && (
-                            <span style={{ fontSize: "10.5px", fontWeight: "700", color: "#64748b", backgroundColor: "#f1f5f9", padding: "1px 6px", borderRadius: "4px" }}>
-                              {item.measurementDetail}
+                        </div>
+
+                        {/* Breakdown Sub-detail */}
+                        {item.stockFormatted?.fractionSubUnits > 0 && item.stockFormatted.detail ? (
+                          <div style={{ fontSize: "10.5px", fontWeight: "600", color: "#64748b", marginTop: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={item.stockFormatted.detail}>
+                            ({item.stockFormatted.detail})
+                          </div>
+                        ) : item.measurementDetail ? (
+                          <div style={{ fontSize: "10.5px", fontWeight: "600", color: "#64748b", marginTop: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={item.measurementDetail}>
+                            ({item.measurementDetail})
+                          </div>
+                        ) : null}
+
+                        {/* Rate & Supplier Row */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11.5px", color: "#475569", fontWeight: "700", marginTop: "4px" }}>
+                          <span>Rate: <strong style={{ color: "#0f172a" }}>₹{item.costPerUnit || 0}</strong> / {item.unit}</span>
+                          {item.latestSupplier && (
+                            <span style={{ fontSize: "10.5px", color: "#94a3b8", maxWidth: "90px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={item.latestSupplier}>
+                              🚚 {item.latestSupplier}
                             </span>
                           )}
-                        </div>
-
-                        {/* Rate / Purchase Price */}
-                        <div style={{ fontSize: "12px", color: "#475569", fontWeight: "700", marginTop: "3px" }}>
-                          Rate: <strong style={{ color: "#0f172a" }}>₹{item.costPerUnit || 0}</strong> / {item.unit}
-                        </div>
-
-                        {/* Supplier Hint */}
-                        <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                          🚚 {item.latestSupplier}
                         </div>
                       </div>
 
                       {/* Card Bottom Action Bar */}
-                      <div style={{ marginTop: "10px", display: "flex", gap: "6px" }}>
+                      <div style={{ marginTop: "8px", display: "flex", gap: "6px" }}>
                         <button
                           type="button"
                           onClick={(e) => {
@@ -1779,7 +2073,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                             border: "1px solid #cbd5e1",
                             borderRadius: "7px",
                             fontWeight: "800",
-                            fontSize: "11px",
+                            fontSize: "11.5px",
                             cursor: "pointer"
                           }}
                         >
@@ -1800,7 +2094,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                             border: "1px solid #fed7aa",
                             borderRadius: "7px",
                             fontWeight: "800",
-                            fontSize: "11px",
+                            fontSize: "11.5px",
                             cursor: "pointer"
                           }}
                         >
@@ -1841,6 +2135,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                 <tr style={styles.thRow}>
                   <th style={styles.th}>Date</th>
                   <th style={styles.th}>Bill / Invoice</th>
+                  {internalBranchId === "all" && <th style={styles.th}>Outlet</th>}
                   <th style={styles.th}>{reportMode === "restaurant" ? "Grocery / Ingredient" : "Product / Stock"}</th>
                   <th style={styles.th}>Category</th>
                   <th style={{ ...styles.th, textAlign: "right" }}>Quantity</th>
@@ -1853,13 +2148,13 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
               <tbody>
                 {loading ? (
                   <tr>
-                    <td colSpan="9" style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
+                    <td colSpan={internalBranchId === "all" ? 10 : 9} style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
                       Loading purchase records...
                     </td>
                   </tr>
                 ) : filteredRecords.length === 0 ? (
                   <tr>
-                    <td colSpan="9" style={{ padding: "50px", textAlign: "center", color: "#94a3b8" }}>
+                    <td colSpan={internalBranchId === "all" ? 10 : 9} style={{ padding: "50px", textAlign: "center", color: "#94a3b8" }}>
                       <div style={{ fontSize: "32px", marginBottom: "6px" }}>🛒</div>
                       <div style={{ fontWeight: "700", fontSize: "14px", color: "#475569" }}>No purchase records found</div>
                       <div style={{ fontSize: "12px", marginTop: "4px" }}>Click "+ Record Purchase" above to log your groceries or stock purchases!</div>
@@ -1875,6 +2170,13 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                         <td style={styles.td}>
                           <span style={styles.billBadge}>{r.billNo || "DIRECT"}</span>
                         </td>
+                        {internalBranchId === "all" && (
+                          <td style={styles.td}>
+                            <span style={{ fontSize: "11px", fontWeight: "700", color: "#4338ca", backgroundColor: "#e0e7ff", padding: "2px 7px", borderRadius: "5px" }}>
+                              📍 {r.branchName || "Main Outlet"}
+                            </span>
+                          </td>
+                        )}
                         <td style={{ ...styles.td, fontWeight: "700", color: "#0f172a" }}>
                           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                             <img
@@ -1916,7 +2218,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
               {filteredRecords.length > 0 && (
                 <tfoot>
                   <tr style={{ backgroundColor: "#f8fafc", borderTop: "2px solid #cbd5e1", fontWeight: "800" }}>
-                    <td colSpan="4" style={{ padding: "12px 14px", textAlign: "right", color: "#334155" }}>
+                    <td colSpan={internalBranchId === "all" ? 5 : 4} style={{ padding: "12px 14px", textAlign: "right", color: "#334155" }}>
                       Grand Total ({filteredRecords.length} entries):
                     </td>
                     <td style={{ padding: "12px 14px", textAlign: "right", color: "#0f172a" }}>
@@ -1960,17 +2262,40 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                     {selectedItemDetail.name}
                   </h3>
                   <div style={{ fontSize: "12px", color: "#64748b", marginTop: "2px" }}>
-                    Category: <strong>{selectedItemDetail.category}</strong> • Base Unit: <strong>{selectedItemDetail.unit}</strong>
+                    Category: <strong>{selectedItemDetail.category}</strong> • Base Unit: <strong>{selectedItemDetail.unit}</strong> • Outlet: <strong style={{ color: "#4f46e5" }}>{selectedItemDetail.branchName || branches.find(b => b.id === internalBranchId)?.name || internalBranchName || "Main Outlet"}</strong>
                   </div>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedItemDetail(null)}
-                style={styles.closeBtn}
-              >
-                ✕
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <button
+                  type="button"
+                  onClick={() => openEditItemModal(selectedItemDetail)}
+                  style={{
+                    backgroundColor: "#eff6ff",
+                    color: "#2563eb",
+                    border: "1px solid #bfdbfe",
+                    padding: "6px 12px",
+                    borderRadius: "8px",
+                    fontWeight: "800",
+                    fontSize: "12px",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px"
+                  }}
+                  title="Edit item details, price, category & photo"
+                >
+                  <span>✏️</span>
+                  <span>Edit Item</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedItemDetail(null)}
+                  style={styles.closeBtn}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {/* Metrics Grid for this item */}
@@ -1980,17 +2305,22 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                   <div style={{ fontSize: "11px", fontWeight: "800", color: "#64748b", textTransform: "uppercase" }}>
                     Available Stock
                   </div>
-                  <div style={{ fontSize: "18px", fontWeight: "900", color: "#16a34a", marginTop: "2px" }}>
-                    {selectedItemDetail.stockQuantity} {selectedItemDetail.unit}
+                  <div style={{ fontSize: "16px", fontWeight: "900", color: "#16a34a", marginTop: "2px" }}>
+                    {selectedItemDetail.stockFormatted?.formatted || `${selectedItemDetail.stockQuantity} ${selectedItemDetail.unit}`}
                   </div>
+                  {selectedItemDetail.stockFormatted?.detail && (
+                    <div style={{ fontSize: "10.5px", color: "#64748b", fontWeight: "700", marginTop: "2px" }}>
+                      {selectedItemDetail.stockFormatted.detail}
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ backgroundColor: "#ffffff", padding: "10px", borderRadius: "10px", border: "1px solid #e2e8f0" }}>
                   <div style={{ fontSize: "11px", fontWeight: "800", color: "#64748b", textTransform: "uppercase" }}>
                     Total Purchased
                   </div>
-                  <div style={{ fontSize: "18px", fontWeight: "900", color: "#0284c7", marginTop: "2px" }}>
-                    {selectedItemDetail.totalPurchasedQty} {selectedItemDetail.unit}
+                  <div style={{ fontSize: "16px", fontWeight: "900", color: "#0284c7", marginTop: "2px" }}>
+                    {selectedItemDetail.totalPurchasedFormatted?.formatted || `${selectedItemDetail.totalPurchasedQty} ${selectedItemDetail.unit}`}
                   </div>
                 </div>
 
@@ -2023,6 +2353,160 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                   {selectedItemDetail.suppliersList.join(", ") || "Walk-in Supplier"}
                 </span>
               </div>
+
+              {/* Recipe Portion Yield & Shortage Reconcile (e.g. 1 packet 500ml = 50 coffees @ 10ml, actual 48 served = 2 cups / 20ml shortage) */}
+              {Boolean(selectedItemDetail.recipeInfo || ["milk", "coffe", "tea", "salt", "sugar", "chicken", "oil", "bread", "paneer", "lemon"].some(k => selectedItemDetail.name.toLowerCase().includes(k)) || ["packet", "box", "kg", "g", "l", "ml"].includes(String(selectedItemDetail.unit).toLowerCase())) && (() => {
+                const isMilk = selectedItemDetail.name.toLowerCase().includes("milk");
+                const isCoffee = selectedItemDetail.name.toLowerCase().includes("coffe");
+                
+                // Recipe portion parameters
+                const defaultCap = selectedItemDetail.packCapacity || (isMilk ? 500 : (selectedItemDetail.unit === "kg" || selectedItemDetail.unit === "L") ? 1000 : 500);
+                const defaultPortionQty = selectedItemDetail.recipeInfo?.quantity || (isCoffee ? 5 : isMilk ? 10 : 20);
+                const defaultPortionUnit = selectedItemDetail.packSubUnit || (isMilk ? "ml" : isCoffee ? "g" : (selectedItemDetail.unit === "kg" ? "g" : "ml"));
+
+                const yieldInfo = calculatePortionYieldAndShortage({
+                  packCapacity: defaultCap,
+                  portionQty: defaultPortionQty,
+                  packsUsed: reconcilePacksUsed,
+                  actualPortionsServed: reconcileActualServed,
+                  portionUnit: defaultPortionUnit,
+                  packCost: selectedItemDetail.costPerUnit || 50
+                });
+
+                const handleLogShortageWaste = async () => {
+                  if (!yieldInfo.isShortage) {
+                    alert("No shortage detected! Actual output matches or exceeds expected yield.");
+                    return;
+                  }
+                  setReconcilingShortage(true);
+                  try {
+                    const shortageBaseQty = Number((yieldInfo.shortageVolume / defaultCap).toFixed(4));
+                    await logWasteRecord({
+                      db,
+                      uid: currentUid,
+                      itemId: selectedItemDetail.id,
+                      itemType: "shop_product",
+                      wastedQty: shortageBaseQty > 0 ? shortageBaseQty : 0.01,
+                      reason: "Kitchen Spoilage / Rotten",
+                      notes: `Portion Yield Shortage Reconcile: 1 ${selectedItemDetail.unit} (${defaultCap} ${defaultPortionUnit}) should yield ${yieldInfo.totalExpectedPortions} cups. Actual obtained: ${yieldInfo.actualPortionsServed} cups. Shortage: ${yieldInfo.shortagePortions} cups (${yieldInfo.shortageVolume} ${defaultPortionUnit} / ₹${yieldInfo.shortageLossAmount}).`,
+                      unitCost: selectedItemDetail.costPerUnit,
+                      unitType: selectedItemDetail.unit,
+                      productName: selectedItemDetail.name,
+                      category: selectedItemDetail.category,
+                      image: selectedItemDetail.image
+                    });
+                    setReconcileSuccessMsg(`✅ Shortage of ${yieldInfo.shortagePortions} cups (${yieldInfo.shortageVolume} ${defaultPortionUnit} / ₹${yieldInfo.shortageLossAmount}) logged as kitchen waste and deducted from stock!`);
+                    setTimeout(() => setReconcileSuccessMsg(""), 6000);
+                  } catch (err) {
+                    alert("Error logging shortage: " + err.message);
+                  } finally {
+                    setReconcilingShortage(false);
+                  }
+                };
+
+                return (
+                  <div style={{ marginTop: "14px", backgroundColor: "#fffbeb", border: "1.5px solid #fde68a", borderRadius: "12px", padding: "14px 16px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <span style={{ fontSize: "18px" }}>☕</span>
+                        <h4 style={{ margin: 0, fontSize: "14px", fontWeight: "900", color: "#92400e" }}>
+                          Recipe Portion Yield & Shortage Reconcile
+                        </h4>
+                      </div>
+                      <span style={{ fontSize: "11px", fontWeight: "800", backgroundColor: "#fef3c7", color: "#b45309", padding: "3px 8px", borderRadius: "6px" }}>
+                        {selectedItemDetail.recipeInfo ? `Recipe: ${selectedItemDetail.recipeInfo.dishName}` : "Active Ingredient"}
+                      </span>
+                    </div>
+
+                    <div style={{ fontSize: "12px", color: "#78350f", marginBottom: "12px", lineHeight: "1.4" }}>
+                      Standard Formula: <strong>1 {selectedItemDetail.unit} ({defaultCap} {defaultPortionUnit})</strong> = <strong>{yieldInfo.yieldPerPack} cups/portions</strong> (at {defaultPortionQty} {defaultPortionUnit} per cup).
+                    </div>
+
+                    {/* Inputs */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+                      <div style={{ backgroundColor: "#ffffff", padding: "10px", borderRadius: "8px", border: "1px solid #fed7aa" }}>
+                        <label style={{ display: "block", fontSize: "11px", fontWeight: "800", color: "#9a3412", marginBottom: "4px" }}>
+                          📦 Packets / Units Opened:
+                        </label>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <input
+                            type="number"
+                            min="0.5"
+                            step="0.5"
+                            value={reconcilePacksUsed}
+                            onChange={(e) => setReconcilePacksUsed(Math.max(0.1, parseFloat(e.target.value) || 1))}
+                            style={{ width: "70px", padding: "4px 8px", borderRadius: "6px", border: "1px solid #d97706", fontWeight: "800", fontSize: "13px" }}
+                          />
+                          <span style={{ fontSize: "12px", fontWeight: "700", color: "#475569" }}>
+                            {selectedItemDetail.unit} ({yieldInfo.totalVolumeOrWeight} {defaultPortionUnit})
+                          </span>
+                        </div>
+                      </div>
+
+                      <div style={{ backgroundColor: "#ffffff", padding: "10px", borderRadius: "8px", border: "1px solid #fed7aa" }}>
+                        <label style={{ display: "block", fontSize: "11px", fontWeight: "800", color: "#9a3412", marginBottom: "4px" }}>
+                          ☕ Actual Cups / Portions Served:
+                        </label>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <input
+                            type="number"
+                            min="0"
+                            value={reconcileActualServed}
+                            onChange={(e) => setReconcileActualServed(Math.max(0, parseInt(e.target.value, 10) || 0))}
+                            style={{ width: "70px", padding: "4px 8px", borderRadius: "6px", border: "1px solid #d97706", fontWeight: "800", fontSize: "13px" }}
+                          />
+                          <span style={{ fontSize: "12px", fontWeight: "700", color: "#475569" }}>
+                            cups (Expected: {yieldInfo.totalExpectedPortions} cups)
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Shortage Result */}
+                    {yieldInfo.isShortage ? (
+                      <div style={{ backgroundColor: "#fef2f2", border: "1px solid #fecaca", borderRadius: "8px", padding: "10px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
+                        <div>
+                          <div style={{ fontSize: "13px", fontWeight: "900", color: "#b91c1c" }}>
+                            ⚠️ Shortage: {yieldInfo.shortagePortions} cups ({yieldInfo.shortageVolume} {defaultPortionUnit})
+                          </div>
+                          <div style={{ fontSize: "11px", fontWeight: "700", color: "#7f1d1d", marginTop: "2px" }}>
+                            {yieldInfo.shortagePercent}% Loss Variance • Financial Loss: ₹{yieldInfo.shortageLossAmount}
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={reconcilingShortage}
+                          onClick={handleLogShortageWaste}
+                          style={{
+                            backgroundColor: "#dc2626",
+                            color: "#ffffff",
+                            border: "none",
+                            padding: "7px 14px",
+                            borderRadius: "8px",
+                            fontSize: "12px",
+                            fontWeight: "800",
+                            cursor: reconcilingShortage ? "not-allowed" : "pointer",
+                            boxShadow: "0 2px 4px rgba(220, 38, 38, 0.25)"
+                          }}
+                        >
+                          {reconcilingShortage ? "Reconciling..." : "📝 Reconcile & Deduct Shortage as Waste"}
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ backgroundColor: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "8px", padding: "8px 12px", fontSize: "12px", fontWeight: "800", color: "#166534" }}>
+                        ✅ Perfect Yield! {reconcileActualServed} cups obtained. Zero shortage variance.
+                      </div>
+                    )}
+
+                    {reconcileSuccessMsg && (
+                      <div style={{ backgroundColor: "#dcfce7", border: "1px solid #86efac", borderRadius: "8px", padding: "8px 12px", fontSize: "12px", fontWeight: "800", color: "#15803d", marginTop: "8px" }}>
+                        {reconcileSuccessMsg}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Purchase History / Invoices Table for this specific item */}
@@ -2031,26 +2515,49 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                 <h4 style={{ margin: 0, fontSize: "14px", fontWeight: "800", color: "#0f172a" }}>
                   Purchase Invoices & Log for "{selectedItemDetail.name}"
                 </h4>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const target = selectedItemDetail;
-                    setSelectedItemDetail(null);
-                    openPurchaseForSpecificItem(target);
-                  }}
-                  style={{
-                    backgroundColor: "#16a34a",
-                    color: "#fff",
-                    border: "none",
-                    padding: "6px 12px",
-                    borderRadius: "8px",
-                    fontWeight: "800",
-                    fontSize: "12px",
-                    cursor: "pointer"
-                  }}
-                >
-                  ➕ Record New Purchase
-                </button>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    type="button"
+                    onClick={() => openEditItemModal(selectedItemDetail)}
+                    style={{
+                      backgroundColor: "#eff6ff",
+                      color: "#2563eb",
+                      border: "1px solid #bfdbfe",
+                      padding: "6px 12px",
+                      borderRadius: "8px",
+                      fontWeight: "800",
+                      fontSize: "12px",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "4px"
+                    }}
+                  >
+                    <span>✏️</span>
+                    <span>Edit Item</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const target = selectedItemDetail;
+                      setSelectedItemDetail(null);
+                      openPurchaseForSpecificItem(target);
+                    }}
+                    style={{
+                      backgroundColor: "#16a34a",
+                      color: "#fff",
+                      border: "none",
+                      padding: "6px 12px",
+                      borderRadius: "8px",
+                      fontWeight: "800",
+                      fontSize: "12px",
+                      cursor: "pointer"
+                    }}
+                  >
+                    ➕ Record New Purchase
+                  </button>
+                </div>
               </div>
 
               {selectedItemDetail.history.length === 0 ? (
@@ -2104,6 +2611,364 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
       )}
 
       {/* ============================================================== */}
+      {/* 3B. EDIT ITEM MODAL ("dei apram ithula oru edit optionum set panniru da") */}
+      {/* ============================================================== */}
+      {editingItem && (
+        <div style={styles.modalOverlay} onClick={() => !savingEdit && setEditingItem(null)}>
+          <div
+            style={{
+              ...styles.modalCard,
+              maxWidth: "640px"
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div style={styles.modalHeader}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <img
+                  src={editImage.trim() || getGroceryImage(editItemName, editCategory)}
+                  alt="Thumbnail"
+                  style={{ width: "42px", height: "42px", borderRadius: "8px", objectFit: "cover", border: "1px solid #cbd5e1" }}
+                  onError={(e) => {
+                    e.target.onerror = null;
+                    e.target.src = getGroceryImage("grocery", "general");
+                  }}
+                />
+                <div>
+                  <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "800", color: "#0f172a" }}>
+                    ✏️ Edit Item: {editingItem.name}
+                  </h3>
+                  <div style={{ fontSize: "12px", color: "#64748b", marginTop: "2px" }}>
+                    Update item name, category, stock on hand, price, pack size or photo.
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => !savingEdit && setEditingItem(null)}
+                style={styles.closeBtn}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditedItem} style={{ padding: "20px" }}>
+              {/* Item Name & Category */}
+              <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1.1fr", gap: "12px", marginBottom: "14px" }}>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                    <label style={styles.modalLabel}>Item Name *</label>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenWebImageSearch(editItemName, "edit")}
+                      style={{
+                        backgroundColor: "#e0e7ff",
+                        color: "#4338ca",
+                        border: "1px solid #c7d2fe",
+                        padding: "2px 8px",
+                        borderRadius: "6px",
+                        fontWeight: "800",
+                        fontSize: "11px",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px"
+                      }}
+                      title="Search web images for this product"
+                    >
+                      <span>🔍</span>
+                      <span>Search web</span>
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    required
+                    value={editItemName}
+                    onChange={(e) => setEditItemName(e.target.value)}
+                    placeholder="e.g. Cheese, Coffee Powder, Milk"
+                    style={styles.modalInput}
+                  />
+                </div>
+
+                {/* Category with inline add */}
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                    <label style={styles.modalLabel}>Category *</label>
+                    <button
+                      type="button"
+                      onClick={() => setShowEditAddCategory(!showEditAddCategory)}
+                      style={{
+                        background: "transparent",
+                        border: "none",
+                        color: "#4338ca",
+                        fontSize: "11.5px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                        padding: "0"
+                      }}
+                    >
+                      {showEditAddCategory ? "✕ Cancel" : "+ Add"}
+                    </button>
+                  </div>
+
+                  {!showEditAddCategory ? (
+                    <select
+                      value={editCategory}
+                      onChange={(e) => {
+                        if (e.target.value === "__NEW__") {
+                          setShowEditAddCategory(true);
+                        } else {
+                          setEditCategory(e.target.value);
+                        }
+                      }}
+                      style={styles.modalInput}
+                    >
+                      {availableCategories.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                      <option value="__NEW__">➕ Add New Category...</option>
+                    </select>
+                  ) : (
+                    <div style={{ display: "flex", gap: "4px" }}>
+                      <input
+                        type="text"
+                        value={newEditCategoryInput}
+                        onChange={(e) => setNewEditCategoryInput(e.target.value)}
+                        placeholder="New category..."
+                        style={{ ...styles.modalInput, flex: 1, padding: "7px 9px", fontSize: "12px" }}
+                      />
+                      <button
+                        type="button"
+                        onClick={handleAddNewEditCategory}
+                        style={{
+                          backgroundColor: "#4f46e5",
+                          color: "#fff",
+                          border: "none",
+                          padding: "0 10px",
+                          borderRadius: "6px",
+                          fontWeight: "800",
+                          fontSize: "12px",
+                          cursor: "pointer"
+                        }}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Stock Quantity & Unit */}
+              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: "12px", marginBottom: "14px" }}>
+                <div>
+                  <label style={styles.modalLabel}>Available Stock Quantity *</label>
+                  <input
+                    type="number"
+                    step="any"
+                    required
+                    value={editStockQty}
+                    onChange={(e) => setEditStockQty(e.target.value)}
+                    placeholder="e.g. 10 or 3.5"
+                    style={{ ...styles.modalInput, fontWeight: "700" }}
+                  />
+                  <span style={{ fontSize: "11px", color: "#64748b" }}>
+                    Manual correction / stock on hand
+                  </span>
+                </div>
+
+                <div>
+                  <label style={styles.modalLabel}>Base Unit *</label>
+                  <select
+                    value={editUnit}
+                    onChange={(e) => setEditUnit(e.target.value)}
+                    style={styles.modalInput}
+                  >
+                    <option value="kg">kg (Kilograms)</option>
+                    <option value="g">g (Grams)</option>
+                    <option value="L">L (Litres)</option>
+                    <option value="ml">ml (Millilitres)</option>
+                    <option value="packet">packet (Packets)</option>
+                    <option value="box">box (Boxes)</option>
+                    <option value="pcs">pcs (Pieces)</option>
+                    <option value="bottle">bottle (Bottles)</option>
+                    <option value="can">can (Cans)</option>
+                    <option value="tin">tin (Tins)</option>
+                    <option value="unit">unit (General Units)</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Rate & Min Stock Alert */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "14px" }}>
+                <div>
+                  <label style={styles.modalLabel}>Rate / Cost per {editUnit} (₹) *</label>
+                  <input
+                    type="number"
+                    step="any"
+                    required
+                    value={editRate}
+                    onChange={(e) => setEditRate(e.target.value)}
+                    placeholder="e.g. 50"
+                    style={styles.modalInput}
+                  />
+                </div>
+
+                <div>
+                  <label style={styles.modalLabel}>Low Stock Alert Limit</label>
+                  <input
+                    type="number"
+                    step="any"
+                    value={editMinAlert}
+                    onChange={(e) => setEditMinAlert(e.target.value)}
+                    placeholder="e.g. 5"
+                    style={styles.modalInput}
+                  />
+                  <span style={{ fontSize: "11px", color: "#64748b" }}>
+                    Card shows ⚠️ Low badge when at/below this
+                  </span>
+                </div>
+              </div>
+
+              {/* Pack Size & Capacity (for packets/boxes) */}
+              {["packet", "pkt", "pack", "box", "bottle", "can", "tin", "pcs"].includes(editUnit.toLowerCase()) && (
+                <div style={{ backgroundColor: "#f8fafc", padding: "12px", borderRadius: "8px", border: "1px solid #e2e8f0", marginBottom: "14px" }}>
+                  <label style={{ ...styles.modalLabel, color: "#0f172a", marginBottom: "4px" }}>
+                    📦 Pack Capacity / Measurement Size (Optional for Yield Calculation):
+                  </label>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "13px", fontWeight: "700", color: "#475569" }}>1 {editUnit} =</span>
+                    <input
+                      type="number"
+                      step="any"
+                      value={editPackCapacity}
+                      onChange={(e) => setEditPackCapacity(e.target.value)}
+                      placeholder="e.g. 500"
+                      style={{ width: "90px", padding: "6px 8px", borderRadius: "6px", border: "1px solid #cbd5e1", fontWeight: "700", fontSize: "13px" }}
+                    />
+                    <select
+                      value={editPackUnit}
+                      onChange={(e) => setEditPackUnit(e.target.value)}
+                      style={{ padding: "6px 10px", borderRadius: "6px", border: "1px solid #cbd5e1", fontWeight: "700", fontSize: "13px" }}
+                    >
+                      <option value="ml">ml (Millilitres)</option>
+                      <option value="g">g (Grams)</option>
+                      <option value="pcs">pcs (Pieces)</option>
+                      <option value="L">L (Litres)</option>
+                    </select>
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#64748b", marginTop: "4px" }}>
+                    Example: 1 packet milk = 500 ml. Used for calculating recipe yields & multi-unit stock display.
+                  </div>
+                </div>
+              )}
+
+              {/* Supplier & Image */}
+              <div style={{ marginBottom: "14px" }}>
+                <label style={styles.modalLabel}>Default Supplier / Vendor Name</label>
+                <input
+                  type="text"
+                  value={editSupplier}
+                  onChange={(e) => setEditSupplier(e.target.value)}
+                  placeholder="e.g. Metro Cash & Carry, Local Mart"
+                  style={styles.modalInput}
+                />
+              </div>
+
+              {/* Photo & Search Web */}
+              <div style={{ marginBottom: "16px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                  <label style={styles.modalLabel}>Product Photo (Image URL or Search Web):</label>
+                  <button
+                    type="button"
+                    onClick={() => handleOpenWebImageSearch(editItemName, "edit")}
+                    style={{
+                      backgroundColor: "#e0e7ff",
+                      color: "#4338ca",
+                      border: "1px solid #c7d2fe",
+                      padding: "2px 8px",
+                      borderRadius: "6px",
+                      fontWeight: "800",
+                      fontSize: "11px",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "4px"
+                    }}
+                  >
+                    <span>🌐</span>
+                    <span>Search Web Images</span>
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                  <img
+                    src={editImage.trim() || getGroceryImage(editItemName, editCategory)}
+                    alt="Preview"
+                    style={{ width: "48px", height: "48px", borderRadius: "8px", objectFit: "cover", border: "1.5px solid #cbd5e1" }}
+                    onError={(e) => {
+                      e.target.onerror = null;
+                      e.target.src = getGroceryImage("grocery", "general");
+                    }}
+                  />
+                  <input
+                    type="text"
+                    value={editImage}
+                    onChange={(e) => setEditImage(e.target.value)}
+                    placeholder="Paste image URL or click 'Search web'..."
+                    style={{ ...styles.modalInput, flex: 1 }}
+                  />
+                </div>
+              </div>
+
+              {/* Actions: Delete on Left, Cancel & Save on Right */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid #e2e8f0", paddingTop: "14px" }}>
+                <button
+                  type="button"
+                  disabled={savingEdit}
+                  onClick={handleDeleteItem}
+                  style={{
+                    padding: "8px 14px",
+                    backgroundColor: "#fef2f2",
+                    border: "1px solid #fecaca",
+                    borderRadius: "8px",
+                    fontSize: "12px",
+                    fontWeight: "800",
+                    color: "#dc2626",
+                    cursor: savingEdit ? "not-allowed" : "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px"
+                  }}
+                  title="Remove this item from inventory"
+                >
+                  <span>🗑️</span>
+                  <span>Delete Item</span>
+                </button>
+
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button
+                    type="button"
+                    disabled={savingEdit}
+                    onClick={() => setEditingItem(null)}
+                    style={styles.modalCancelBtn}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingEdit}
+                    style={styles.modalSubmitBtn}
+                  >
+                    {savingEdit ? "Saving..." : "✓ Save Changes"}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
       {/* 4. RECORD PURCHASE MODAL with Category Dropdown & Add Option & Search Web Image */}
       {/* ============================================================== */}
       {showAddModal && (
@@ -2112,10 +2977,28 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
             <div style={styles.modalHeader}>
               <div>
                 <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "800", color: "#0f172a" }}>
-                  {reportMode === "restaurant" ? "➕ Record Grocery / Ingredient Purchase" : "➕ Record Product Stock Purchase"}
+                  ➕ Record Purchase & Stock In
                 </h3>
                 <div style={{ fontSize: "12px", color: "#64748b", marginTop: "2px" }}>
-                  Stock will automatically increase in your inventory upon recording.
+                  Stock will automatically increase in your shop inventory upon recording.
+                </div>
+                <div style={{
+                  marginTop: "6px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  backgroundColor: "#eff6ff",
+                  color: "#1d4ed8",
+                  padding: "3px 10px",
+                  borderRadius: "6px",
+                  fontSize: "11px",
+                  fontWeight: "800",
+                  border: "1px solid #bfdbfe"
+                }}>
+                  <span>📍 Tagged to Outlet:</span>
+                  <span>
+                    {branches.find(b => b.id === (internalBranchId !== "all" ? internalBranchId : (branches[0]?.id || "main_branch")))?.name || internalBranchName}
+                  </span>
                 </div>
               </div>
               <button
@@ -2139,9 +3022,9 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                   style={styles.modalInput}
                 >
                   <option value="">-- Or enter new item below --</option>
-                  {[...rawMaterialsList, ...shopProductsList].map((it) => (
+                  {[...shopProductsList, ...rawMaterialsList].filter((it) => itemMatchesBranch(it, internalBranchId)).map((it) => (
                     <option key={it.id} value={it.id}>
-                      {it.name || it.itemName} ({it.category || "Stock"}) - In Stock: {it.stockQuantity ?? it.quantity ?? 0} {it.unit || it.unitType || "unit"}
+                      {it.name || it.itemName} ({it.category || "Stock"}) - In Stock: {it.quantity ?? it.stockQuantity ?? 0} {it.unitType || it.unit || "unit"}
                     </option>
                   ))}
                 </select>
@@ -2180,7 +3063,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                     required
                     value={formItemName}
                     onChange={(e) => setFormItemName(e.target.value)}
-                    placeholder={reportMode === "restaurant" ? "e.g. Chicken, Milk, Coffee, Oil" : "e.g. Bluetooth Speaker, Tea Box"}
+                    placeholder="e.g. Chicken, Milk, Coffee Powder, Bread, Rice"
                     style={styles.modalInput}
                   />
                 </div>
@@ -3010,7 +3893,11 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                     <div
                       key={idx}
                       onClick={() => {
-                        setFormImage(imgUrl);
+                        if (webSearchTarget === "edit") {
+                          setEditImage(imgUrl);
+                        } else {
+                          setFormImage(imgUrl);
+                        }
                         setWebSearchModalOpen(false);
                       }}
                       style={{
@@ -3018,7 +3905,7 @@ export default function PurchaseReport({ userProfile = {}, isRestaurant = false,
                         height: "110px",
                         borderRadius: "8px",
                         overflow: "hidden",
-                        border: formImage === imgUrl ? "2.5px solid #16a34a" : "1px solid #e2e8f0",
+                        border: (webSearchTarget === "edit" ? editImage === imgUrl : formImage === imgUrl) ? "2.5px solid #16a34a" : "1px solid #e2e8f0",
                         cursor: "pointer",
                         backgroundColor: "#ffffff",
                         boxShadow: "0 1px 3px rgba(0, 0, 0, 0.06)",
@@ -3264,7 +4151,7 @@ const styles = {
   // Card Grid Styles (like Menu Items)
   productGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))",
+    gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
     gap: "16px",
     paddingBottom: "30px"
   },
@@ -3279,7 +4166,7 @@ const styles = {
   },
   imageWrapper: {
     position: "relative",
-    height: "145px",
+    height: "125px",
     width: "100%",
     backgroundColor: "#f1f5f9"
   },
@@ -3300,10 +4187,10 @@ const styles = {
     boxShadow: "0 2px 4px rgba(0,0,0,0.2)"
   },
   productDetails: {
-    padding: "12px",
+    padding: "10px 12px",
     display: "flex",
     flexDirection: "column",
-    gap: "4px",
+    gap: "3px",
     flex: 1,
     justifyContent: "space-between"
   },
