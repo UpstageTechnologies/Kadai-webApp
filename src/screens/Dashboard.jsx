@@ -13,13 +13,16 @@ import WasteManagement from "./WasteManagement";
 import PurchaseReport from "./PurchaseReport";
 import FeedbackScreen from "./FeedbackScreen";
 import BranchManagement from "./BranchManagement";
+import RoomManagement from "./medical/RoomManagement";
+import LabManagement from "./medical/LabManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
 import { subscribeWasteRecords, calculateWasteStats } from "../utils/wasteService";
 import { deductRecipeStock } from "../utils/recipeStockService";
 
-export default function Dashboard({ initialTab = "sales" }) {
+export default function Dashboard({ initialTab = "sales", pharmacistMode = false }) {
+  const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
   const [activeTab, setActiveTab] = useState(initialTab === "dashboard" ? "sales" : initialTab);
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState(["All"]);
@@ -35,6 +38,29 @@ export default function Dashboard({ initialTab = "sales" }) {
   // Restaurant Mode Detection
   const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
   const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
+
+  // Medical Mode Detection
+  const isMedical = (shopType || "").trim().toLowerCase() === "medical";
+
+  // Staff Role & Mode Detection
+  const isStaff = localStorage.getItem("is_staff") === "true";
+  const staffRole = (localStorage.getItem("staff_role") || "").toLowerCase();
+  const staffName = localStorage.getItem("staff_name") || "Staff Member";
+  const staffId = localStorage.getItem("staff_id") || "";
+  const isPharmacist = pharmacistMode || (isStaff && staffRole === "pharmacist");
+  const isWardIncharge = isStaff && (staffRole === "ward_incharge" || staffRole === "ward-incharge" || staffRole === "wardincharge");
+  const isLabTechnician = isStaff && (staffRole === "lab_technician" || staffRole === "lab-technician" || staffRole === "labtechnician");
+
+  // Strict role-based tab access enforcement
+  useEffect(() => {
+    if (isWardIncharge && activeTab !== "rooms") {
+      setActiveTab("rooms");
+    } else if (isLabTechnician && activeTab !== "lab") {
+      setActiveTab("lab");
+    } else if (isPharmacist && activeTab !== "sales" && activeTab !== "inventory") {
+      setActiveTab("sales");
+    }
+  }, [isWardIncharge, isLabTechnician, isPharmacist, activeTab]);
 
   // Shop Mode: Local vs Global
   const [appMode, setAppMode] = useState(() => localStorage.getItem("app_mode") || "local");
@@ -2501,10 +2527,10 @@ export default function Dashboard({ initialTab = "sales" }) {
               ...styles.navTabBtn,
               ...(activeTab === "sales" ? styles.navTabBtnActive : {})
             }}
-            title={isRestaurant ? "POS Billing & Orders" : "Sales & Billing"}
+            title={isMedical ? "Pharmacy POS & Medicine Dispensing" : (isRestaurant ? "POS Billing & Orders" : "Sales & Billing")}
           >
-            <span style={{ fontSize: "14px" }}>🧾</span>
-            <span>{isRestaurant ? "Billing" : (isGlobalMode ? "Global Sales" : "Sales")}</span>
+            <span style={{ fontSize: "14px" }}>{isMedical ? "💊" : "🧾"}</span>
+            <span>{isMedical ? "Pharmacy POS" : (isRestaurant ? "Billing" : (isGlobalMode ? "Global Sales" : "Sales"))}</span>
           </button>
 
           {/* 2. Menu Items / Inventory */}
@@ -2515,51 +2541,107 @@ export default function Dashboard({ initialTab = "sales" }) {
               ...styles.navTabBtn,
               ...(activeTab === "inventory" ? styles.navTabBtnActive : {})
             }}
-            title={isRestaurant ? "Food items, categories & pricing" : "Inventory management"}
+            title={isMedical ? "Medicine inventory, tablets, syrups & stock" : (isRestaurant ? "Food items, categories & pricing" : "Inventory management")}
           >
             <span style={{ fontSize: "14px" }}>📦</span>
-            <span>{isRestaurant ? "Menu Items" : (isGlobalMode ? "Global Inventory" : "Inventory")}</span>
+            <span>{isMedical ? "Medicine Stock" : (isRestaurant ? "Menu Items" : (isGlobalMode ? "Global Inventory" : "Inventory"))}</span>
           </button>
 
-          {/* 3. Online Orders & Delivery */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("orders")}
-            style={{
-              ...styles.navTabBtn,
-              ...(activeTab === "orders" ? styles.navTabBtnActive : {})
-            }}
-            title="Customer online orders & live delivery dispatch"
-          >
-            <span style={{ fontSize: "14px" }}>🌐</span>
-            <span>Online</span>
-            {newOnlineOrdersCount > 0 ? (
-              <span style={styles.navBadgeRed}>
-                {newOnlineOrdersCount}
-              </span>
-            ) : onlineOrdersList.length > 0 ? (
-              <span style={styles.navBadgeGray}>
-                {onlineOrdersList.length}
-              </span>
-            ) : null}
-          </button>
+          {/* MEDICAL: Rooms & Beds (Visible to Owner, hidden from Pharmacist) */}
+          {isMedical && !isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("rooms")}
+              style={{
+                ...styles.navTabBtn,
+                ...(activeTab === "rooms" ? styles.navTabBtnActive : {}),
+              }}
+              title="Hospital Room Inventory, Daily Charges & Bed Availability"
+            >
+              <span style={{ fontSize: "14px" }}>🏥</span>
+              <span>Rooms & Beds</span>
+            </button>
+          )}
 
-          {/* 4. Purchase Report (Shop Stocks & Restaurant Groceries) */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("purchases")}
-            style={{
-              ...styles.navTabBtn,
-              ...(activeTab === "purchases" ? styles.navTabBtnActive : {})
-            }}
-            title={isRestaurant ? "Restaurant groceries, raw materials & food supplies purchase report" : "Shop product stocks & inventory purchase report"}
-          >
-            <span style={{ fontSize: "14px" }}>📊</span>
-            <span>Purchase Report</span>
-          </button>
+          {/* MEDICAL: Lab Tests & Pricing (Visible to Owner, hidden from Pharmacist) */}
+          {isMedical && !isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("lab")}
+              style={{
+                ...styles.navTabBtn,
+                ...(activeTab === "lab" ? styles.navTabBtnActive : {}),
+              }}
+              title="Laboratory Services, Diagnostic Tests & Service Pricing"
+            >
+              <span style={{ fontSize: "14px" }}>🧪</span>
+              <span>Lab Tests</span>
+            </button>
+          )}
 
+          {/* 3. Online Orders & Delivery (Not shown to Pharmacist) */}
+          {!isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("orders")}
+              style={{
+                ...styles.navTabBtn,
+                ...(activeTab === "orders" ? styles.navTabBtnActive : {})
+              }}
+              title="Customer online orders & live delivery dispatch"
+            >
+              <span style={{ fontSize: "14px" }}>🌐</span>
+              <span>Online</span>
+              {newOnlineOrdersCount > 0 ? (
+                <span style={styles.navBadgeRed}>
+                  {newOnlineOrdersCount}
+                </span>
+              ) : onlineOrdersList.length > 0 ? (
+                <span style={styles.navBadgeGray}>
+                  {onlineOrdersList.length}
+                </span>
+              ) : null}
+            </button>
+          )}
+
+          {/* 4. Purchase Report (Shop Stocks & Restaurant Groceries - Not shown to Pharmacist) */}
+          {!isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("purchases")}
+              style={{
+                ...styles.navTabBtn,
+                ...(activeTab === "purchases" ? styles.navTabBtnActive : {})
+              }}
+              title={isRestaurant ? "Restaurant groceries, raw materials & food supplies purchase report" : "Shop product stocks & inventory purchase report"}
+            >
+              <span style={{ fontSize: "14px" }}>📊</span>
+              <span>Purchase Report</span>
+            </button>
+          )}
+
+          {/* 5. Waste & Spoilage Management (Icon Only - Not shown to Pharmacist) */}
+          {!isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("waste")}
+              style={{
+                ...styles.navTabBtn,
+                ...(activeTab === "waste" ? styles.navTabBtnActive : {}),
+                padding: "7px 11px"
+              }}
+              title={isRestaurant ? "Food waste, kitchen spoilage & loss calculation" : "Product waste & inventory shrinkage tracking"}
+            >
+              <span style={{ fontSize: "16px" }}>🗑️</span>
+              {wasteStats.todayLoss > 0 && (
+                <span style={styles.navBadgeRed}>
+                  ₹{Math.round(wasteStats.todayLoss)}
+                </span>
+              )}
+            </button>
+          )}
           {/* RESTAURANT OPERATIONS */}
-          {isRestaurant && (
+          {isRestaurant && !isPharmacist && (
             <button
               type="button"
               onClick={() => setActiveTab("recipes")}
@@ -2577,7 +2659,45 @@ export default function Dashboard({ initialTab = "sales" }) {
 
         {/* Right Area: Held Orders, Owner Alerts & Profile */}
         <div style={styles.navRightGroup}>
+          {isPharmacist && (
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <div style={{
+                backgroundColor: "#e0f2fe",
+                color: "#0369a1",
+                padding: "6px 12px",
+                borderRadius: "8px",
+                fontSize: "12px",
+                fontWeight: "700",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px"
+              }}>
+                <span>💊 Pharmacist:</span>
+                <span>{staffName}</span>
+                {staffId && <span style={{ opacity: 0.8 }}>({staffId})</span>}
+              </div>
+              <button
+                type="button"
+                onClick={handleLogout}
+                style={{
+                  backgroundColor: "#fee2e2",
+                  color: "#dc2626",
+                  border: "none",
+                  borderRadius: "8px",
+                  padding: "6px 12px",
+                  fontSize: "12px",
+                  fontWeight: "700",
+                  cursor: "pointer"
+                }}
+                title="Log out"
+              >
+                🚪 Exit
+              </button>
+            </div>
+          )}
+
           {/* Owner Notifications Bell */}
+          {!isPharmacist && (
           <div style={{ position: "relative" }}>
             <button
               ref={ownerNotifBtnRef}
@@ -2729,6 +2849,7 @@ export default function Dashboard({ initialTab = "sales" }) {
               </div>
             )}
           </div>
+          )}
 
           {/* Held orders quick chip if any held */}
           {heldOrders.length > 0 && (
@@ -2746,27 +2867,29 @@ export default function Dashboard({ initialTab = "sales" }) {
           )}
 
           {/* Profile Trigger Button */}
-          <button 
-            ref={profileBtnRef}
-            type="button"
-            onClick={toggleProfileDropdown} 
-            style={{ 
-              ...styles.navProfileBtn, 
-              backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "#f8fafc", 
-              color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#334155",
-            }}
-          >
-            <div style={styles.profileAvatarBox}>
-              {userProfile.profileImage ? (
-                <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-              ) : (
-                <span style={{ fontSize: "11px", fontWeight: "800", color: "#fc8019" }}>
-                  {userProfile.name ? userProfile.name.charAt(0).toUpperCase() : "A"}
-                </span>
-              )}
-            </div>
-            <span style={styles.profileBtnText}>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
-          </button>
+          {!isPharmacist && (
+            <button 
+              ref={profileBtnRef}
+              type="button"
+              onClick={toggleProfileDropdown} 
+              style={{ 
+                ...styles.navProfileBtn, 
+                backgroundColor: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#ffedd5" : "#f8fafc", 
+                color: (activeTab === "profile" || activeTab === "settings" || profileDropdownOpen) ? "#fc8019" : "#334155",
+              }}
+            >
+              <div style={styles.profileAvatarBox}>
+                {userProfile.profileImage ? (
+                  <img src={userProfile.profileImage} alt="Profile" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                ) : (
+                  <span style={{ fontSize: "11px", fontWeight: "800", color: "#fc8019" }}>
+                    {userProfile.name ? userProfile.name.charAt(0).toUpperCase() : "A"}
+                  </span>
+                )}
+              </div>
+              <span style={styles.profileBtnText}>{userProfile.name ? userProfile.name.split(" ")[0] : "Profile"} ▾</span>
+            </button>
+          )}
         </div>
       </header>
 
@@ -2941,8 +3064,26 @@ export default function Dashboard({ initialTab = "sales" }) {
             onClick={() => { setActiveTab("staff"); setProfileDropdownOpen(false); }}
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "staff" ? "#fff7ed" : "transparent", color: activeTab === "staff" ? "#fc8019" : "#334155" }}
           >
-            👥 Staff Accounts & Attendance
+            👥 {isMedical ? "Medical Staff Accounts" : "Staff Accounts & Attendance"}
           </button>
+          {isMedical && (
+            <>
+              <button 
+                type="button"
+                onClick={() => { setActiveTab("rooms"); setProfileDropdownOpen(false); }}
+                style={{ ...styles.dropdownItem, backgroundColor: activeTab === "rooms" ? "#fff7ed" : "transparent", color: activeTab === "rooms" ? "#fc8019" : "#334155" }}
+              >
+                🏥 Hospital Ward & Rooms
+              </button>
+              <button 
+                type="button"
+                onClick={() => { setActiveTab("lab"); setProfileDropdownOpen(false); }}
+                style={{ ...styles.dropdownItem, backgroundColor: activeTab === "lab" ? "#fff7ed" : "transparent", color: activeTab === "lab" ? "#fc8019" : "#334155" }}
+              >
+                🧪 Laboratory & Diagnostics
+              </button>
+            </>
+          )}
           <button 
             type="button"
             onClick={() => { setActiveTab("branches"); setProfileDropdownOpen(false); }}
@@ -2958,24 +3099,58 @@ export default function Dashboard({ initialTab = "sales" }) {
             📊 Profit, Loss &amp; Waste Tracking
           </button>
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
-          <a 
-            href="/waiter"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ ...styles.dropdownItem, textDecoration: "none", color: "#0284c7", display: "flex", justifyContent: "space-between", alignItems: "center" }}
-          >
-            <span>🍽️ Open Waiter Portal</span>
-            <span style={{ fontSize: "11px" }}>↗</span>
-          </a>
-          <a 
-            href="/kitchen"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ ...styles.dropdownItem, textDecoration: "none", color: "#ea580c", display: "flex", justifyContent: "space-between", alignItems: "center" }}
-          >
-            <span>👨‍🍳 Open Kitchen Display (KDS)</span>
-            <span style={{ fontSize: "11px" }}>↗</span>
-          </a>
+          {isMedical ? (
+            <>
+              <a 
+                href="/pharmacist"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.dropdownItem, textDecoration: "none", color: "#0284c7", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <span>💊 Open Pharmacist Portal</span>
+                <span style={{ fontSize: "11px" }}>↗</span>
+              </a>
+              <a 
+                href="/ward"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.dropdownItem, textDecoration: "none", color: "#7c3aed", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <span>🏥 Open Ward Portal</span>
+                <span style={{ fontSize: "11px" }}>↗</span>
+              </a>
+              <a 
+                href="/lab"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.dropdownItem, textDecoration: "none", color: "#059669", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <span>🧪 Open Lab Portal</span>
+                <span style={{ fontSize: "11px" }}>↗</span>
+              </a>
+            </>
+          ) : (
+            <>
+              <a 
+                href="/waiter"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.dropdownItem, textDecoration: "none", color: "#0284c7", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <span>🍽️ Open Waiter Portal</span>
+                <span style={{ fontSize: "11px" }}>↗</span>
+              </a>
+              <a 
+                href="/kitchen"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.dropdownItem, textDecoration: "none", color: "#ea580c", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <span>👨‍🍳 Open Kitchen Display (KDS)</span>
+                <span style={{ fontSize: "11px" }}>↗</span>
+              </a>
+            </>
+          )}
           <div style={{ height: "1px", backgroundColor: "#e2e8f0", margin: "4px 0" }} />
           <button 
             type="button"
@@ -3918,6 +4093,24 @@ export default function Dashboard({ initialTab = "sales" }) {
           />
         )}
 
+        {/* MEDICAL: HOSPITAL WARD & ROOMS TAB */}
+        {activeTab === "rooms" && (
+          <RoomManagement
+            ownerUid={currentUid}
+            isOwner={!isStaff}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
+        {/* MEDICAL: LABORATORY & DIAGNOSTIC SERVICES TAB */}
+        {activeTab === "lab" && (
+          <LabManagement
+            ownerUid={currentUid}
+            isOwner={!isStaff}
+            onBack={() => setActiveTab("sales")}
+          />
+        )}
+
         {/* STAFF MANAGEMENT & ATTENDANCE TAB */}
         {activeTab === "staff" && (
           <StaffManagement 
@@ -3990,18 +4183,18 @@ export default function Dashboard({ initialTab = "sales" }) {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", flexWrap: "wrap", gap: "10px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
                 <h2 style={{ fontSize: "24px", fontWeight: "800", color: "#0f172a", margin: 0 }}>
-                  {isRestaurant ? "🍽️ Restaurant Menu Management" : isGlobalMode ? "🌐 Global Inventory Management" : "🏪 Local Store Inventory Management"}
+                  {isMedical ? "💊 Pharmacy Medicine Inventory" : isRestaurant ? "🍽️ Restaurant Menu Management" : isGlobalMode ? "🌐 Global Inventory Management" : "🏪 Local Store Inventory Management"}
                 </h2>
                 <span style={{
                   fontSize: "11px",
                   fontWeight: "800",
                   padding: "3px 10px",
                   borderRadius: "12px",
-                  backgroundColor: isRestaurant ? "#f0fdf4" : isGlobalMode ? "#ecfdf5" : "#eef2ff",
-                  color: isRestaurant ? "#16a34a" : isGlobalMode ? "#059669" : "#4f46e5",
-                  border: "1px solid " + (isRestaurant ? "#bbf7d0" : isGlobalMode ? "#a7f3d0" : "#c7d2fe")
+                  backgroundColor: isMedical ? "#e0f2fe" : isRestaurant ? "#f0fdf4" : isGlobalMode ? "#ecfdf5" : "#eef2ff",
+                  color: isMedical ? "#0284c7" : isRestaurant ? "#16a34a" : isGlobalMode ? "#059669" : "#4f46e5",
+                  border: "1px solid " + (isMedical ? "#bae6fd" : isRestaurant ? "#bbf7d0" : isGlobalMode ? "#a7f3d0" : "#c7d2fe")
                 }}>
-                  {isRestaurant ? "MENU" : isGlobalMode ? "GLOBAL" : "LOCAL"} ({products.length} Items)
+                  {isMedical ? "PHARMACY" : isRestaurant ? "MENU" : isGlobalMode ? "GLOBAL" : "LOCAL"} ({products.length} Items)
                 </span>
               </div>
               <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>

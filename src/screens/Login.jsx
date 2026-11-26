@@ -3,6 +3,7 @@ import { signInWithEmailAndPassword } from "firebase/auth";
 import { doc, getDoc, collection, getDocs, query, where, updateDoc } from "firebase/firestore";
 import { auth, db } from "../utils/firebase";
 import { Link } from "react-router-dom";
+import { verifyPassword } from "../utils/cryptoUtils";
 
 export default function Login() {
   const [loginType, setLoginType] = useState("owner"); // "owner" | "staff"
@@ -117,7 +118,16 @@ export default function Login() {
         return;
       }
 
-      if (String(staffData.password).trim() !== String(password).trim()) {
+      // Check account active/inactive status
+      if (staffData.status === "inactive" || staffData.isActive === false) {
+        setError("This staff account is currently inactive / deactivated. Please contact your store manager ⚠️");
+        setLoading(false);
+        return;
+      }
+
+      // Secure password verification (SHA-256 hash or legacy plaintext)
+      const isPasswordValid = await verifyPassword(password, staffData.passwordHash, staffData.password);
+      if (!isPasswordValid) {
         setError("Incorrect staff password. Please try again ❌");
         setLoading(false);
         return;
@@ -136,7 +146,9 @@ export default function Login() {
               masterUid = uDoc.id;
               try {
                 await updateDoc(staffDocRef, { masterUid: uDoc.id });
-              } catch (_) {}
+              } catch (healErr) {
+                console.warn("Notice updating mirror doc:", healErr);
+              }
               break;
             }
           }
@@ -177,6 +189,12 @@ export default function Login() {
         window.location.href = "/waiter";
       } else if (staffRole === "kitchen") {
         window.location.href = "/kitchen";
+      } else if (staffRole === "pharmacist") {
+        window.location.href = "/pharmacist";
+      } else if (staffRole === "ward_incharge" || staffRole === "ward-incharge" || staffRole === "wardincharge") {
+        window.location.href = "/ward";
+      } else if (staffRole === "lab_technician" || staffRole === "lab-technician" || staffRole === "labtechnician") {
+        window.location.href = "/lab";
       } else {
         window.location.href = "/dashboard";
       }
@@ -199,7 +217,7 @@ export default function Login() {
           <p style={styles.subtitle}>
             {loginType === "owner"
               ? "Sign in to manage your shop, restaurant & inventory"
-              : "Staff portal: Waiter orders, Kitchen KOT & Delivery"}
+              : "Staff portal: Pharmacist POS, Hospital Ward, Diagnostic Lab, Waiter & Kitchen"}
           </p>
         </div>
 

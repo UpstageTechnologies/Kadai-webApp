@@ -7,6 +7,9 @@ import Register from "./screens/Register";
 import Dashboard from "./screens/Dashboard";
 import WaiterOrder from "./screens/WaiterOrder";
 import KitchenDisplay from "./screens/KitchenDisplay";
+import PharmacistDashboard from "./screens/medical/PharmacistDashboard";
+import WardDashboard from "./screens/medical/WardDashboard";
+import LabDashboard from "./screens/medical/LabDashboard";
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(() => !!localStorage.getItem("uid"));
@@ -35,6 +38,9 @@ export default function App() {
     const staffRole = (localStorage.getItem("staff_role") || "").toLowerCase();
     if (staffRole === "waiter") return "/waiter";
     if (staffRole === "kitchen") return "/kitchen";
+    if (staffRole === "pharmacist") return "/pharmacist";
+    if (staffRole === "ward_incharge" || staffRole === "ward-incharge" || staffRole === "wardincharge") return "/ward";
+    if (staffRole === "lab_technician" || staffRole === "lab-technician" || staffRole === "labtechnician") return "/lab";
     return "/dashboard";
   };
 
@@ -64,8 +70,13 @@ export default function App() {
         <Route path="/feedback" element={isAuthenticated ? <Dashboard key="feedback" initialTab="feedback" /> : <Navigate to="/login" replace />} />
         <Route path="/branches" element={isAuthenticated ? <Dashboard key="branches" initialTab="branches" /> : <Navigate to="/login" replace />} />
         <Route path="/attendance" element={isAuthenticated ? <Dashboard key="attendance" initialTab="staff" /> : <Navigate to="/login" replace />} />
+        <Route path="/rooms" element={isAuthenticated ? <Dashboard key="rooms" initialTab="rooms" /> : <Navigate to="/login" replace />} />
+        <Route path="/lab-tests" element={isAuthenticated ? <Dashboard key="lab_tests" initialTab="lab" /> : <Navigate to="/login" replace />} />
         <Route path="/waiter" element={isAuthenticated ? <WaiterOrder /> : <Navigate to="/login" replace />} />
         <Route path="/kitchen" element={isAuthenticated ? <KitchenDisplay /> : <Navigate to="/login" replace />} />
+        <Route path="/pharmacist" element={isAuthenticated ? <PharmacistDashboard /> : <Navigate to="/login" replace />} />
+        <Route path="/ward" element={isAuthenticated ? <WardDashboard /> : <Navigate to="/login" replace />} />
+        <Route path="/lab" element={isAuthenticated ? <LabDashboard /> : <Navigate to="/login" replace />} />
         <Route path="*" element={<Navigate to={isAuthenticated ? getHomeRedirect() : "/login"} replace />} />
       </Routes>
     </Router>

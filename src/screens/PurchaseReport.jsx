@@ -58,6 +58,37 @@ const DEFAULT_SHOP_CATEGORIES = [
   "Hardware"
 ];
 
+// Safe date parsing helper to prevent RangeError: invalid date on Firestore timestamps or malformed date fields
+const parseSafeDate = (val) => {
+  if (!val) return new Date();
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? new Date() : val;
+  }
+  if (typeof val === "object" && typeof val.toDate === "function") {
+    try {
+      const d = val.toDate();
+      return isNaN(d.getTime()) ? new Date() : d;
+    } catch (_) {
+      return new Date();
+    }
+  }
+  if (typeof val === "object" && val.seconds != null) {
+    const d = new Date(val.seconds * 1000);
+    return isNaN(d.getTime()) ? new Date() : d;
+  }
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? new Date() : d;
+};
+
+const formatSafeIsoDate = (val) => {
+  try {
+    const d = parseSafeDate(val);
+    return d.toISOString().slice(0, 10);
+  } catch (_) {
+    return new Date().toISOString().slice(0, 10);
+  }
+};
+
 export default function PurchaseReport({
   userProfile = {},
   isRestaurant = false,
@@ -405,11 +436,12 @@ export default function PurchaseReport({
       (snapshot) => {
         const records = snapshot.docs.map((d) => {
           const data = d.data();
-          const createdAt = data.createdAt?.toDate ? data.createdAt.toDate() : (data.date ? new Date(data.date) : (data.createdAt ? new Date(data.createdAt) : new Date()));
+          const createdAt = parseSafeDate(data.createdAt || data.date || data.purchaseDate);
           return {
             id: d.id,
             ...data,
             parsedDate: createdAt,
+            purchaseDate: data.purchaseDate || formatSafeIsoDate(createdAt),
             totalAmount: Number(data.totalAmount || data.total || 0),
             qty: Number(data.qty || data.quantity || 1),
             rate: Number(data.rate || data.purchasePrice || data.costPerUnit || 0)
@@ -1079,25 +1111,29 @@ export default function PurchaseReport({
     const branchShopProducts = shopProductsList.filter((p) => itemMatchesBranch(p, internalBranchId));
 
     if (branchPurchases.length === 0) {
-      return branchShopProducts.map((it) => ({
-        id: `stock-${it.id}`,
-        billNo: "INITIAL-STOCK",
-        itemName: it.name || it.itemName || "Stock Item",
-        category: it.category || "Stock",
-        type: "shop",
-        qty: Number(it.quantity != null ? it.quantity : (it.stockQuantity || 0)),
-        unit: it.unitType || it.unit || "unit",
-        rate: Number(it.purchasePrice != null ? it.purchasePrice : (it.costPerUnit || 0)),
-        totalAmount: Number(((Number(it.quantity ?? it.stockQuantity ?? 0)) * (Number(it.purchasePrice ?? it.costPerUnit ?? 0))).toFixed(2)),
-        supplierName: it.supplierName || "Local Market",
-        paymentMode: "Stock On Hand",
-        purchaseDate: it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
-        parsedDate: it.updatedAt ? new Date(it.updatedAt) : new Date(),
-        isStockOnHand: true,
-        image: it.image,
-        branchId: it.branchId,
-        branchName: it.branchName
-      }));
+      return branchShopProducts.map((it) => {
+        const itemDate = parseSafeDate(it.updatedAt || it.createdAt);
+        const itemDateStr = formatSafeIsoDate(itemDate);
+        return {
+          id: `stock-${it.id}`,
+          billNo: "INITIAL-STOCK",
+          itemName: it.name || it.itemName || "Stock Item",
+          category: it.category || "Stock",
+          type: "shop",
+          qty: Number(it.quantity != null ? it.quantity : (it.stockQuantity || 0)),
+          unit: it.unitType || it.unit || "unit",
+          rate: Number(it.purchasePrice != null ? it.purchasePrice : (it.costPerUnit || 0)),
+          totalAmount: Number(((Number(it.quantity ?? it.stockQuantity ?? 0)) * (Number(it.purchasePrice ?? it.costPerUnit ?? 0))).toFixed(2)),
+          supplierName: it.supplierName || "Local Market",
+          paymentMode: "Stock On Hand",
+          purchaseDate: itemDateStr,
+          parsedDate: itemDate,
+          isStockOnHand: true,
+          image: it.image,
+          branchId: it.branchId,
+          branchName: it.branchName
+        };
+      });
     }
 
     return branchPurchases;
@@ -1106,7 +1142,7 @@ export default function PurchaseReport({
   // Filtered Invoices/Records based on search, date range, and payment mode
   const filteredRecords = useMemo(() => {
     const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
+    const todayStr = formatSafeIsoDate(now);
 
     return combinedRecords.filter((rec) => {
       if (searchQuery.trim()) {
@@ -1123,8 +1159,8 @@ export default function PurchaseReport({
         return false;
       }
 
-      const recDate = rec.parsedDate instanceof Date && !isNaN(rec.parsedDate) ? rec.parsedDate : new Date(rec.purchaseDate || Date.now());
-      const recDateStr = recDate.toISOString().slice(0, 10);
+      const recDate = parseSafeDate(rec.parsedDate || rec.purchaseDate || rec.date || rec.createdAt);
+      const recDateStr = formatSafeIsoDate(recDate);
 
       if (dateFilter === "today") {
         return recDateStr === todayStr;
@@ -1323,7 +1359,7 @@ export default function PurchaseReport({
 
     const rows = filteredRecords.map((r) => [
       `"${(r.billNo || "").replace(/"/g, '""')}"`,
-      r.purchaseDate || (r.parsedDate ? r.parsedDate.toISOString().slice(0, 10) : ""),
+      r.purchaseDate || formatSafeIsoDate(r.parsedDate),
       `"${(r.itemName || "").replace(/"/g, '""')}"`,
       r.type === "restaurant" ? "Restaurant Grocery" : "Shop Stock",
       `"${(r.category || "").replace(/"/g, '""')}"`,
@@ -1386,7 +1422,7 @@ export default function PurchaseReport({
       : "Official inventory stock purchases & vendor supplies log";
 
     const rowsHtml = filteredRecords.map((r, idx) => {
-      const dStr = r.purchaseDate || (r.parsedDate ? r.parsedDate.toISOString().slice(0, 10) : "-");
+      const dStr = r.purchaseDate || formatSafeIsoDate(r.parsedDate);
       const bNo = r.billNo || "DIRECT";
       const iName = r.itemName || "Item";
       const cat = r.category || (reportMode === "restaurant" ? "Groceries" : "Stock");
@@ -2162,7 +2198,7 @@ export default function PurchaseReport({
                   </tr>
                 ) : (
                   filteredRecords.map((r, idx) => {
-                    const dateStr = r.purchaseDate || (r.parsedDate ? r.parsedDate.toISOString().slice(0, 10) : "");
+                    const dateStr = r.purchaseDate || formatSafeIsoDate(r.parsedDate);
                     const isEven = idx % 2 === 0;
                     return (
                       <tr key={r.id || idx} style={isEven ? styles.trEven : styles.trOdd}>
@@ -2581,7 +2617,7 @@ export default function PurchaseReport({
                     <tbody>
                       {selectedItemDetail.history.map((p, idx) => (
                         <tr key={p.id || idx} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                          <td style={{ padding: "8px 12px" }}>{p.purchaseDate || p.date}</td>
+                          <td style={{ padding: "8px 12px" }}>{p.purchaseDate || p.date || formatSafeIsoDate(p.parsedDate)}</td>
                           <td style={{ padding: "8px 12px", fontWeight: "700" }}>{p.billNo || p.invoiceId}</td>
                           <td style={{ padding: "8px 12px", textAlign: "right", fontWeight: "700" }}>{p.qty} {p.unit}</td>
                           <td style={{ padding: "8px 12px", textAlign: "right" }}>₹{p.rate}</td>

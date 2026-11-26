@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { collection, onSnapshot, doc, setDoc, deleteDoc, serverTimestamp, getDoc, updateDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
+import { hashPassword } from "../utils/cryptoUtils";
 
 const ROLE_OPTIONS = [
   {
@@ -45,7 +46,44 @@ const ROLE_OPTIONS = [
   },
 ];
 
+const MEDICAL_ROLE_OPTIONS = [
+  {
+    id: "pharmacist",
+    label: "Pharmacist",
+    icon: "💊",
+    badge: "Pharmacist",
+    color: "#0284c7",
+    bgColor: "#e0f2fe",
+    desc: "Medicine inventory access, stock view & POS billing sales",
+    portalPath: "/pharmacist",
+  },
+  {
+    id: "ward_incharge",
+    label: "Ward In-charge",
+    icon: "🏥",
+    badge: "Ward In-charge",
+    color: "#7c3aed",
+    bgColor: "#f3e8ff",
+    desc: "Hospital room inventory, room categories & room charges",
+    portalPath: "/ward",
+  },
+  {
+    id: "lab_technician",
+    label: "Lab Technician",
+    icon: "🧪",
+    badge: "Lab Technician",
+    color: "#059669",
+    bgColor: "#ecfdf5",
+    desc: "Laboratory diagnostic tests, test categories & service pricing",
+    portalPath: "/lab",
+  },
+];
+
 export default function StaffManagement({ onBack }) {
+  const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
+  const isMedical = (shopType || "").trim().toLowerCase() === "medical";
+  const activeRoles = useMemo(() => (isMedical ? MEDICAL_ROLE_OPTIONS : ROLE_OPTIONS), [isMedical]);
+
   const [staffList, setStaffList] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -56,10 +94,11 @@ export default function StaffManagement({ onBack }) {
 
   const [name, setName] = useState("");
   const [mobile, setMobile] = useState("");
-  const [selectedRole, setSelectedRole] = useState("waiter");
+  const [selectedRole, setSelectedRole] = useState(() => (isMedical ? "pharmacist" : "waiter"));
   const [staffId, setStaffId] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [accountStatus, setAccountStatus] = useState("active"); // "active" | "inactive"
   const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
 
@@ -75,6 +114,26 @@ export default function StaffManagement({ onBack }) {
   const [attendanceRecords, setAttendanceRecords] = useState({});
 
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
+
+  // Sync shopType from user document
+  useEffect(() => {
+    if (!currentUid) return;
+    const fetchShop = async () => {
+      try {
+        const uDoc = await getDoc(doc(db, "users", currentUid));
+        if (uDoc.exists()) {
+          const sT = (uDoc.data().shopType || uDoc.data().shop_type || uDoc.data().businessType || "").trim();
+          if (sT) {
+            setShopType(sT);
+            localStorage.setItem("shop_type", sT);
+          }
+        }
+      } catch (err) {
+        console.warn("Could not read shop type:", err);
+      }
+    };
+    fetchShop();
+  }, [currentUid]);
 
   // Real-time listener for selected date attendance
   useEffect(() => {
@@ -260,6 +319,9 @@ export default function StaffManagement({ onBack }) {
     if (role === "waiter") prefix = "WTR";
     else if (role === "kitchen") prefix = "KIT";
     else if (role === "delivery") prefix = "DEL";
+    else if (role === "pharmacist") prefix = "PHARM";
+    else if (role === "ward_incharge") prefix = "WARD";
+    else if (role === "lab_technician") prefix = "LAB";
 
     const num = Math.floor(100 + Math.random() * 900);
     return `${prefix}-${num}`;
@@ -270,10 +332,12 @@ export default function StaffManagement({ onBack }) {
     setEditId(null);
     setName("");
     setMobile("");
-    setSelectedRole("waiter");
-    setStaffId(generateAutoStaffId("waiter"));
+    const initialRole = isMedical ? "pharmacist" : "waiter";
+    setSelectedRole(initialRole);
+    setStaffId(generateAutoStaffId(initialRole));
     setPassword(generateRandomPassword());
     setShowPassword(false);
+    setAccountStatus("active");
     setStatusMsg("");
     setIsModalOpen(true);
   };
@@ -283,10 +347,11 @@ export default function StaffManagement({ onBack }) {
     setEditId(staff.id || staff.staffId);
     setName(staff.name || "");
     setMobile(staff.mobile || staff.phone || "");
-    setSelectedRole(staff.role || "waiter");
+    setSelectedRole(staff.role || (isMedical ? "pharmacist" : "waiter"));
     setStaffId(staff.staffId || staff.id);
-    setPassword(staff.password || "");
+    setPassword("");
     setShowPassword(false);
+    setAccountStatus(staff.status || (staff.isActive !== false ? "active" : "inactive"));
     setStatusMsg("");
     setIsModalOpen(true);
   };
@@ -298,8 +363,12 @@ export default function StaffManagement({ onBack }) {
       alert("Please enter staff member name.");
       return;
     }
-    if (!staffId.trim() || !password.trim()) {
-      alert("Staff ID and Password are required.");
+    if (!staffId.trim()) {
+      alert("Staff ID is required.");
+      return;
+    }
+    if (!isEditing && !password.trim()) {
+      alert("Password is required.");
       return;
     }
 
@@ -308,6 +377,8 @@ export default function StaffManagement({ onBack }) {
 
     try {
       const cleanStaffId = staffId.trim().toUpperCase();
+      const isActiveBool = accountStatus === "active";
+
       const staffPayload = {
         staffId: cleanStaffId,
         id: cleanStaffId,
@@ -315,12 +386,20 @@ export default function StaffManagement({ onBack }) {
         mobile: mobile.trim() || "",
         phone: mobile.trim() || "",
         role: selectedRole,
-        password: password.trim(),
+        status: accountStatus,
+        isActive: isActiveBool,
         masterUid: currentUid,
         ownerUid: currentUid,
         userId: currentUid,
+        shopId: currentUid,
         updatedAt: serverTimestamp(),
       };
+
+      // Securely hash password - NEVER store plaintext passwords in Firestore
+      if (password.trim()) {
+        const pwdHash = await hashPassword(password.trim());
+        staffPayload.passwordHash = pwdHash;
+      }
 
       if (!isEditing) {
         staffPayload.createdAt = serverTimestamp();
@@ -350,6 +429,31 @@ export default function StaffManagement({ onBack }) {
     }
   };
 
+  const handleToggleStaffActive = async (staff) => {
+    if (!currentUid) return;
+    const targetStatus = staff.status === "inactive" || staff.isActive === false ? "active" : "inactive";
+    const targetIsActive = targetStatus === "active";
+    const sId = staff.id || staff.staffId;
+    if (!window.confirm(`Are you sure you want to ${targetIsActive ? "activate" : "deactivate"} account for "${staff.name}" (${sId})?`)) {
+      return;
+    }
+    try {
+      const updateData = {
+        status: targetStatus,
+        isActive: targetIsActive,
+        updatedAt: serverTimestamp(),
+      };
+      await updateDoc(doc(db, "users", currentUid, "staffs", sId), updateData);
+      try {
+        await updateDoc(doc(db, "staffs", sId), updateData);
+      } catch (mirrorErr) {
+        console.warn("Mirror update notice:", mirrorErr);
+      }
+    } catch (err) {
+      alert("Error updating staff status: " + err.message);
+    }
+  };
+
   const handleDeleteStaff = async (targetStaffId, staffName) => {
     if (!window.confirm(`Are you sure you want to delete staff account for "${staffName}" (${targetStaffId})?`)) {
       return;
@@ -361,14 +465,24 @@ export default function StaffManagement({ onBack }) {
       }
       try {
         await deleteDoc(doc(db, "staffs", targetStaffId));
-      } catch (_) {}
+      } catch (delErr) {
+        console.warn("Mirror delete notice:", delErr);
+      }
     } catch (err) {
       alert("Error deleting staff: " + err.message);
     }
   };
 
   const copyCredentials = (sId, sPwd, sRole) => {
-    const text = `🍽️ Staff Login Details:\n• Staff ID: ${sId}\n• Password: ${sPwd}\n• Role: ${sRole.toUpperCase()}\nLogin at your restaurant web portal.`;
+    let portalName = "store web portal";
+    if (sRole === "pharmacist") portalName = "Pharmacy POS portal (/pharmacist)";
+    else if (sRole === "ward_incharge") portalName = "Hospital Ward portal (/ward)";
+    else if (sRole === "lab_technician") portalName = "Diagnostic Lab portal (/lab)";
+    else if (sRole === "waiter") portalName = "Waiter ordering portal (/waiter)";
+    else if (sRole === "kitchen") portalName = "Kitchen KDS portal (/kitchen)";
+
+    const pwdText = sPwd ? `\n• Password: ${sPwd}` : "";
+    const text = `🏥 Staff Login Credentials:\n• Staff ID: ${sId}${pwdText}\n• Role: ${sRole.toUpperCase()}\nLogin at your ${portalName}.`;
     navigator.clipboard.writeText(text);
     setCopiedText(true);
     setTimeout(() => setCopiedText(false), 2000);
@@ -467,7 +581,7 @@ export default function StaffManagement({ onBack }) {
         <>
           {/* Role Quick Cards Summary */}
           <div style={styles.roleSummaryGrid}>
-        {ROLE_OPTIONS.map((r) => {
+        {activeRoles.map((r) => {
           const count = staffList.filter((s) => s.role === r.id).length;
           return (
             <div key={r.id} style={{ ...styles.roleSummaryCard, borderColor: r.bgColor }}>
@@ -523,7 +637,9 @@ export default function StaffManagement({ onBack }) {
             <span style={{ fontSize: "36px", display: "block", marginBottom: "8px" }}>👥</span>
             <div style={{ fontSize: "15px", fontWeight: "700", color: "#0f172a" }}>No staff accounts found</div>
             <p style={{ fontSize: "13px", margin: "4px 0 16px 0" }}>
-              Add your waiters and kitchen cooks to start taking table KOT orders seamlessly.
+              {isMedical
+                ? "Add your Pharmacist, Ward In-charge, and Lab Technician accounts to manage services."
+                : "Add your waiters and kitchen cooks to start taking table KOT orders seamlessly."}
             </p>
             <button type="button" onClick={handleOpenAddModal} style={styles.addBtn}>
               + Add First Staff Member
@@ -538,15 +654,32 @@ export default function StaffManagement({ onBack }) {
                   <th style={styles.th}>Name</th>
                   <th style={styles.th}>Role / Permission</th>
                   <th style={styles.th}>Contact</th>
+                  <th style={styles.th}>Status</th>
+                  <th style={styles.th}>Created</th>
                   <th style={styles.th}>Password</th>
                   <th style={{ ...styles.th, textAlign: "right" }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {staffList.map((s, idx) => {
-                  const roleObj = ROLE_OPTIONS.find((r) => r.id === s.role) || ROLE_OPTIONS[3];
+                  const allKnownRoles = [...ROLE_OPTIONS, ...MEDICAL_ROLE_OPTIONS];
+                  const roleObj = allKnownRoles.find((r) => r.id === s.role) || {
+                    id: s.role || "staff",
+                    label: s.role || "Staff",
+                    icon: "💼",
+                    badge: s.role || "Staff",
+                    color: "#4f46e5",
+                    bgColor: "#ede9fe",
+                  };
+                  const isAct = s.status !== "inactive" && s.isActive !== false;
+                  const createdDateStr = s.createdAt?.toDate
+                    ? s.createdAt.toDate().toLocaleDateString()
+                    : s.createdAt?.seconds
+                    ? new Date(s.createdAt.seconds * 1000).toLocaleDateString()
+                    : "—";
+
                   return (
-                    <tr key={s.id || idx} style={styles.tr}>
+                    <tr key={s.id || idx} style={{ ...styles.tr, opacity: isAct ? 1 : 0.65 }}>
                       <td style={styles.td}>
                         <span style={styles.staffIdBadge}>{s.staffId || s.id}</span>
                       </td>
@@ -570,6 +703,28 @@ export default function StaffManagement({ onBack }) {
                         <span style={{ color: "#64748b", fontSize: "13px" }}>{s.mobile || s.phone || "—"}</span>
                       </td>
                       <td style={styles.td}>
+                        <button
+                          type="button"
+                          onClick={() => handleToggleStaffActive(s)}
+                          style={{
+                            padding: "4px 8px",
+                            borderRadius: "6px",
+                            border: "none",
+                            fontSize: "11px",
+                            fontWeight: "700",
+                            cursor: "pointer",
+                            backgroundColor: isAct ? "#dcfce7" : "#fee2e2",
+                            color: isAct ? "#166534" : "#991b1b",
+                          }}
+                          title={isAct ? "Click to deactivate" : "Click to activate"}
+                        >
+                          {isAct ? "🟢 Active" : "⏸️ Inactive"}
+                        </button>
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{ fontSize: "12px", color: "#64748b" }}>{createdDateStr}</span>
+                      </td>
+                      <td style={styles.td}>
                         <span style={styles.passwordMask}>••••••••</span>
                         <button
                           type="button"
@@ -582,6 +737,25 @@ export default function StaffManagement({ onBack }) {
                       </td>
                       <td style={{ ...styles.td, textAlign: "right" }}>
                         <div style={{ display: "flex", gap: "6px", justifyContent: "flex-end" }}>
+                          {roleObj.portalPath && (
+                            <a
+                              href={roleObj.portalPath}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{
+                                padding: "6px 8px",
+                                backgroundColor: "#f1f5f9",
+                                color: roleObj.color,
+                                borderRadius: "6px",
+                                textDecoration: "none",
+                                fontSize: "11px",
+                                fontWeight: "700",
+                              }}
+                              title="Test Portal View"
+                            >
+                              Portal ↗
+                            </a>
+                          )}
                           <button
                             type="button"
                             onClick={() => handleOpenEditModal(s)}
@@ -885,7 +1059,7 @@ export default function StaffManagement({ onBack }) {
               <div>
                 <label style={styles.fieldLabel}>Select Role *</label>
                 <div style={styles.rolePickerGrid}>
-                  {ROLE_OPTIONS.map((r) => {
+                  {activeRoles.map((r) => {
                     const isSelected = selectedRole === r.id;
                     return (
                       <div
@@ -910,6 +1084,19 @@ export default function StaffManagement({ onBack }) {
                     );
                   })}
                 </div>
+              </div>
+
+              {/* Account Status */}
+              <div>
+                <label style={styles.fieldLabel}>Account Status *</label>
+                <select
+                  value={accountStatus}
+                  onChange={(e) => setAccountStatus(e.target.value)}
+                  style={styles.modalInput}
+                >
+                  <option value="active">🟢 Active (Permitted to Log In)</option>
+                  <option value="inactive">⏸️ Inactive (Login Blocked)</option>
+                </select>
               </div>
 
               {/* Name */}
@@ -951,7 +1138,7 @@ export default function StaffManagement({ onBack }) {
                 </div>
                 <input
                   type="text"
-                  placeholder="e.g. WTR-101"
+                  placeholder={isMedical ? "e.g. PHARM-101" : "e.g. WTR-101"}
                   value={staffId}
                   onChange={(e) => setStaffId(e.target.value)}
                   style={styles.modalInput}
@@ -962,7 +1149,9 @@ export default function StaffManagement({ onBack }) {
               {/* Password */}
               <div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-                  <label style={styles.fieldLabel}>Password *</label>
+                  <label style={styles.fieldLabel}>
+                    {isEditing ? "New Password (leave empty to keep unchanged)" : "Password *"}
+                  </label>
                   <button
                     type="button"
                     onClick={() => setPassword(generateRandomPassword())}
@@ -974,11 +1163,11 @@ export default function StaffManagement({ onBack }) {
                 <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                   <input
                     type={showPassword ? "text" : "password"}
-                    placeholder="Enter password"
+                    placeholder={isEditing ? "•••••••• (unchanged)" : "Enter password"}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     style={{ ...styles.modalInput, paddingRight: "44px" }}
-                    required
+                    required={!isEditing}
                   />
                   <button
                     type="button"

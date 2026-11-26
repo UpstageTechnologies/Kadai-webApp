@@ -13,6 +13,7 @@ export default function Inventory() {
   // Restaurant Mode Detection
   const [shopType, setShopType] = useState(() => localStorage.getItem("shop_type") || "");
   const isRestaurant = (shopType || "").trim().toLowerCase() === "restaurant";
+  const isMedical = (shopType || "").trim().toLowerCase() === "medical";
 
   // Shop Mode: Local vs Global
   const [appMode] = useState(() => localStorage.getItem("app_mode") || "local");
@@ -42,6 +43,21 @@ export default function Inventory() {
   const [savingWaste, setSavingWaste] = useState(false);
   const [wasteSuccessToast, setWasteSuccessToast] = useState("");
 
+  const MEDICAL_CATEGORIES = useMemo(() => [
+    "Tablets",
+    "Capsules",
+    "Syrups & Suspensions",
+    "Injections & Infusions",
+    "Ointments & Creams",
+    "Drops (Eye/Ear)",
+    "Antibiotics",
+    "Pain Relief",
+    "Vitamins & Supplements",
+    "Medical Devices & Consumables",
+    "First Aid & Surgical",
+    "General Health"
+  ], []);
+
   const RESTAURANT_CATEGORIES = useMemo(() => [
     "Starters",
     "Main Course",
@@ -65,7 +81,7 @@ export default function Inventory() {
   ], []);
 
   const availableCategories = useMemo(() => {
-    const baseList = isRestaurant ? RESTAURANT_CATEGORIES : RETAIL_CATEGORIES;
+    const baseList = isMedical ? MEDICAL_CATEGORIES : (isRestaurant ? RESTAURANT_CATEGORIES : RETAIL_CATEGORIES);
     const catSet = new Set(baseList);
     items.forEach((p) => {
       const c = p.category;
@@ -74,7 +90,7 @@ export default function Inventory() {
       }
     });
     return Array.from(catSet);
-  }, [isRestaurant, items, RESTAURANT_CATEGORIES, RETAIL_CATEGORIES]);
+  }, [isMedical, isRestaurant, items, MEDICAL_CATEGORIES, RESTAURANT_CATEGORIES, RETAIL_CATEGORIES]);
 
   useEffect(() => {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
