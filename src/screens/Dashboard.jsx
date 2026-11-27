@@ -13,13 +13,36 @@ import WasteManagement from "./WasteManagement";
 import PurchaseReport from "./PurchaseReport";
 import FeedbackScreen from "./FeedbackScreen";
 import BranchManagement from "./BranchManagement";
+import TerminalManagement from "./TerminalManagement";
+import PosTerminalBar from "../components/PosTerminalBar";
 import RoomManagement from "./medical/RoomManagement";
 import LabManagement from "./medical/LabManagement";
+import CustomerManagement from "./CustomerManagement";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
 import { subscribeWasteRecords, calculateWasteStats } from "../utils/wasteService";
 import { deductRecipeStock } from "../utils/recipeStockService";
+import {
+  INVENTORY_MODES,
+  assignUnassignedProductsToTerminal,
+  ensurePrimaryTerminalSeeded,
+  filterProductsForCatalog,
+  getAuthorizedTerminalsForStaff,
+  getShopInventoryMode,
+  recordTerminalSaleTransaction,
+  setShopInventoryMode,
+  subscribeFloors,
+  subscribeTerminals,
+} from "../utils/terminalService";
+import {
+  DEFAULT_CRM_CONFIG,
+  calculateMaxRedeemable,
+  isValidPhone10,
+  mergeCrmConfig,
+  normalizePhone10,
+  recordPosSaleCustomerTransaction,
+} from "../utils/customerCrmService";
 
 export default function Dashboard({ initialTab = "sales", pharmacistMode = false }) {
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
@@ -59,8 +82,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       setActiveTab("lab");
     } else if (isPharmacist && activeTab !== "sales" && activeTab !== "inventory") {
       setActiveTab("sales");
+    } else if (isStaff && activeTab === "terminals") {
+      setActiveTab("sales");
     }
-  }, [isWardIncharge, isLabTechnician, isPharmacist, activeTab]);
+  }, [isWardIncharge, isLabTechnician, isPharmacist, isStaff, activeTab]);
 
   // Shop Mode: Local vs Global
   const [appMode, setAppMode] = useState(() => localStorage.getItem("app_mode") || "local");
@@ -224,6 +249,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("Cash");
   const [sendWhatsAppBill, setSendWhatsAppBill] = useState(false);
+  const [crmConfig, setCrmConfig] = useState(DEFAULT_CRM_CONFIG);
+  const [crmCustomers, setCrmCustomers] = useState([]);
+  const [redeemLoyaltyPoints, setRedeemLoyaltyPoints] = useState(false);
 
   // Success Animated Popup Modal State
   const [popupModal, setPopupModal] = useState({ show: false, message: "" });
@@ -284,6 +312,85 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const [qty, setQty] = useState("");
   const [brand, setBrand] = useState("");
   const [image, setImage] = useState("");
+  const [productFloorId, setProductFloorId] = useState("all");
+  const [productTerminalId, setProductTerminalId] = useState("all");
+  const [inventoryFloorFilter, setInventoryFloorFilter] = useState("all");
+  const [inventoryTerminalFilter, setInventoryTerminalFilter] = useState("all");
+
+  // POS Floor & Terminal Architecture States
+  const [floorsList, setFloorsList] = useState([]);
+  const [terminalsList, setTerminalsList] = useState([]);
+  const [terminalsLoaded, setTerminalsLoaded] = useState(false);
+  const [activeTerminalId, setActiveTerminalId] = useState(() => {
+    const uid = localStorage.getItem("uid") || "";
+    return uid ? localStorage.getItem(`active_terminal_id_${uid}`) || "" : "";
+  });
+  const [activeSessionDoc, setActiveSessionDoc] = useState(null);
+  const [isSubmittingCheckout, setIsSubmittingCheckout] = useState(false);
+  const checkoutIdempotencyRef = useRef("");
+  const primarySeedAttemptedRef = useRef(false);
+
+  const shopInventoryMode = rawUserData?.inventoryMode
+    ? getShopInventoryMode(rawUserData)
+    : terminalsList.length > 1
+    ? INVENTORY_MODES.TERMINAL_WISE
+    : INVENTORY_MODES.SHARED;
+
+  const primaryTerminalObj = useMemo(() => {
+    if (terminalsList.length === 0) return null;
+    const explicit = terminalsList.find((t) => t.isPrimary === true || t.id === "terminal_1");
+    if (explicit) return explicit;
+    const sorted = [...terminalsList].sort((a, b) => {
+      const aMs = a.createdAt?.toMillis?.() || (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
+      const bMs = b.createdAt?.toMillis?.() || (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
+      if (aMs !== bMs) return aMs - bMs;
+      return String(a.code || a.name || "").localeCompare(String(b.code || b.name || ""));
+    });
+    return sorted[0] || null;
+  }, [terminalsList]);
+
+  const authorizedTerminalsForUser = useMemo(
+    () =>
+      getAuthorizedTerminalsForStaff({
+        terminals: terminalsList,
+        floors: floorsList,
+        shopId: currentUid,
+        staffId,
+        isOwner: !isStaff,
+      }),
+    [terminalsList, floorsList, currentUid, staffId, isStaff]
+  );
+
+  const activeTerminalObj = useMemo(() => {
+    if (!activeTerminalId) {
+      if (isStaff && authorizedTerminalsForUser.length === 1) {
+        return authorizedTerminalsForUser[0];
+      }
+      if (!isStaff && authorizedTerminalsForUser.length > 0) {
+        return (
+          authorizedTerminalsForUser.find((t) => t.id === primaryTerminalObj?.id) ||
+          authorizedTerminalsForUser[0]
+        );
+      }
+      return null;
+    }
+    return (
+      authorizedTerminalsForUser.find((t) => t.id === activeTerminalId) ||
+      (!isStaff ? authorizedTerminalsForUser[0] || null : null)
+    );
+  }, [activeTerminalId, isStaff, authorizedTerminalsForUser, primaryTerminalObj?.id]);
+
+  const handleSelectActiveTerminal = (term) => {
+    const tId = term?.id || "";
+    setActiveTerminalId(tId);
+    if (currentUid) {
+      if (tId) {
+        localStorage.setItem(`active_terminal_id_${currentUid}`, tId);
+      } else {
+        localStorage.removeItem(`active_terminal_id_${currentUid}`);
+      }
+    }
+  };
 
   // Web Image Search Modal States
   const [webImageModalOpen, setWebImageModalOpen] = useState(false);
@@ -507,6 +614,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         if (data.settings) {
           setStoreSettings(data.settings);
         }
+        if (data.crmConfig) {
+          setCrmConfig(mergeCrmConfig(data.crmConfig));
+        }
         if (data.printSettings || data.settings?.print) {
           const loadedPrint = normalizePrintSettings(data.printSettings || data.settings?.print);
           setPrintSettings(loadedPrint);
@@ -593,19 +703,6 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       setOrdersList(orders);
     }, (error) => {
       console.error("Error fetching orders:", error);
-    });
-
-    // 3. Real-time Active Cart Sync with Mobile App
-    const activeCartRef = doc(db, "users", currentUid, "active_cart", "current");
-    const unsubscribeActiveCart = onSnapshot(activeCartRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        setCurrentBill(data.items || []);
-      } else {
-        setCurrentBill([]);
-      }
-    }, (err) => {
-      console.error("Cart sync listener error:", err);
     });
 
     // 4. Real-time Held Orders Sync across Web and Mobile
@@ -855,6 +952,16 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       console.warn("Customer feedbacks listener notice:", err);
     });
 
+    // 10. Real-time Customer CRM Directory Sync
+    const crmCustRef = collection(db, "users", currentUid, "customers");
+    const unsubscribeCrmCustomers = onSnapshot(crmCustRef, (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      list.sort((a, b) => Number(b.totalOrders || 0) - Number(a.totalOrders || 0));
+      setCrmCustomers(list);
+    }, (err) => {
+      console.warn("Customer CRM listener notice:", err);
+    });
+
     return () => {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
@@ -863,7 +970,6 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       unsubscribeUser();
       unsubscribeInventory();
       unsubscribeOrders();
-      unsubscribeActiveCart();
       unsubscribeHeldOrders();
       unsubscribeKitchenOrders();
       unsubscribeLocalOrders();
@@ -872,8 +978,166 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       unsubscribeOwnerNotif();
       unsubscribeWaste();
       unsubscribeFeedback();
+      unsubscribeCrmCustomers();
     };
   }, [isRestaurant, appMode]);
+
+  // Real-time Active Cart Sync (scoped per selected POS terminal to prevent counter collisions)
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!uid) return undefined;
+    const cartDocId = activeTerminalObj?.id ? `terminal_${activeTerminalObj.id}` : "current";
+    const activeCartRef = doc(db, "users", uid, "active_cart", cartDocId);
+    const unsub = onSnapshot(
+      activeCartRef,
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setCurrentBill(data.items || []);
+        } else {
+          setCurrentBill([]);
+        }
+      },
+      (err) => {
+        console.error("Cart sync listener error:", err);
+      }
+    );
+    return () => unsub();
+  }, [activeTerminalObj?.id]);
+
+  // Real-time Floors & POS Terminals Sync
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!uid) return undefined;
+
+    const unsubFloors = subscribeFloors(
+      db,
+      uid,
+      (list) => setFloorsList(list),
+      (err) => console.warn("Floors sync notice:", err)
+    );
+    const unsubTerminals = subscribeTerminals(
+      db,
+      uid,
+      (list) => {
+        setTerminalsList(list);
+        setTerminalsLoaded(true);
+      },
+      (err) => {
+        console.warn("Terminals sync notice:", err);
+        setTerminalsLoaded(true);
+      }
+    );
+
+    return () => {
+      unsubFloors();
+      unsubTerminals();
+    };
+  }, []);
+
+  // Auto-seed Primary Terminal 1 when a shop starts using multiple terminals (preserves existing cafe/shop items on Terminal 1)
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (
+      !uid ||
+      isStaff ||
+      !terminalsLoaded ||
+      !rawUserData ||
+      primarySeedAttemptedRef.current
+    ) {
+      return;
+    }
+    if (rawUserData.primaryTerminalSeeded === true) {
+      primarySeedAttemptedRef.current = true;
+      return;
+    }
+    if (terminalsList.length === 0) return;
+    primarySeedAttemptedRef.current = true;
+    ensurePrimaryTerminalSeeded(db, uid, {
+      floors: floorsList,
+      terminals: terminalsList,
+      rawUserData,
+      storeName: userProfile.storeName || "Main Counter",
+    }).catch((err) => console.warn("Primary terminal auto-seed notice:", err));
+  }, [isStaff, terminalsLoaded, rawUserData, terminalsList, floorsList, userProfile.storeName]);
+
+  // Real-time Active Billing Session Sync for Selected Terminal
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid");
+    if (!uid || !activeTerminalObj?.id || !activeTerminalObj?.currentSessionId) {
+      return undefined;
+    }
+    const sessRef = doc(
+      db,
+      "users",
+      uid,
+      "terminals",
+      activeTerminalObj.id,
+      "sessions",
+      activeTerminalObj.currentSessionId
+    );
+    const unsub = onSnapshot(
+      sessRef,
+      (snap) => {
+        if (snap.exists() && snap.data().status === "open") {
+          setActiveSessionDoc({ id: snap.id, ...snap.data() });
+        } else {
+          setActiveSessionDoc(null);
+        }
+      },
+      (err) => console.warn("Active session sync notice:", err)
+    );
+    return () => unsub();
+  }, [activeTerminalObj?.id, activeTerminalObj?.currentSessionId]);
+
+  // Scope Speed Dial slots per active terminal so each terminal keeps its own quick keys
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid") || "";
+    if (!uid) return;
+    const isRest = (shopType || "").trim().toLowerCase() === "restaurant";
+    const modeKey = isRest ? "restaurant" : isGlobalMode ? "global" : "local";
+    const termSuffix = activeTerminalObj?.id ? `_${activeTerminalObj.id}` : "";
+    const termStorageKey = `speed_dial_slots_${modeKey}_${uid}${termSuffix}`;
+    const legacyStorageKey = `speed_dial_slots_${modeKey}_${uid}`;
+    const isPrimary = !activeTerminalObj?.id || activeTerminalObj.id === primaryTerminalObj?.id;
+
+    const savedTermSlots = localStorage.getItem(termStorageKey);
+    if (savedTermSlots) {
+      try {
+        setSpeedDialSlots(JSON.parse(savedTermSlots));
+        return;
+      } catch (e) {
+        console.warn("Could not parse terminal speed dial slots:", e);
+      }
+    }
+    if (rawUserData?.speedDialSlots?.[`${modeKey}${termSuffix}`]) {
+      setSpeedDialSlots(rawUserData.speedDialSlots[`${modeKey}${termSuffix}`]);
+      return;
+    }
+    if (isPrimary) {
+      const legacySaved = localStorage.getItem(legacyStorageKey);
+      if (legacySaved) {
+        try {
+          setSpeedDialSlots(JSON.parse(legacySaved));
+          return;
+        } catch (e) {
+          console.warn("Could not parse legacy speed dial slots:", e);
+        }
+      }
+      if (rawUserData?.speedDialSlots?.[modeKey]) {
+        setSpeedDialSlots(rawUserData.speedDialSlots[modeKey]);
+        return;
+      }
+    }
+    setSpeedDialSlots({});
+  }, [activeTerminalObj?.id, primaryTerminalObj?.id, shopType, isGlobalMode, rawUserData]);
+
+  const resolvedActiveSession =
+    activeTerminalObj?.currentSessionId &&
+    activeSessionDoc?.id === activeTerminalObj.currentSessionId &&
+    activeSessionDoc?.status === "open"
+      ? activeSessionDoc
+      : null;
 
   // Derived Kitchen & Table Orders
   const activeKitchenOrders = kitchenOrders.filter((o) => o.status !== "completed");
@@ -1265,9 +1529,17 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     } catch (e) {
       console.error("Sign out error:", e);
     }
+    const prevUid = localStorage.getItem("uid");
+    if (prevUid) {
+      localStorage.removeItem(`active_terminal_id_${prevUid}`);
+    }
     localStorage.removeItem("uid");
     localStorage.removeItem("shop_type");
     localStorage.removeItem("store_name");
+    localStorage.removeItem("is_staff");
+    localStorage.removeItem("staff_id");
+    localStorage.removeItem("staff_name");
+    localStorage.removeItem("staff_role");
     window.location.href = "/login";
   };
 
@@ -1275,9 +1547,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     if (!currentUid) return;
     try {
-      const activeCartRef = doc(db, "users", currentUid, "active_cart", "current");
+      const cartDocId = activeTerminalObj?.id ? `terminal_${activeTerminalObj.id}` : "current";
+      const activeCartRef = doc(db, "users", currentUid, "active_cart", cartDocId);
       await setDoc(activeCartRef, {
         items: updatedItems,
+        terminalId: activeTerminalObj?.id || null,
         updatedAt: serverTimestamp()
       }, { merge: true });
     } catch (e) {
@@ -1416,7 +1690,12 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       createdAt: serverTimestamp(),
       source: "web_pos",
       isRestaurant: isRestaurant,
-      appMode: appMode
+      appMode: appMode,
+      terminalId: activeTerminalObj?.id || null,
+      terminalName: activeTerminalObj?.name || null,
+      terminalCode: activeTerminalObj?.code || null,
+      floorId: activeTerminalObj?.floorId || null,
+      floorName: activeTerminalObj?.floorName || null,
     };
 
     // Update local state immediately for instant feedback
@@ -1474,7 +1753,12 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         createdAt: serverTimestamp(),
         source: "web_pos",
         isRestaurant: isRestaurant,
-        appMode: appMode
+        appMode: appMode,
+        terminalId: activeTerminalObj?.id || null,
+        terminalName: activeTerminalObj?.name || null,
+        terminalCode: activeTerminalObj?.code || null,
+        floorId: activeTerminalObj?.floorId || null,
+        floorName: activeTerminalObj?.floorName || null,
       };
       if (currentUid) {
         try {
@@ -1542,7 +1826,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const handleAssignProductToSlot = async (slotNum, product) => {
     const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
     const modeKey = isRestaurant ? "restaurant" : (isGlobalMode ? "global" : "local");
-    const speedDialStorageKey = `speed_dial_slots_${modeKey}_${currentUid}`;
+    const termSuffix = activeTerminalObj?.id ? `_${activeTerminalObj.id}` : "";
+    const speedDialKey = `${modeKey}${termSuffix}`;
+    const speedDialStorageKey = `speed_dial_slots_${speedDialKey}_${currentUid}`;
 
     const normalizedProduct = product ? {
       id: String(product.id || product.barcode || new Date().getTime()),
@@ -1577,13 +1863,13 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     if (currentUid && updatedSlots !== undefined) {
       try {
         await updateDoc(doc(db, "users", currentUid), {
-          [`speedDialSlots.${modeKey}`]: updatedSlots
+          [`speedDialSlots.${speedDialKey}`]: updatedSlots
         });
       } catch {
         try {
           await setDoc(doc(db, "users", currentUid), {
             speedDialSlots: {
-              [modeKey]: updatedSlots
+              [speedDialKey]: updatedSlots
             }
           }, { merge: true });
         } catch (setErr) {
@@ -1692,10 +1978,25 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
   const handleFinalCheckoutSubmit = async (e) => {
     e.preventDefault();
-    if (currentBill.length === 0) return;
+    if (currentBill.length === 0 || isSubmittingCheckout) return;
+    if (isStaff && terminalsList.length > 0 && (!activeTerminalObj || !resolvedActiveSession)) {
+      alert("Please select an authorized POS terminal and open a billing session before completing a sale.");
+      return;
+    }
+    if (paymentMethod === "Credit" && !isValidPhone10(customerPhone)) {
+      alert("Please enter a valid 10-digit customer mobile number for Khata / Credit billing.");
+      return;
+    }
+    setIsSubmittingCheckout(true);
     try {
       const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
-      const totalAmt = currentBill.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
+      const idempotencyKey =
+        checkoutIdempotencyRef.current ||
+        `TXN-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      checkoutIdempotencyRef.current = idempotencyKey;
+
+      const totalAmt = totalBillAmount;
+      const netPayable = netCheckoutTotal;
       const totalProfit = currentBill.reduce((sum, i) => sum + (Number(i.salesPrice || i.price || 0) - Number(i.purchasePrice || 0)) * i.qty, 0);
 
       const now = new Date();
@@ -1703,8 +2004,12 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       const month = String(now.getMonth() + 1).padStart(2, "0");
       const day = String(now.getDate()).padStart(2, "0");
       const datePrefix = `${year}${month}${day}`;
-      const sequenceNum = String(ordersList.length + 1).padStart(4, "0");
-      const bNo = `${datePrefix}-${sequenceNum}`;
+      const termOrdersCount = activeTerminalObj?.id
+        ? ordersList.filter((o) => o.terminalId === activeTerminalObj.id).length
+        : ordersList.length;
+      const sequenceNum = String(termOrdersCount + 1).padStart(4, "0");
+      const codePrefix = activeTerminalObj?.code ? `${activeTerminalObj.code}-` : "";
+      const bNo = `${codePrefix}${datePrefix}-${sequenceNum}`;
       const bDate = now.toLocaleDateString("en-GB");
       const nextTokenNo = activeTableOrderInfo?.tokenNumber || getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: currentUid });
       
@@ -1733,6 +2038,28 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
       const saleTableNo = activeTableOrderId && activeTableOrderInfo?.isTable ? activeTableOrderInfo.tableNo : null;
 
+      let crmResult = null;
+      const validPhone10 = isValidPhone10(customerPhone) ? normalizePhone10(customerPhone) : "";
+      if (currentUid && validPhone10) {
+        crmResult = await recordPosSaleCustomerTransaction({
+          shopId: currentUid,
+          customer: {
+            ...(matchedCheckoutCustomer || {}),
+            phone: validPhone10,
+            name: customerName.trim() || matchedCheckoutCustomer?.name || "Customer",
+          },
+          billNo: bNo,
+          grossTotal: totalAmt,
+          netPayable,
+          paymentMode: paymentMethod === "Credit" ? "CREDIT" : paymentMethod.toUpperCase(),
+          loyaltyRedeemedPoints: appliedLoyaltyPoints,
+          loyaltyDiscountAmount: appliedLoyaltyDiscount,
+          crmConfig,
+          staffName: localStorage.getItem("staff_name") || userProfile.name || "Owner",
+          shopName: userProfile.storeName || "My Store",
+        });
+      }
+
       const saleRecord = {
         billNo: bNo,
         invoiceId: bNo,
@@ -1740,27 +2067,56 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         tokenNo: nextTokenNo,
         billDate: bDate,
         items: sanitizedBillItems,
-        total: totalAmt,
-        totalAmount: totalAmt,
-        profit: totalProfit,
-        customerName: customerName.trim() || (saleTableNo ? saleTableNo : "Walk-in Customer"),
-        customerPhone: customerPhone.trim() || "N/A",
+        grossTotal: totalAmt,
+        total: netPayable,
+        totalAmount: netPayable,
+        loyaltyDiscount: appliedLoyaltyDiscount,
+        loyaltyRedeemedPoints: appliedLoyaltyPoints,
+        loyaltyEarnedPoints: crmResult?.earnedPoints || 0,
+        profit: Number((totalProfit - appliedLoyaltyDiscount).toFixed(2)),
+        customerName: customerName.trim() || matchedCheckoutCustomer?.name || (saleTableNo ? saleTableNo : "Walk-in Customer"),
+        customerPhone: validPhone10 || customerPhone.trim() || "N/A",
+        customerId: validPhone10 || "",
+        customerUid: crmResult?.customerUid || matchedCheckoutCustomer?.customerUid || "",
         orderType: saleOrderType,
         tableNo: saleTableNo,
-        paymentMode: paymentMethod.toUpperCase(),
+        paymentMode: paymentMethod === "Credit" ? "CREDIT" : paymentMethod.toUpperCase(),
         paymentMethod: paymentMethod,
+        paymentStatus: paymentMethod === "Credit" ? "CREDIT_DUE" : "SUCCESS",
         isGlobalMode: isGlobalMode,
         appMode: appMode,
         isRestaurant: isRestaurant,
         shopType: isRestaurant ? "restaurant" : "retail",
         branchId: activeBranchId || "main_branch",
         branchName: activeBranchName || "Main Branch",
+        shopId: currentUid || "",
+        floorId: activeTerminalObj?.floorId || null,
+        floorName: activeTerminalObj?.floorName || null,
+        terminalId: activeTerminalObj?.id || null,
+        terminalName: activeTerminalObj?.name || null,
+        terminalCode: activeTerminalObj?.code || null,
+        sessionId: resolvedActiveSession?.id || null,
+        staffId: isStaff ? staffId : "OWNER",
+        staffName: isStaff ? staffName : (userProfile.name || "Owner"),
         createdAt: serverTimestamp()
       };
 
       if (currentUid) {
-        // 1. Direct save in "sales" collection (No online order notification)
-        await addDoc(collection(db, "users", currentUid, "sales"), saleRecord);
+        // 1. Save sale atomically against active terminal session if open, else standard sales collection
+        if (activeTerminalObj && resolvedActiveSession) {
+          await recordTerminalSaleTransaction(db, {
+            shopId: currentUid,
+            terminal: activeTerminalObj,
+            session: resolvedActiveSession,
+            staffId: isStaff ? staffId : "OWNER",
+            staffName: isStaff ? staffName : (userProfile.name || "Store Owner"),
+            saleDocId: idempotencyKey,
+            saleRecord,
+            idempotencyKey,
+          });
+        } else {
+          await setDoc(doc(db, "users", currentUid, "sales", idempotencyKey), saleRecord);
+        }
 
         // Deduct raw material recipe ingredients from stock in real-time
         try {
@@ -1771,9 +2127,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
         // 2. Transmit confirmation event to Mobile App
         try {
-          const cartRef = doc(db, "users", currentUid, "active_cart", "current");
+          const cartDocId = activeTerminalObj?.id ? `terminal_${activeTerminalObj.id}` : "current";
+          const cartRef = doc(db, "users", currentUid, "active_cart", cartDocId);
           await setDoc(cartRef, {
             items: [],
+            terminalId: activeTerminalObj?.id || null,
             updatedAt: serverTimestamp(),
             lastConfirmedSale: {
               billNo: bNo,
@@ -1887,15 +2245,18 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         billDate: bDate,
         createdAt: new Date(),
         items: [...currentBill],
-        totalAmount: totalAmt,
-        total: totalAmt,
+        totalAmount: netPayable,
+        total: netPayable,
         tokenNumber: nextTokenNo,
         tokenNo: nextTokenNo,
         orderType: saleOrderType,
-        customerName: customerName.trim() || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
-        customerPhone: customerPhone.trim() || "N/A",
+        customerName: customerName.trim() || matchedCheckoutCustomer?.name || (isRestaurant ? "Dine-in / Walk-in" : "Walk-in Customer"),
+        customerPhone: validPhone10 || customerPhone.trim() || "N/A",
         paymentMethod: paymentMethod,
-        paymentMode: paymentMethod.toUpperCase(),
+        paymentMode: paymentMethod === "Credit" ? "CREDIT" : paymentMethod.toUpperCase(),
+        terminalName: activeTerminalObj?.name || null,
+        terminalCode: activeTerminalObj?.code || null,
+        floorName: activeTerminalObj?.floorName || null,
       };
 
       // Real-Time Notification to Store Owner for this sale
@@ -1940,9 +2301,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       }
 
       setIsCheckoutModalOpen(false);
+      checkoutIdempotencyRef.current = "";
       setCustomerName("");
       setCustomerPhone("");
       setSendWhatsAppBill(false);
+      setRedeemLoyaltyPoints(false);
       setCurrentBill([]);
       setActiveResumedOrderId(null);
       setActiveTableOrderId(null);
@@ -1963,6 +2326,8 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     } catch (err) {
       console.error("Checkout error:", err);
       alert("Checkout failed: " + err.message);
+    } finally {
+      setIsSubmittingCheckout(false);
     }
   };
 
@@ -2100,7 +2465,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     }
   };
 
-  const openAddModal = () => {
+  const openAddModal = (forcedTerminal = null) => {
     if (!canAddInventoryItem(products.length, userSubscription.plan, userSubscription.isExpired)) {
       const limit = userSubscription.limits.inventoryLimit;
       const msg = userSubscription.isExpired
@@ -2111,6 +2476,13 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       }
       return;
     }
+    const targetTerm =
+      (forcedTerminal && forcedTerminal.id ? forcedTerminal : null) ||
+      (activeTab === "inventory" && inventoryTerminalFilter !== "all"
+        ? terminalsList.find((t) => t.id === inventoryTerminalFilter)
+        : null) ||
+      (activeTab === "sales" && activeTerminalObj ? activeTerminalObj : null);
+
     setIsEditing(false);
     setEditId(null);
     setName("");
@@ -2121,6 +2493,13 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     setQty(isRestaurant ? "100" : "");
     setBrand("");
     setImage("");
+    if (targetTerm) {
+      setProductTerminalId(targetTerm.id);
+      setProductFloorId(targetTerm.floorId || "all");
+    } else {
+      setProductTerminalId("all");
+      setProductFloorId("all");
+    }
     setIsModalOpen(true);
   };
 
@@ -2136,6 +2515,8 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     setQty(String(item.quantity ?? "0"));
     setBrand(item.brand || "");
     setImage(item.image || item.imageUrl || "");
+    setProductTerminalId(item.terminalId || "all");
+    setProductFloorId(item.floorId || "all");
     setIsModalOpen(true);
   };
 
@@ -2254,6 +2635,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       }
 
       const targetCol = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
+      const chosenTerminal = terminalsList.find((t) => t.id === productTerminalId);
+      const resolvedFloorId = chosenTerminal?.floorId || productFloorId || "all";
+      const chosenFloor = floorsList.find((f) => f.id === resolvedFloorId);
       const productData = {
         name: name.trim(),
         itemName: name.trim(),
@@ -2269,6 +2653,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         inventoryMode: isGlobalMode ? "global" : "local",
         branchId: activeBranchId || "main_branch",
         branchName: activeBranchName || "Main Branch",
+        terminalId: chosenTerminal ? chosenTerminal.id : "all",
+        terminalName: chosenTerminal ? chosenTerminal.name : "All Terminals",
+        terminalCode: chosenTerminal ? chosenTerminal.code : "",
+        floorId: resolvedFloorId !== "all" ? resolvedFloorId : "all",
+        floorName: chosenFloor ? chosenFloor.name : "All Floors",
         updatedAt: serverTimestamp()
       };
 
@@ -2307,7 +2696,45 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const totalBillAmount = currentBill.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
   const totalBillItemsCount = currentBill.reduce((sum, item) => sum + item.qty, 0);
 
-  const filteredProducts = products.filter(item => {
+  const normalizedCheckoutPhone = normalizePhone10(customerPhone);
+  const matchedCheckoutCustomer = useMemo(() => {
+    if (normalizedCheckoutPhone.length !== 10) return null;
+    return crmCustomers.find((c) => normalizePhone10(c.phone || c.id) === normalizedCheckoutPhone) || null;
+  }, [crmCustomers, normalizedCheckoutPhone]);
+
+  const loyaltyRedeemInfo = useMemo(() => {
+    if (!matchedCheckoutCustomer) return { maxPoints: 0, maxDiscount: 0 };
+    return calculateMaxRedeemable(matchedCheckoutCustomer.loyaltyPoints || 0, totalBillAmount, crmConfig);
+  }, [matchedCheckoutCustomer, totalBillAmount, crmConfig]);
+
+  const appliedLoyaltyPoints = redeemLoyaltyPoints && matchedCheckoutCustomer ? loyaltyRedeemInfo.maxPoints : 0;
+  const appliedLoyaltyDiscount = redeemLoyaltyPoints && matchedCheckoutCustomer ? loyaltyRedeemInfo.maxDiscount : 0;
+  const netCheckoutTotal = Math.max(0, Number((totalBillAmount - appliedLoyaltyDiscount).toFixed(2)));
+
+  const terminalScopedProducts = filterProductsForCatalog(products, {
+    inventoryMode: shopInventoryMode,
+    terminalId: activeTerminalObj?.id || null,
+    floorId: activeTerminalObj?.floorId || null,
+    primaryTerminalId: primaryTerminalObj?.id || null,
+  });
+
+  const scopedCategories = useMemo(() => {
+    const defaultCategory = isRestaurant ? "Main Course" : "General";
+    const pool = activeTerminalObj ? terminalScopedProducts : products;
+    const unique = ["All", ...new Set(pool.map((item) => item.category || defaultCategory).filter(Boolean))];
+    return unique;
+  }, [activeTerminalObj, terminalScopedProducts, products, isRestaurant]);
+
+  const terminalHeldOrders = useMemo(() => {
+    if (!activeTerminalObj?.id) return heldOrders;
+    const isPrimary = activeTerminalObj.id === primaryTerminalObj?.id;
+    return heldOrders.filter((h) => {
+      if (!h.terminalId) return isPrimary;
+      return h.terminalId === activeTerminalObj.id;
+    });
+  }, [heldOrders, activeTerminalObj?.id, primaryTerminalObj?.id]);
+
+  const filteredProducts = terminalScopedProducts.filter(item => {
     // Branch Filter: Match activeBranchId. If item has no branchId or isAllBranches is true, show in primary or all branches.
     const isCurrentPrimary = activeBranchId === "main_branch" || activeBranchId === "main_default" || branchesList.find(b => b.id === activeBranchId)?.isPrimary;
     const matchesBranch = (() => {
@@ -2328,6 +2755,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
   // --- Sales Top Stat Cards Metrics Calculation ---
   const relevantOrders = ordersList.filter(o => {
+    // Separate billing stats per active terminal when a terminal is selected
+    if (activeTerminalObj?.id) {
+      if (o.terminalId !== activeTerminalObj.id) return false;
+    }
+
     // Branch Filter: If order has branchId, match activeBranchId. If order has no branchId, assign to primary branch.
     const isCurrentPrimary = activeBranchId === "main_branch" || activeBranchId === "main_default" || branchesList.find(b => b.id === activeBranchId)?.isPrimary;
     const matchesBranch = (() => {
@@ -2424,8 +2856,23 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     }}>
       {/* Top Navbar Header */}
       <header style={styles.navbar}>
-        {/* Left Area: Brand & Shop Mode */}
+        {/* Left Area: Sidebar Menu Button + Brand & Shop Mode */}
         <div style={styles.navLeftGroup}>
+          {!isPharmacist && (
+            <button
+              type="button"
+              onClick={() => setHamburgerOpen(true)}
+              style={styles.hamburgerBtn}
+              title="Open Sidebar Menu (Terminal Management & Modules)"
+              aria-label="Open Sidebar Menu"
+            >
+              <div style={styles.hamburgerIconBox}>
+                <span style={styles.hamburgerBar} />
+                <span style={styles.hamburgerBar} />
+                <span style={styles.hamburgerBar} />
+              </div>
+            </button>
+          )}
           <div 
             ref={shopModeBtnRef}
             onClick={toggleShopModeDropdown}
@@ -2465,28 +2912,6 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                   textTransform: "uppercase"
                 }}>
                   {isRestaurant ? "RESTAURANT" : isGlobalMode ? "GLOBAL SHOP" : "LOCAL SHOP"}
-                </span>
-                <span 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActiveTab("branches");
-                  }}
-                  style={{
-                    backgroundColor: "#f8fafc",
-                    color: "#0f172a",
-                    border: "1px solid #cbd5e1",
-                    fontSize: "9px",
-                    fontWeight: "800",
-                    padding: "1.5px 6px",
-                    borderRadius: "8px",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "2px",
-                    cursor: "pointer"
-                  }}
-                  title="Current Active Branch. Click to manage branches."
-                >
-                  📍 {activeBranchName}
                 </span>
                 <span 
                   onClick={(e) => {
@@ -2591,7 +3016,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
               title="Customer online orders & live delivery dispatch"
             >
               <span style={{ fontSize: "14px" }}>🌐</span>
-              <span>Online</span>
+              <span>Orders</span>
               {newOnlineOrdersCount > 0 ? (
                 <span style={styles.navBadgeRed}>
                   {newOnlineOrdersCount}
@@ -2620,23 +3045,21 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             </button>
           )}
 
-          {/* 5. Waste & Spoilage Management (Icon Only - Not shown to Pharmacist) */}
+          {/* 6. Customer CRM, Loyalty & Khata (Not shown to Pharmacist) */}
           {!isPharmacist && (
             <button
               type="button"
-              onClick={() => setActiveTab("waste")}
+              onClick={() => setActiveTab("customers")}
               style={{
                 ...styles.navTabBtn,
-                ...(activeTab === "waste" ? styles.navTabBtnActive : {}),
-                padding: "7px 11px"
+                ...(activeTab === "customers" ? styles.navTabBtnActive : {})
               }}
-              title={isRestaurant ? "Food waste, kitchen spoilage & loss calculation" : "Product waste & inventory shrinkage tracking"}
+              title="Customer Directory, Loyalty Points & Khata Credit Ledger"
             >
-              <span style={{ fontSize: "16px" }}>🗑️</span>
-              {wasteStats.todayLoss > 0 && (
-                <span style={styles.navBadgeRed}>
-                  ₹{Math.round(wasteStats.todayLoss)}
-                </span>
+              <span style={{ fontSize: "14px" }}>👥</span>
+              <span>Customers</span>
+              {crmCustomers.length > 0 && (
+                <span style={styles.navBadgeGray}>{crmCustomers.length}</span>
               )}
             </button>
           )}
@@ -2852,7 +3275,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
           )}
 
           {/* Held orders quick chip if any held */}
-          {heldOrders.length > 0 && (
+          {terminalHeldOrders.length > 0 && (
             <button 
               type="button"
               onClick={() => setShowResumeModal(true)} 
@@ -2861,7 +3284,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             >
               <span>⏸️ Held</span>
               <span style={styles.quickHeldBadge}>
-                {heldOrders.length}
+                {terminalHeldOrders.length}
               </span>
             </button>
           )}
@@ -3086,11 +3509,27 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
           )}
           <button 
             type="button"
+            onClick={() => { setActiveTab("customers"); setProfileDropdownOpen(false); }}
+            style={{ ...styles.dropdownItem, backgroundColor: activeTab === "customers" ? "#fff7ed" : "transparent", color: activeTab === "customers" ? "#fc8019" : "#334155" }}
+          >
+            🎁 Customer CRM &amp; Khata
+          </button>
+          <button 
+            type="button"
             onClick={() => { setActiveTab("branches"); setProfileDropdownOpen(false); }}
             style={{ ...styles.dropdownItem, backgroundColor: activeTab === "branches" ? "#fff7ed" : "transparent", color: activeTab === "branches" ? "#fc8019" : "#334155" }}
           >
             🏢 Multi-Store Branches (கிளைகள்)
           </button>
+          {!isStaff && (
+            <button 
+              type="button"
+              onClick={() => { setActiveTab("terminals"); setProfileDropdownOpen(false); }}
+              style={{ ...styles.dropdownItem, backgroundColor: activeTab === "terminals" ? "#fff7ed" : "transparent", color: activeTab === "terminals" ? "#fc8019" : "#334155" }}
+            >
+              🖥️ Terminal Management
+            </button>
+          )}
           <button 
             type="button"
             onClick={() => { setActiveTab("waste"); setProfileDropdownOpen(false); }}
@@ -3163,14 +3602,208 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         document.body
       )}
 
+      {/* SIDEBAR NAVIGATION DRAWER */}
+      {hamburgerOpen && createPortal(
+        <div style={styles.drawerOverlay} onClick={() => setHamburgerOpen(false)}>
+          <aside style={styles.drawerContainer} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.drawerHeader}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <span style={{ fontSize: "22px" }}>{isRestaurant ? "🍽️" : "🏪"}</span>
+                <div>
+                  <div style={{ fontWeight: "800", fontSize: "15px", color: "#0f172a" }}>
+                    {userProfile.storeName || "Kadai Pro"}
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#64748b" }}>
+                    {isStaff ? `Staff: ${staffName}` : "Store Management"}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setHamburgerOpen(false)}
+                style={styles.drawerCloseBtn}
+                aria-label="Close Sidebar Menu"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={styles.drawerContent}>
+              <div style={styles.drawerSectionHeader}>POS &amp; Operations</div>
+              <button
+                type="button"
+                onClick={() => { setActiveTab("sales"); setHamburgerOpen(false); }}
+                style={{
+                  ...styles.drawerItem,
+                  backgroundColor: activeTab === "sales" ? "#fff7ed" : "transparent",
+                  color: activeTab === "sales" ? "#ea580c" : "#1e293b",
+                  fontWeight: activeTab === "sales" ? "800" : "600",
+                }}
+              >
+                <span>🧾</span>
+                <span>POS Billing</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setActiveTab("inventory"); setHamburgerOpen(false); }}
+                style={{
+                  ...styles.drawerItem,
+                  backgroundColor: activeTab === "inventory" ? "#fff7ed" : "transparent",
+                  color: activeTab === "inventory" ? "#ea580c" : "#1e293b",
+                  fontWeight: activeTab === "inventory" ? "800" : "600",
+                }}
+              >
+                <span>📦</span>
+                <span>{isRestaurant ? "Menu Items" : "Inventory"}</span>
+              </button>
+              {!isStaff && (
+                <button
+                  type="button"
+                  onClick={() => { setActiveTab("terminals"); setHamburgerOpen(false); }}
+                  style={{
+                    ...styles.drawerItem,
+                    backgroundColor: activeTab === "terminals" ? "#eef2ff" : "transparent",
+                    color: activeTab === "terminals" ? "#4338ca" : "#1e293b",
+                    fontWeight: activeTab === "terminals" ? "800" : "700",
+                  }}
+                >
+                  <span>🖥️</span>
+                  <span>Terminal Management</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => { setActiveTab("orders"); setHamburgerOpen(false); }}
+                style={{
+                  ...styles.drawerItem,
+                  backgroundColor: activeTab === "orders" ? "#fff7ed" : "transparent",
+                  color: activeTab === "orders" ? "#ea580c" : "#1e293b",
+                  fontWeight: activeTab === "orders" ? "800" : "600",
+                }}
+              >
+                <span>🌐</span>
+                <span>Online Orders &amp; Sales</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setActiveTab("purchases"); setHamburgerOpen(false); }}
+                style={{
+                  ...styles.drawerItem,
+                  backgroundColor: activeTab === "purchases" ? "#fff7ed" : "transparent",
+                  color: activeTab === "purchases" ? "#ea580c" : "#1e293b",
+                  fontWeight: activeTab === "purchases" ? "800" : "600",
+                }}
+              >
+                <span>📊</span>
+                <span>Purchase Report</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setActiveTab("customers"); setHamburgerOpen(false); }}
+                style={{
+                  ...styles.drawerItem,
+                  backgroundColor: activeTab === "customers" ? "#fff7ed" : "transparent",
+                  color: activeTab === "customers" ? "#ea580c" : "#1e293b",
+                  fontWeight: activeTab === "customers" ? "800" : "600",
+                }}
+              >
+                <span>👥</span>
+                <span>Customer CRM &amp; Khata</span>
+              </button>
+
+              {!isStaff && (
+                <>
+                  <div style={styles.drawerSectionHeader}>Management</div>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("staff"); setHamburgerOpen(false); }}
+                    style={{
+                      ...styles.drawerItem,
+                      backgroundColor: activeTab === "staff" ? "#fff7ed" : "transparent",
+                      color: activeTab === "staff" ? "#ea580c" : "#1e293b",
+                      fontWeight: activeTab === "staff" ? "800" : "600",
+                    }}
+                  >
+                    <span>👨‍💼</span>
+                    <span>Staff &amp; Attendance</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("branches"); setHamburgerOpen(false); }}
+                    style={{
+                      ...styles.drawerItem,
+                      backgroundColor: activeTab === "branches" ? "#fff7ed" : "transparent",
+                      color: activeTab === "branches" ? "#ea580c" : "#1e293b",
+                      fontWeight: activeTab === "branches" ? "800" : "600",
+                    }}
+                  >
+                    <span>🏢</span>
+                    <span>Multi-Store Branches</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("waste"); setHamburgerOpen(false); }}
+                    style={{
+                      ...styles.drawerItem,
+                      backgroundColor: activeTab === "waste" ? "#fff7ed" : "transparent",
+                      color: activeTab === "waste" ? "#ea580c" : "#1e293b",
+                      fontWeight: activeTab === "waste" ? "800" : "600",
+                    }}
+                  >
+                    <span>🗑️</span>
+                    <span>Waste &amp; Loss Tracking</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("settings"); setHamburgerOpen(false); }}
+                    style={{
+                      ...styles.drawerItem,
+                      backgroundColor: activeTab === "settings" ? "#fff7ed" : "transparent",
+                      color: activeTab === "settings" ? "#ea580c" : "#1e293b",
+                      fontWeight: activeTab === "settings" ? "800" : "600",
+                    }}
+                  >
+                    <span>⚙️</span>
+                    <span>Settings</span>
+                  </button>
+                </>
+              )}
+            </div>
+          </aside>
+        </div>,
+        document.body
+      )}
+
       {/* Main Content Area */}
       <div style={{
         ...styles.mainContent,
-        ...(activeTab === "sales" ? { minHeight: 0, overflow: "hidden" } : {})
+        ...(activeTab === "sales" ? { minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" } : {})
       }}>
         {/* TAB 1: POS TERMINAL */}
         {activeTab === "sales" && (
-          <div style={styles.posLayout}>
+          <>
+            <PosTerminalBar
+              shopId={currentUid}
+              storeName={userProfile.storeName}
+              isStaff={isStaff}
+              staffId={staffId}
+              staffName={staffName}
+              floors={floorsList}
+              terminals={terminalsList}
+              terminalsLoaded={terminalsLoaded}
+              activeTerminal={activeTerminalObj}
+              activeSession={resolvedActiveSession}
+              onSelectTerminal={handleSelectActiveTerminal}
+              onSessionOpened={(term, sess) => {
+                handleSelectActiveTerminal(term);
+                setActiveSessionDoc(sess);
+              }}
+              onSessionClosed={() => {
+                setActiveSessionDoc(null);
+              }}
+              onOpenTerminalManagement={!isStaff ? () => setActiveTab("terminals") : undefined}
+            />
+            <div style={{ ...styles.posLayout, flex: 1, minHeight: 0 }}>
             {/* LEFT SIDE: Current Bill / Cart Summary (Full Height) */}
             <div style={styles.posLeftPane}>
               <div style={styles.posHeaderTop}>
@@ -3261,9 +3894,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     type="button"
                     onClick={() => setShowResumeModal(true)} 
                     style={{
-                      backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "#f8fafc",
-                      border: heldOrders.length > 0 ? "1.5px solid #fde68a" : "1.5px solid #e2e8f0",
-                      color: heldOrders.length > 0 ? "#b45309" : "#64748b",
+                      backgroundColor: terminalHeldOrders.length > 0 ? "#fef3c7" : "#f8fafc",
+                      border: terminalHeldOrders.length > 0 ? "1.5px solid #fde68a" : "1.5px solid #e2e8f0",
+                      color: terminalHeldOrders.length > 0 ? "#b45309" : "#64748b",
                       padding: "4px 10px",
                       borderRadius: "8px",
                       fontWeight: "700",
@@ -3276,7 +3909,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     title="View Held Bills"
                   >
                     <span>⏸️ HELD</span>
-                    {heldOrders.length > 0 && (
+                    {terminalHeldOrders.length > 0 && (
                       <span style={{
                         backgroundColor: "#d97706",
                         color: "#fff",
@@ -3285,7 +3918,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                         fontSize: "10.5px",
                         fontWeight: "800"
                       }}>
-                        {heldOrders.length}
+                        {terminalHeldOrders.length}
                       </span>
                     )}
                   </button>
@@ -3469,7 +4102,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                       opacity: currentBill.length === 0 ? 0.5 : 1
                     }} 
                     disabled={currentBill.length === 0}
-                    onClick={() => setIsCheckoutModalOpen(true)}
+                    onClick={() => {
+                      checkoutIdempotencyRef.current = `TXN-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+                      setIsCheckoutModalOpen(true);
+                    }}
                   >
                     CONTINUE தொடரவும் →
                   </button>
@@ -3905,7 +4541,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
               </div>
 
               <div style={styles.categoryScroll}>
-                {categories.map((cat, idx) => (
+                {(scopedCategories.length > 0 ? scopedCategories : categories).map((cat, idx) => (
                   <div 
                     key={idx} 
                     onClick={() => setSelectedCategory(cat)}
@@ -3921,14 +4557,64 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 ))}
               </div>
 
-              <h2 style={styles.sectionTitle}>
-                {isRestaurant ? `Available Foods (${filteredProducts.length})` : `Available Products (${filteredProducts.length})`}
-              </h2>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "8px" }}>
+                <h2 style={{ ...styles.sectionTitle, margin: 0 }}>
+                  {activeTerminalObj
+                    ? `${activeTerminalObj.name} — ${isRestaurant ? "Menu" : "Products"} (${filteredProducts.length})`
+                    : isRestaurant
+                    ? `Available Foods (${filteredProducts.length})`
+                    : `Available Products (${filteredProducts.length})`}
+                </h2>
+                {activeTerminalObj && !isStaff && (
+                  <button
+                    type="button"
+                    onClick={() => openAddModal(activeTerminalObj)}
+                    style={{
+                      padding: "6px 12px",
+                      borderRadius: "8px",
+                      border: "1.5px solid #2563eb",
+                      backgroundColor: "#eff6ff",
+                      color: "#1d4ed8",
+                      fontSize: "12px",
+                      fontWeight: "800",
+                      cursor: "pointer",
+                    }}
+                  >
+                    + Add {isRestaurant ? "Food" : "Item"} to {activeTerminalObj.name}
+                  </button>
+                )}
+              </div>
 
               {loading ? (
                 <div style={styles.centerBox}>{isRestaurant ? "Loading menu items..." : "Loading products..."}</div>
               ) : filteredProducts.length === 0 ? (
-                <div style={styles.centerBox}>{isRestaurant ? "No food items found ❌" : "No products found ❌"}</div>
+                <div style={{ ...styles.centerBox, display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
+                  <div>
+                    {activeTerminalObj
+                      ? `No ${isRestaurant ? "food items" : "products"} added to "${activeTerminalObj.name}" yet.`
+                      : isRestaurant
+                      ? "No food items found ❌"
+                      : "No products found ❌"}
+                  </div>
+                  {activeTerminalObj && !isStaff && (
+                    <button
+                      type="button"
+                      onClick={() => openAddModal(activeTerminalObj)}
+                      style={{
+                        padding: "9px 18px",
+                        borderRadius: "10px",
+                        border: "none",
+                        backgroundColor: "#2563eb",
+                        color: "#ffffff",
+                        fontSize: "13px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                      }}
+                    >
+                      + Add {isRestaurant ? "Hotel Food" : "Product"} to {activeTerminalObj.name}
+                    </button>
+                  )}
+                </div>
               ) : (
                 <div style={styles.productGrid}>
                   {filteredProducts.map((item) => {
@@ -4052,6 +4738,21 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
               )}
             </div>
           </div>
+          </>
+        )}
+
+        {/* TERMINAL MANAGEMENT TAB */}
+        {activeTab === "terminals" && !isStaff && (
+          <TerminalManagement
+            userProfile={userProfile}
+            rawUserData={rawUserData}
+            ordersList={ordersList}
+            onSelectTerminalForPos={(term) => {
+              handleSelectActiveTerminal(term);
+              setActiveTab("sales");
+            }}
+            onBack={() => setActiveTab("sales")}
+          />
         )}
 
         {/* PROFILE PAGE TAB */}
@@ -4074,7 +4775,20 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             setStoreSettings={setStoreSettings} 
             printSettings={printSettings}
             setPrintSettings={setPrintSettings}
+            crmConfig={crmConfig}
+            setCrmConfig={setCrmConfig}
             setPopupModal={setPopupModal} 
+          />
+        )}
+
+        {/* CUSTOMER CRM, LOYALTY & KHATA TAB */}
+        {activeTab === "customers" && (
+          <CustomerManagement
+            userProfile={userProfile}
+            storeSettings={storeSettings}
+            ordersList={ordersList}
+            onlineOrdersList={onlineOrdersList}
+            onBack={() => setActiveTab("sales")}
           />
         )}
 
@@ -4221,18 +4935,188 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     <span>→</span>
                   </button>
                 )}
-                <button onClick={openAddModal} style={styles.addNewBtn}>
+                <button onClick={() => openAddModal()} style={styles.addNewBtn}>
                   {isRestaurant ? "+ Add New Food" : isGlobalMode ? "+ Add Global Product" : "+ Add Local Product"}
                 </button>
               </div>
             </div>
+            {terminalsList.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginBottom: "18px", backgroundColor: "#f8fafc", padding: "12px 16px", borderRadius: "14px", border: "1px solid #e2e8f0" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: "12px", fontWeight: "800", color: "#0f172a" }}>
+                      📦 Catalog Mode:
+                    </span>
+                    {[
+                      { id: INVENTORY_MODES.SHARED, label: "Shared (All Terminals)" },
+                      { id: INVENTORY_MODES.FLOOR_WISE, label: "Floor-wise" },
+                      { id: INVENTORY_MODES.TERMINAL_WISE, label: "Terminal-wise (Separate per Terminal)" },
+                    ].map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await setShopInventoryMode(db, currentUid, m.id);
+                          } catch (err) {
+                            alert("Could not switch mode: " + err.message);
+                          }
+                        }}
+                        style={{
+                          padding: "5px 11px",
+                          borderRadius: "8px",
+                          border: "1px solid " + (shopInventoryMode === m.id ? "#0f172a" : "#cbd5e1"),
+                          backgroundColor: shopInventoryMode === m.id ? "#0f172a" : "#ffffff",
+                          color: shopInventoryMode === m.id ? "#ffffff" : "#475569",
+                          fontSize: "12px",
+                          fontWeight: "700",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {primaryTerminalObj && products.some((p) => !p.terminalId && (!p.floorId || p.floorId === "all")) && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const targetCol = isRestaurant ? "restaurant_menu" : isGlobalMode ? "global_inventory" : "inventory";
+                        const unassignedCount = products.filter((p) => !p.terminalId && (!p.floorId || p.floorId === "all")).length;
+                        if (!window.confirm(`Assign ${unassignedCount} unassigned items (e.g. existing items) to "${primaryTerminalObj.name}"?`)) {
+                          return;
+                        }
+                        try {
+                          const count = await assignUnassignedProductsToTerminal(db, currentUid, targetCol, products, primaryTerminalObj);
+                          setPopupModal({ show: true, message: `Assigned ${count} items to ${primaryTerminalObj.name}! ✅` });
+                        } catch (err) {
+                          alert("Failed to assign items: " + err.message);
+                        }
+                      }}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: "8px",
+                        border: "1px solid #bbf7d0",
+                        backgroundColor: "#f0fdf4",
+                        color: "#15803d",
+                        fontSize: "11.5px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                      }}
+                    >
+                      📌 Save Existing Items to {primaryTerminalObj.name}
+                    </button>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: "12px", fontWeight: "800", color: "#3730a3" }}>
+                    🖥️ View by Terminal:
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setInventoryTerminalFilter("all")}
+                    style={{
+                      padding: "5px 12px",
+                      borderRadius: "8px",
+                      border: "1px solid " + (inventoryTerminalFilter === "all" ? "#2563eb" : "#cbd5e1"),
+                      backgroundColor: inventoryTerminalFilter === "all" ? "#2563eb" : "#ffffff",
+                      color: inventoryTerminalFilter === "all" ? "#ffffff" : "#334155",
+                      fontSize: "12px",
+                      fontWeight: "700",
+                      cursor: "pointer"
+                    }}
+                  >
+                    All Items ({products.length})
+                  </button>
+                  {terminalsList.map((t) => {
+                    const tCount = filterProductsForCatalog(products, {
+                      inventoryMode: shopInventoryMode,
+                      terminalId: t.id,
+                      floorId: t.floorId,
+                      primaryTerminalId: primaryTerminalObj?.id || null,
+                    }).length;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => setInventoryTerminalFilter(t.id)}
+                        style={{
+                          padding: "5px 12px",
+                          borderRadius: "8px",
+                          border: "1px solid " + (inventoryTerminalFilter === t.id ? "#2563eb" : "#cbd5e1"),
+                          backgroundColor: inventoryTerminalFilter === t.id ? "#2563eb" : "#ffffff",
+                          color: inventoryTerminalFilter === t.id ? "#ffffff" : "#334155",
+                          fontSize: "12px",
+                          fontWeight: "700",
+                          cursor: "pointer"
+                        }}
+                      >
+                        {t.name} ({t.floorName}) • {tCount}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {shopInventoryMode === INVENTORY_MODES.FLOOR_WISE && floorsList.length > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px", flexWrap: "wrap", backgroundColor: "#eef2ff", padding: "10px 14px", borderRadius: "12px", border: "1px solid #c7d2fe" }}>
+                <span style={{ fontSize: "12px", fontWeight: "800", color: "#3730a3" }}>
+                  🏢 Floor-wise Inventory Filter:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setInventoryFloorFilter("all")}
+                  style={{
+                    padding: "5px 12px",
+                    borderRadius: "8px",
+                    border: "1px solid " + (inventoryFloorFilter === "all" ? "#4338ca" : "#cbd5e1"),
+                    backgroundColor: inventoryFloorFilter === "all" ? "#4338ca" : "#ffffff",
+                    color: inventoryFloorFilter === "all" ? "#ffffff" : "#334155",
+                    fontSize: "12px",
+                    fontWeight: "700",
+                    cursor: "pointer"
+                  }}
+                >
+                  All Floors ({products.length})
+                </button>
+                {floorsList.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setInventoryFloorFilter(f.id)}
+                    style={{
+                      padding: "5px 12px",
+                      borderRadius: "8px",
+                      border: "1px solid " + (inventoryFloorFilter === f.id ? "#4338ca" : "#cbd5e1"),
+                      backgroundColor: inventoryFloorFilter === f.id ? "#4338ca" : "#ffffff",
+                      color: inventoryFloorFilter === f.id ? "#ffffff" : "#334155",
+                      fontSize: "12px",
+                      fontWeight: "700",
+                      cursor: "pointer"
+                    }}
+                  >
+                    {f.name}
+                  </button>
+                ))}
+              </div>
+            )}
             {products.length === 0 ? (
               <div style={styles.centerBox}>
                 No {isRestaurant ? "food items" : isGlobalMode ? "global products" : "local products"} found. Click above to add your first item!
               </div>
             ) : (
               <div style={styles.productGrid}>
-                {products.map((item) => (
+                {filterProductsForCatalog(products, {
+                  inventoryMode: shopInventoryMode,
+                  terminalId: inventoryTerminalFilter !== "all" ? inventoryTerminalFilter : null,
+                  floorId:
+                    inventoryTerminalFilter !== "all"
+                      ? terminalsList.find((t) => t.id === inventoryTerminalFilter)?.floorId || null
+                      : inventoryFloorFilter,
+                  primaryTerminalId: primaryTerminalObj?.id || null,
+                }).map((item) => (
                   <div 
                     key={item.id} 
                     style={{ ...styles.productCard, cursor: "pointer" }}
@@ -4253,6 +5137,16 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     <div style={styles.productDetails}>
                       <h4 style={styles.productName}>{item.itemName || item.name}</h4>
                       <p style={styles.productCategory}>₹{item.salesPrice || item.price || 0}</p>
+                      {item.terminalId && item.terminalId !== "all" ? (
+                        <div style={{ fontSize: "10.5px", color: "#15803d", fontWeight: "700", backgroundColor: "#f0fdf4", padding: "2px 7px", borderRadius: "6px", display: "inline-block", marginTop: "3px" }}>
+                          🖥️ {item.terminalName || terminalsList.find((t) => t.id === item.terminalId)?.name || "Terminal"}
+                          {item.floorName && item.floorName !== "All Floors" ? ` • ${item.floorName}` : ""}
+                        </div>
+                      ) : shopInventoryMode === INVENTORY_MODES.FLOOR_WISE && item.floorId && item.floorId !== "all" ? (
+                        <div style={{ fontSize: "10.5px", color: "#4338ca", fontWeight: "700", backgroundColor: "#eef2ff", padding: "2px 7px", borderRadius: "6px", display: "inline-block", marginTop: "3px" }}>
+                          🏢 {item.floorName || floorsList.find((f) => f.id === item.floorId)?.name || "Assigned Floor"}
+                        </div>
+                      ) : null}
                       {item.makingCost !== undefined && item.makingCost > 0 && (
                         <div style={{ fontSize: "11px", color: "#16a34a", fontWeight: "800", marginTop: "2px", backgroundColor: "#f0fdf4", padding: "2px 6px", borderRadius: "6px", display: "inline-block" }}>
                           Making: ₹{item.makingCost} • Profit: +₹{item.grossProfit} ({item.profitMarginPercent}%)
@@ -4426,21 +5320,21 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                   Pending Held Bills / நிலுவை பில்கள்
                 </h3>
                 <span style={{
-                  backgroundColor: heldOrders.length > 0 ? "#fef3c7" : "#f1f5f9",
-                  color: heldOrders.length > 0 ? "#b45309" : "#64748b",
+                  backgroundColor: terminalHeldOrders.length > 0 ? "#fef3c7" : "#f1f5f9",
+                  color: terminalHeldOrders.length > 0 ? "#b45309" : "#64748b",
                   padding: "2px 8px",
                   borderRadius: "12px",
                   fontSize: "12px",
                   fontWeight: "800"
                 }}>
-                  {heldOrders.length} {heldOrders.length === 1 ? "Bill" : "Bills"}
+                  {terminalHeldOrders.length} {terminalHeldOrders.length === 1 ? "Bill" : "Bills"}
                 </span>
               </div>
               <button onClick={() => setShowResumeModal(false)} style={{ background: "transparent", border: "none", fontSize: "16px", cursor: "pointer", fontWeight: "800" }}>✕</button>
             </div>
 
             <div style={{ flex: 1, overflowY: "auto", minHeight: "160px", paddingRight: "4px" }}>
-              {heldOrders.length === 0 ? (
+              {terminalHeldOrders.length === 0 ? (
                 <div style={{ textAlign: "center", padding: "40px 20px", color: "#64748b" }}>
                   <span style={{ fontSize: "40px", display: "block", marginBottom: "10px" }}>🧾</span>
                   <h4 style={{ margin: "0 0 6px 0", color: "#0f172a", fontSize: "16px" }}>No bills on hold!</h4>
@@ -4448,7 +5342,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-                  {heldOrders.map((order) => {
+                  {terminalHeldOrders.map((order) => {
                     const itemCount = (order.items || []).reduce((sum, itm) => sum + (itm.qty || 1), 0);
                     const orderTotal = Number(order.totalAmount || order.total || 0);
 
@@ -4693,7 +5587,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 }}>
                   🎟️ Token: #{activeTableOrderInfo?.tokenNumber || getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: auth.currentUser?.uid || localStorage.getItem("uid") })}
                 </span>
-                <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>₹{totalBillAmount}.00</span>
+                <span style={{ fontSize: "18px", fontWeight: "800", color: "#fc8019" }}>
+                  ₹{netCheckoutTotal.toFixed(2)}
+                  {appliedLoyaltyDiscount > 0 ? ` (Saved ₹${appliedLoyaltyDiscount.toFixed(0)})` : ""}
+                </span>
               </div>
 
               {/* Restaurant Mode Table / Parcel Indicator & Option */}
@@ -4768,6 +5665,33 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
                 <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
+                  <label style={styles.label}>Phone No. (CRM / Loyalty / Khata)</label>
+                  <input 
+                    type="tel" 
+                    list="kadai-crm-customer-phones"
+                    placeholder="10-digit mobile" 
+                    value={customerPhone} 
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setCustomerPhone(val);
+                      setRedeemLoyaltyPoints(false);
+                      const phone10 = normalizePhone10(val);
+                      if (phone10.length === 10) {
+                        const match = crmCustomers.find((c) => normalizePhone10(c.phone || c.id) === phone10);
+                        if (match?.name && !customerName.trim()) {
+                          setCustomerName(match.name);
+                        }
+                      }
+                    }} 
+                    style={styles.modalInput} 
+                  />
+                  <datalist id="kadai-crm-customer-phones">
+                    {crmCustomers.slice(0, 30).map((c) => (
+                      <option key={c.id} value={c.phone}>{c.name} ({Number(c.loyaltyPoints || 0)} pts)</option>
+                    ))}
+                  </datalist>
+                </div>
+                <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
                   <label style={styles.label}>Customer Name (Optional)</label>
                   <input 
                     type="text" 
@@ -4777,17 +5701,47 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     style={styles.modalInput} 
                   />
                 </div>
-                <div style={{ ...styles.inputGroup, flex: 1, minWidth: "140px" }}>
-                  <label style={styles.label}>Phone No. (Optional)</label>
-                  <input 
-                    type="tel" 
-                    placeholder="10-digit number" 
-                    value={customerPhone} 
-                    onChange={(e) => setCustomerPhone(e.target.value)} 
-                    style={styles.modalInput} 
-                  />
-                </div>
               </div>
+
+              {isValidPhone10(customerPhone) && (
+                <div style={{
+                  padding: "8px 12px",
+                  borderRadius: "8px",
+                  border: "1px solid #c7d2fe",
+                  backgroundColor: "#eef2ff",
+                  marginBottom: "6px",
+                  fontSize: "12px",
+                }}>
+                  {matchedCheckoutCustomer ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontWeight: "700", color: "#3730a3", flexWrap: "wrap", gap: "6px" }}>
+                        <span>✓ {matchedCheckoutCustomer.name}</span>
+                        <span>
+                          🎁 {Number(matchedCheckoutCustomer.loyaltyPoints || 0)} pts
+                          {Number(matchedCheckoutCustomer.creditBalance || 0) > 0
+                            ? ` • Due: ₹${Number(matchedCheckoutCustomer.creditBalance).toFixed(0)}`
+                            : ""}
+                        </span>
+                      </div>
+                      {loyaltyRedeemInfo.maxPoints > 0 && (
+                        <label style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: "700", color: "#15803d", cursor: "pointer" }}>
+                          <input
+                            type="checkbox"
+                            checked={redeemLoyaltyPoints}
+                            onChange={(e) => setRedeemLoyaltyPoints(e.target.checked)}
+                            style={{ accentColor: "#16a34a" }}
+                          />
+                          <span>Redeem {loyaltyRedeemInfo.maxPoints} Loyalty Pts (-₹{loyaltyRedeemInfo.maxDiscount.toFixed(2)})</span>
+                        </label>
+                      )}
+                    </div>
+                  ) : (
+                    <span style={{ color: "#4338ca", fontWeight: "700" }}>
+                      ✨ New CRM Customer (+91 {normalizedCheckoutPhone}) — will auto-save &amp; earn Loyalty Points
+                    </span>
+                  )}
+                </div>
+              )}
 
               {/* WhatsApp E-Bill Option */}
               <div style={{ width: "100%", marginTop: "-4px", marginBottom: "8px" }}>
@@ -4858,6 +5812,18 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                       <span style={{ fontWeight: "700", fontSize: "13px", color: "#1e293b" }}>Card</span>
                     </div>
                   )}
+
+                  <div 
+                    onClick={() => setPaymentMethod("Credit")}
+                    style={{
+                      ...styles.paymentCardOption,
+                      borderColor: paymentMethod === "Credit" ? "#dc2626" : "#cbd5e1",
+                      backgroundColor: paymentMethod === "Credit" ? "#fef2f2" : "#ffffff"
+                    }}
+                  >
+                    <span style={{ fontSize: "22px" }}>📒</span>
+                    <span style={{ fontWeight: "700", fontSize: "13px", color: paymentMethod === "Credit" ? "#dc2626" : "#1e293b" }}>Khata</span>
+                  </div>
                 </div>
               </div>
 
@@ -4865,24 +5831,29 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 <div style={styles.qrContainer}>
                   <div style={styles.qrBox}>
                     <img 
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(`upi://pay?pa=${storeSettings.upiId}&pn=${encodeURIComponent(userProfile.storeName)}&am=${totalBillAmount}&cu=INR`)}`} 
+                      src={`https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(`upi://pay?pa=${storeSettings.upiId}&pn=${encodeURIComponent(userProfile.storeName)}&am=${netCheckoutTotal}&cu=INR`)}`} 
                       alt="UPI QR Code" 
                       style={{ width: "120px", height: "120px", borderRadius: "8px" }}
                     />
                   </div>
                   <div style={{ textAlign: "center" }}>
-                    <p style={{ margin: "0 0 2px 0", fontSize: "12px", fontWeight: "700", color: "#1e293b" }}>Scan & Pay ₹{totalBillAmount}.00</p>
+                    <p style={{ margin: "0 0 2px 0", fontSize: "12px", fontWeight: "700", color: "#1e293b" }}>Scan &amp; Pay ₹{netCheckoutTotal.toFixed(2)}</p>
                     <p style={{ margin: 0, fontSize: "11px", color: "#64748b" }}>UPI ID: {storeSettings.upiId}</p>
                   </div>
                 </div>
               )}
 
               <div style={{ ...styles.modalBtns, display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                <button type="submit" style={{ ...styles.saveModalBtn, flex: 1, minWidth: "150px" }}>
-                  Confirm & Print Bill 🖨️
+                <button
+                  type="submit"
+                  disabled={isSubmittingCheckout}
+                  style={{ ...styles.saveModalBtn, flex: 1, minWidth: "150px", opacity: isSubmittingCheckout ? 0.65 : 1 }}
+                >
+                  {isSubmittingCheckout ? "Processing..." : "Confirm & Print Bill 🖨️"}
                 </button>
                 <button 
-                  type="button" 
+                  type="button"
+                  disabled={isSubmittingCheckout}
                   onClick={(e) => {
                     setSendWhatsAppBill(true);
                     handleFinalCheckoutSubmit(e);
@@ -4895,10 +5866,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     display: "flex", 
                     alignItems: "center", 
                     justifyContent: "center", 
-                    gap: "6px" 
+                    gap: "6px",
+                    opacity: isSubmittingCheckout ? 0.65 : 1,
                   }}
                 >
-                  <span>Confirm & WhatsApp 📲</span>
+                  <span>{isSubmittingCheckout ? "Processing..." : "Confirm & WhatsApp 📲"}</span>
                 </button>
                 <button type="button" onClick={() => setIsCheckoutModalOpen(false)} style={styles.cancelModalBtn}>Cancel</button>
               </div>
@@ -5531,6 +6503,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 return "";
               })()}
               {" | Paid via: " + (selectedOrderDetails.paymentMethod || selectedOrderDetails.paymentMode || "Cash")}
+              {selectedOrderDetails.terminalName && (
+                <span>
+                  {" | 🖥️ " + selectedOrderDetails.terminalName + (selectedOrderDetails.floorName ? ` (${selectedOrderDetails.floorName})` : "")}
+                </span>
+              )}
             </p>
             <div style={{ maxHeight: "220px", overflowY: "auto", margin: "10px 0", borderTop: "1px solid #eee", borderBottom: "1px solid #eee", padding: "10px 0" }}>
               {(selectedOrderDetails.items || []).map((item, i) => (
@@ -6229,6 +7206,51 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                 onChange={e => setBrand(e.target.value)} 
                 style={styles.modalInput} 
               />
+              {terminalsList.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <label style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>
+                    Assigned Terminal (Separate Menu / Billing)
+                  </label>
+                  <select
+                    value={productTerminalId}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setProductTerminalId(val);
+                      const chosen = terminalsList.find((t) => t.id === val);
+                      if (chosen) {
+                        setProductFloorId(chosen.floorId || "all");
+                      }
+                    }}
+                    style={{ ...styles.modalInput, cursor: "pointer", backgroundColor: "#ffffff" }}
+                  >
+                    <option value="all">🌐 Shared Across All Terminals</option>
+                    {terminalsList.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        🖥️ {t.name} ({t.code}) — {t.floorName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {shopInventoryMode === INVENTORY_MODES.FLOOR_WISE && productTerminalId === "all" && floorsList.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <label style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>
+                    Assigned Floor (Floor-wise Inventory)
+                  </label>
+                  <select
+                    value={productFloorId}
+                    onChange={(e) => setProductFloorId(e.target.value)}
+                    style={{ ...styles.modalInput, cursor: "pointer", backgroundColor: "#ffffff" }}
+                  >
+                    <option value="all">🌐 Shared Across All Floors</option>
+                    {floorsList.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        🏢 {f.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                 <label style={{ fontSize: "12px", fontWeight: "700" }}>{isRestaurant ? "Food Photo" : "Product Photo"}</label>
                 <input type="file" accept="image/*" onChange={handleImageChange} style={{ fontSize: "12px" }} />
@@ -6565,7 +7587,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
             {/* List of Products */}
             <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px", maxHeight: "320px", paddingRight: "4px" }}>
-              {products
+              {(activeTerminalObj ? terminalScopedProducts : products)
                 .filter(p => {
                   const pName = p.itemName || p.name || "";
                   const pCat = p.category || "";

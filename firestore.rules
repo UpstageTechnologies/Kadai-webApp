@@ -3,6 +3,45 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function isMaster() {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "master";
+    }
+
+    function isShopOwnerOrMaster(userId) {
+      return request.auth != null && (request.auth.uid == userId || isMaster());
+    }
+
+    function notOtherShopOwner(userId) {
+      return request.auth == null || request.auth.uid == userId || isMaster();
+    }
+
+    function isActiveShopStaff(userId, staffId) {
+      return staffId is string &&
+        staffId.size() > 0 &&
+        exists(/databases/$(database)/documents/users/$(userId)/staffs/$(staffId)) &&
+        get(/databases/$(database)/documents/users/$(userId)/staffs/$(staffId)).data.isActive != false &&
+        get(/databases/$(database)/documents/users/$(userId)/staffs/$(staffId)).data.status != "inactive";
+    }
+
+    function isAuthorizedTerminalStaff(userId, termData, staffId) {
+      return termData != null &&
+        termData.status == "active" &&
+        termData.assignedStaffIds is list &&
+        staffId in termData.assignedStaffIds &&
+        isActiveShopStaff(userId, staffId);
+    }
+
+    function isAuthorizedTerminalStaffById(userId, terminalId, staffId) {
+      return exists(/databases/$(database)/documents/users/$(userId)/terminals/$(terminalId)) &&
+        isAuthorizedTerminalStaff(
+          userId,
+          get(/databases/$(database)/documents/users/$(userId)/terminals/$(terminalId)).data,
+          staffId
+        );
+    }
+
     /* ================= ROOT STAFFS MIRROR ================= */
     match /staffs/{staffId} {
       allow read: if true;
@@ -133,6 +172,153 @@ service cloud.firestore {
         allow read: if true;
         allow create, update: if request.auth != null;
         allow delete: if false;
+      }
+
+      /* ================= POS SALES, ACTIVE CART & HELD ORDERS ================= */
+      match /sales/{saleId} {
+        allow read: if notOtherShopOwner(userId);
+        allow create, update: if notOtherShopOwner(userId);
+        allow delete: if false;
+      }
+
+      match /active_cart/{cartId} {
+        allow read, write: if notOtherShopOwner(userId);
+      }
+
+      match /held_orders/{orderId} {
+        allow read, write: if notOtherShopOwner(userId);
+      }
+
+      /* ================= FLOOR & POS TERMINAL ARCHITECTURE ================= */
+      match /floors/{floorId} {
+        allow read: if notOtherShopOwner(userId);
+        allow create, update: if isShopOwnerOrMaster(userId) &&
+          request.resource.data.shopId == userId;
+        allow delete: if isShopOwnerOrMaster(userId);
+      }
+
+      match /terminals/{terminalId} {
+        allow read: if notOtherShopOwner(userId);
+        allow create: if isShopOwnerOrMaster(userId) &&
+          request.resource.data.shopId == userId &&
+          request.resource.data.floorId is string &&
+          request.resource.data.code is string;
+        allow delete: if isShopOwnerOrMaster(userId) &&
+          resource.data.sessionStatus != "open";
+        allow update: if (
+          isShopOwnerOrMaster(userId) &&
+          request.resource.data.shopId == userId
+        ) || (
+          notOtherShopOwner(userId) &&
+          request.resource.data.shopId == userId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "sessionStatus",
+            "currentSessionId",
+            "activeStaffId",
+            "activeStaffName",
+            "lastActiveAt",
+            "deviceInfo",
+            "updatedAt"
+          ]) &&
+          isAuthorizedTerminalStaff(
+            userId,
+            resource.data,
+            request.resource.data.activeStaffId != null
+              ? request.resource.data.activeStaffId
+              : resource.data.activeStaffId
+          )
+        );
+
+        match /sessions/{sessionId} {
+          allow read: if notOtherShopOwner(userId);
+          allow create: if notOtherShopOwner(userId) &&
+            request.resource.data.shopId == userId &&
+            request.resource.data.terminalId == terminalId &&
+            (
+              isShopOwnerOrMaster(userId) ||
+              isAuthorizedTerminalStaffById(userId, terminalId, request.resource.data.staffId)
+            );
+          allow update: if notOtherShopOwner(userId) &&
+            request.resource.data.shopId == userId &&
+            (
+              isShopOwnerOrMaster(userId) ||
+              isAuthorizedTerminalStaffById(userId, terminalId, resource.data.staffId)
+            );
+          allow delete: if false;
+        }
+
+        match /transactions/{transactionId} {
+          allow read: if notOtherShopOwner(userId);
+          allow create: if notOtherShopOwner(userId) &&
+            request.resource.data.shopId == userId &&
+            request.resource.data.terminalId == terminalId &&
+            (
+              isShopOwnerOrMaster(userId) ||
+              isAuthorizedTerminalStaffById(userId, terminalId, request.resource.data.staffId)
+            );
+          allow update: if notOtherShopOwner(userId) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              "status",
+              "refundReason",
+              "refundedBy",
+              "refundedAtMs",
+              "updatedAt"
+            ]) &&
+            (
+              isShopOwnerOrMaster(userId) ||
+              isAuthorizedTerminalStaffById(userId, terminalId, resource.data.staffId)
+            );
+          allow delete: if false;
+        }
+
+        /* 🏷️ TERMINAL-SPECIFIC CATEGORIES */
+        match /categories/{categoryId} {
+          allow read: if notOtherShopOwner(userId);
+          allow create, update: if isShopOwnerOrMaster(userId) &&
+            request.resource.data.shopId == userId &&
+            request.resource.data.terminalId == terminalId;
+          allow delete: if isShopOwnerOrMaster(userId);
+        }
+
+        /* 🛍️ TERMINAL PRODUCT ASSIGNMENTS (MODEL A INDEPENDENT & MODEL B SHARED OVERRIDES) */
+        match /products/{assignmentId} {
+          allow read: if notOtherShopOwner(userId);
+          allow create, update: if isShopOwnerOrMaster(userId) &&
+            request.resource.data.shopId == userId &&
+            request.resource.data.terminalId == terminalId &&
+            (request.resource.data.productSource in ["independent", "shared"]) &&
+            (request.resource.data.stockMode in ["independent", "shared"]);
+          allow delete: if isShopOwnerOrMaster(userId);
+        }
+
+        /* 📦 TERMINAL INDEPENDENT STOCK LEDGER */
+        match /inventory/{productId} {
+          allow read: if notOtherShopOwner(userId);
+          allow create, update: if notOtherShopOwner(userId) &&
+            request.resource.data.shopId == userId &&
+            request.resource.data.terminalId == terminalId &&
+            (
+              request.resource.data.stockQuantity >= 0 ||
+              get(/databases/$(database)/documents/users/$(userId)).data.allowNegativeStock == true
+            ) &&
+            (
+              isShopOwnerOrMaster(userId) ||
+              isAuthorizedTerminalStaffById(userId, terminalId, request.resource.data.updatedByStaffId)
+            );
+          allow delete: if isShopOwnerOrMaster(userId);
+        }
+      }
+
+      /* 📜 IMMUTABLE STOCK MOVEMENT AUDIT TRAIL */
+      match /stock_movements/{movementId} {
+        allow read: if notOtherShopOwner(userId);
+        allow create: if notOtherShopOwner(userId) &&
+          request.resource.data.shopId == userId &&
+          (
+            isShopOwnerOrMaster(userId) ||
+            isAuthorizedTerminalStaffById(userId, request.resource.data.terminalId, request.resource.data.staffId)
+          );
+        allow update, delete: if false;
       }
 
       /* Default fallback for other subcollections */

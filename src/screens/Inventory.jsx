@@ -3,6 +3,13 @@ import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc } fro
 import { db, auth } from "../utils/firebase";
 import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
 import { logWasteRecord, WASTE_REASONS } from "../utils/wasteService";
+import {
+  INVENTORY_MODES,
+  filterProductsForCatalog,
+  getShopInventoryMode,
+  subscribeFloors,
+  subscribeTerminals,
+} from "../utils/terminalService";
 
 export default function Inventory() {
   const [items, setItems] = useState([]);
@@ -28,6 +35,20 @@ export default function Inventory() {
   const [salesPrice, setSalesPrice] = useState("");
   const [quantity, setQuantity] = useState("");
   const [image, setImage] = useState("");
+  const [productFloorId, setProductFloorId] = useState("all");
+  const [productTerminalId, setProductTerminalId] = useState("all");
+  const [floorsList, setFloorsList] = useState([]);
+  const [terminalsList, setTerminalsList] = useState([]);
+  const [explicitInvMode, setExplicitInvMode] = useState(null);
+  const shopInvMode =
+    explicitInvMode ||
+    (terminalsList.length > 1 ? INVENTORY_MODES.TERMINAL_WISE : INVENTORY_MODES.SHARED);
+  const primaryTerminalId =
+    terminalsList.find((t) => t.isPrimary === true || t.id === "terminal_1")?.id ||
+    terminalsList[0]?.id ||
+    null;
+  const [floorFilter, setFloorFilter] = useState("all");
+  const [terminalFilter, setTerminalFilter] = useState("all");
 
   // Web Image Search States
   const [webImageModalOpen, setWebImageModalOpen] = useState(false);
@@ -104,6 +125,7 @@ export default function Inventory() {
         const uDoc = await getDoc(doc(db, "users", currentUid));
         if (uDoc.exists()) {
           const d = uDoc.data();
+          setExplicitInvMode(d.inventoryMode ? getShopInventoryMode(d) : null);
           const st = (d.shopType || d.shop_type || d.businessType || "").trim();
           if (st) {
             setShopType(st);
@@ -115,6 +137,8 @@ export default function Inventory() {
       }
     };
     checkType();
+    const unsubFloors = subscribeFloors(db, currentUid, setFloorsList, () => {});
+    const unsubTerminals = subscribeTerminals(db, currentUid, setTerminalsList, () => {});
 
     // Real-time listener for user's inventory or restaurant_menu
     const colName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
@@ -150,7 +174,11 @@ export default function Inventory() {
       setLoading(false);
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      unsubFloors();
+      unsubTerminals();
+    };
   }, [isRestaurant, appMode]);
 
   const convertToWhiteStudioBackground = (imageUrl) => {
@@ -202,6 +230,12 @@ export default function Inventory() {
     setSalesPrice("");
     setQuantity(isRestaurant ? "100" : "");
     setImage("");
+    setProductTerminalId(terminalFilter !== "all" ? terminalFilter : "all");
+    setProductFloorId(
+      terminalFilter !== "all"
+        ? terminalsList.find((t) => t.id === terminalFilter)?.floorId || "all"
+        : "all"
+    );
     setModalVisible(true);
   };
 
@@ -216,6 +250,8 @@ export default function Inventory() {
     setSalesPrice(String(item.salesPrice ?? item.price ?? ""));
     setQuantity(String(item.quantity ?? "0"));
     setImage(item.image || item.imageUrl || "");
+    setProductTerminalId(item.terminalId || "all");
+    setProductFloorId(item.floorId || "all");
     setModalVisible(true);
   };
 
@@ -325,6 +361,9 @@ export default function Inventory() {
     try {
       const colName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
       const targetRef = collection(db, "users", currentUid, colName);
+      const chosenTerminal = terminalsList.find((t) => t.id === productTerminalId);
+      const resolvedFloorId = chosenTerminal?.floorId || productFloorId || "all";
+      const chosenFloor = floorsList.find((f) => f.id === resolvedFloorId);
       const productData = {
         name: itemName.trim(),
         itemName: itemName.trim(),
@@ -337,7 +376,12 @@ export default function Inventory() {
         image: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         imageUrl: image.trim() || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
         isGlobalMode: isGlobalMode,
-        inventoryMode: isGlobalMode ? "global" : "local"
+        inventoryMode: isGlobalMode ? "global" : "local",
+        terminalId: chosenTerminal ? chosenTerminal.id : "all",
+        terminalName: chosenTerminal ? chosenTerminal.name : "All Terminals",
+        terminalCode: chosenTerminal ? chosenTerminal.code : "",
+        floorId: resolvedFloorId !== "all" ? resolvedFloorId : "all",
+        floorName: chosenFloor ? chosenFloor.name : "All Floors"
       };
 
       if (currentItemId) {
@@ -427,7 +471,15 @@ export default function Inventory() {
     }
   };
 
-  const filteredItems = items.filter(item => {
+  const filteredItems = filterProductsForCatalog(items, {
+    inventoryMode: shopInvMode,
+    terminalId: terminalFilter !== "all" ? terminalFilter : null,
+    floorId:
+      terminalFilter !== "all"
+        ? terminalsList.find((t) => t.id === terminalFilter)?.floorId || null
+        : floorFilter,
+    primaryTerminalId,
+  }).filter(item => {
     const name = item.itemName || item.name || "";
     const cat = item.category || "";
     const brd = item.brand || "";
@@ -456,6 +508,88 @@ export default function Inventory() {
           style={styles.searchInput}
         />
       </div>
+
+      {terminalsList.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
+          <span style={{ fontSize: "12px", fontWeight: "700", color: "#1d4ed8" }}>Terminal:</span>
+          <button
+            type="button"
+            onClick={() => setTerminalFilter("all")}
+            style={{
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px solid #cbd5e1",
+              backgroundColor: terminalFilter === "all" ? "#2563eb" : "#ffffff",
+              color: terminalFilter === "all" ? "#ffffff" : "#334155",
+              fontSize: "12px",
+              fontWeight: "700",
+              cursor: "pointer"
+            }}
+          >
+            All Terminals
+          </button>
+          {terminalsList.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setTerminalFilter(t.id)}
+              style={{
+                padding: "5px 12px",
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                backgroundColor: terminalFilter === t.id ? "#2563eb" : "#ffffff",
+                color: terminalFilter === t.id ? "#ffffff" : "#334155",
+                fontSize: "12px",
+                fontWeight: "700",
+                cursor: "pointer"
+              }}
+            >
+              {t.name} ({t.floorName})
+            </button>
+          ))}
+        </div>
+      )}
+
+      {shopInvMode === INVENTORY_MODES.FLOOR_WISE && floorsList.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px", flexWrap: "wrap" }}>
+          <span style={{ fontSize: "12px", fontWeight: "700", color: "#4338ca" }}>Floor:</span>
+          <button
+            type="button"
+            onClick={() => setFloorFilter("all")}
+            style={{
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px solid #cbd5e1",
+              backgroundColor: floorFilter === "all" ? "#4f46e5" : "#ffffff",
+              color: floorFilter === "all" ? "#ffffff" : "#334155",
+              fontSize: "12px",
+              fontWeight: "700",
+              cursor: "pointer"
+            }}
+          >
+            All Floors
+          </button>
+          {floorsList.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              onClick={() => setFloorFilter(f.id)}
+              style={{
+                padding: "5px 12px",
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                backgroundColor: floorFilter === f.id ? "#4f46e5" : "#ffffff",
+                color: floorFilter === f.id ? "#ffffff" : "#334155",
+                fontSize: "12px",
+                fontWeight: "700",
+                cursor: "pointer"
+              }}
+            >
+              {f.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Products List / Grid */}
       {loading ? (
@@ -585,6 +719,47 @@ export default function Inventory() {
                   placeholder={isRestaurant ? "e.g. Spicy, Veg, Non-Veg" : "Brand Name"}
                 />
               </div>
+              {terminalsList.length > 0 && (
+                <div style={styles.inputGroup}>
+                  <label style={styles.label}>Assigned Terminal</label>
+                  <select
+                    value={productTerminalId}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setProductTerminalId(val);
+                      const chosen = terminalsList.find((t) => t.id === val);
+                      if (chosen) {
+                        setProductFloorId(chosen.floorId || "all");
+                      }
+                    }}
+                    style={{ ...styles.input, cursor: "pointer", backgroundColor: "#ffffff" }}
+                  >
+                    <option value="all">Shared Across All Terminals</option>
+                    {terminalsList.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name} ({t.code}) — {t.floorName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {shopInvMode === INVENTORY_MODES.FLOOR_WISE && productTerminalId === "all" && floorsList.length > 0 && (
+                <div style={styles.inputGroup}>
+                  <label style={styles.label}>Assigned Floor</label>
+                  <select
+                    value={productFloorId}
+                    onChange={(e) => setProductFloorId(e.target.value)}
+                    style={{ ...styles.input, cursor: "pointer", backgroundColor: "#ffffff" }}
+                  >
+                    <option value="all">Shared Across All Floors</option>
+                    {floorsList.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div style={styles.rowInputs}>
                 <div style={styles.inputGroup}>
                   <label style={styles.label}>Sales Price (₹)</label>

@@ -160,7 +160,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
 
   // Navigation tab inside Recipe screen
-  const [activeTab, setActiveTab] = useState("recipes"); // "recipes" | "raw_materials" | "batch_planner"
+  const [activeTab, setActiveTab] = useState("recipes"); // "recipes" | "raw_materials"
 
   // Data states
   const [recipes, setRecipes] = useState([]);
@@ -205,10 +205,6 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
   const [restockItem, setRestockItem] = useState(null);
   const [restockAmount, setRestockAmount] = useState("");
   const [restockCost, setRestockCost] = useState("");
-
-  // Batch Production Planner state
-  const [batchProductId, setBatchProductId] = useState("");
-  const [batchServings, setBatchServings] = useState(25);
 
   // Load Firestore data
   useEffect(() => {
@@ -898,14 +894,8 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
             <div>
               <h1 style={{ margin: 0, fontSize: "24px", fontWeight: "900", color: "#0f172a", display: "flex", alignItems: "center", gap: "10px" }}>
                 <span>🥘</span>
-                <span>Recipe Management & Food Costing</span>
-                <span style={{ fontSize: "11px", backgroundColor: "#dbeafe", color: "#1e40af", padding: "3px 9px", borderRadius: "8px", fontWeight: "800" }}>
-                  BOM & PROFIT CALCULATOR
-                </span>
+                <span>Recipe Management</span>
               </h1>
-              <p style={{ margin: "4px 0 0 0", fontSize: "13px", color: "#64748b" }}>
-                Define exact ingredients for each food item, calculate true making costs (COGS), track profit margins, and manage raw stock.
-              </p>
             </div>
           </div>
 
@@ -1076,28 +1066,6 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
             }}>
               {rawMaterials.length}
             </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab("batch_planner")}
-            style={{
-              padding: "9px 18px",
-              borderRadius: "10px",
-              border: "none",
-              fontWeight: "800",
-              fontSize: "13.5px",
-              cursor: "pointer",
-              backgroundColor: activeTab === "batch_planner" ? "#0f172a" : "#ffffff",
-              color: activeTab === "batch_planner" ? "#ffffff" : "#475569",
-              boxShadow: activeTab === "batch_planner" ? "0 2px 8px rgba(15, 23, 42, 0.2)" : "0 1px 3px rgba(0,0,0,0.04)",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-            }}
-          >
-            <span>🥣</span>
-            <span>Batch Production Planner</span>
           </button>
         </div>
       </div>
@@ -1540,192 +1508,6 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                 </table>
               </div>
             )}
-          </div>
-        )}
-
-        {/* ================= TAB 3: BATCH PRODUCTION PLANNER ================= */}
-        {activeTab === "batch_planner" && (
-          <div>
-            <div style={{ backgroundColor: "#ffffff", borderRadius: "16px", border: "1.5px solid #e2e8f0", padding: "20px", marginBottom: "20px" }}>
-              <h2 style={{ margin: "0 0 6px 0", fontSize: "18px", fontWeight: "800", color: "#0f172a" }}>
-                🥣 Batch Production & Kitchen Prep Calculator
-              </h2>
-              <p style={{ margin: "0 0 16px 0", fontSize: "13px", color: "#64748b" }}>
-                Planning to cook in bulk for morning rush or party orders? Select a dish and batch quantity to calculate exact raw material weights and total batch cost.
-              </p>
-
-              {/* Selector Controls */}
-              <div style={{ display: "flex", gap: "14px", alignItems: "flex-end", flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: "240px" }}>
-                  <label style={{ display: "block", fontSize: "12px", fontWeight: "800", color: "#334155", marginBottom: "6px" }}>
-                    Select Food Dish with Configured Recipe:
-                  </label>
-                  <select
-                    value={batchProductId}
-                    onChange={(e) => setBatchProductId(e.target.value)}
-                    style={{
-                      width: "100%",
-                      padding: "10px 12px",
-                      borderRadius: "10px",
-                      border: "1.5px solid #cbd5e1",
-                      fontSize: "13.5px",
-                      fontWeight: "700",
-                      backgroundColor: "#ffffff",
-                    }}
-                  >
-                    <option value="">-- Choose a dish --</option>
-                    {products.map((p) => {
-                      const rec = recipeMap[String(p.id)];
-                      if (!rec || !rec.ingredients?.length) return null;
-                      return (
-                        <option key={p.id} value={p.id}>
-                          {p.name} (Making Cost: ₹{rec.totalMakingCost})
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-
-                <div>
-                  <label style={{ display: "block", fontSize: "12px", fontWeight: "800", color: "#334155", marginBottom: "6px" }}>
-                    Portions / Cups to Prepare:
-                  </label>
-                  <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                    {[10, 25, 50, 100].map((qty) => (
-                      <button
-                        key={qty}
-                        type="button"
-                        onClick={() => setBatchServings(qty)}
-                        style={{
-                          padding: "8px 14px",
-                          borderRadius: "8px",
-                          border: "none",
-                          fontSize: "12px",
-                          fontWeight: "800",
-                          cursor: "pointer",
-                          backgroundColor: batchServings === qty ? "#ea580c" : "#f1f5f9",
-                          color: batchServings === qty ? "#ffffff" : "#475569",
-                        }}
-                      >
-                        {qty} Servings
-                      </button>
-                    ))}
-                    <input
-                      type="number"
-                      min="1"
-                      value={batchServings}
-                      onChange={(e) => setBatchServings(Math.max(1, parseInt(e.target.value) || 1))}
-                      style={{
-                        width: "80px",
-                        padding: "8px 10px",
-                        borderRadius: "8px",
-                        border: "1.5px solid #cbd5e1",
-                        fontSize: "13px",
-                        fontWeight: "800",
-                        textAlign: "center",
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Batch Results View */}
-            {(() => {
-              if (!batchProductId) {
-                return (
-                  <div style={{ textAlign: "center", padding: "40px 20px", color: "#94a3b8" }}>
-                    <div style={{ fontSize: "36px", marginBottom: "8px" }}>📋</div>
-                    <div style={{ fontSize: "14px", fontWeight: "700" }}>Choose a dish above to calculate bulk batch requirements</div>
-                  </div>
-                );
-              }
-
-              const product = products.find((p) => String(p.id) === String(batchProductId));
-              const recipe = recipeMap[String(batchProductId)];
-              if (!recipe || !recipe.ingredients?.length) {
-                return (
-                  <div style={{ textAlign: "center", padding: "30px", color: "#b45309", backgroundColor: "#fffbeb", borderRadius: "12px" }}>
-                    This dish doesn't have a configured recipe yet. Please configure it in the Recipes tab first.
-                  </div>
-                );
-              }
-
-              const multiplier = Number(batchServings) || 1;
-              const totalBatchCost = (Number(recipe.totalMakingCost) || 0) * multiplier;
-              const totalBatchRevenue = (Number(recipe.sellingPrice || product.price) || 0) * multiplier;
-              const totalBatchProfit = totalBatchRevenue - totalBatchCost;
-
-              return (
-                <div style={{ backgroundColor: "#ffffff", borderRadius: "16px", border: "1.5px solid #e2e8f0", padding: "20px", boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
-                  {/* Summary Metric Cards */}
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px", marginBottom: "20px" }}>
-                    <div style={{ backgroundColor: "#fff7ed", padding: "14px", borderRadius: "12px", border: "1px solid #fed7aa" }}>
-                      <div style={{ fontSize: "11px", fontWeight: "800", color: "#9a3412", textTransform: "uppercase" }}>Batch Target</div>
-                      <div style={{ fontSize: "20px", fontWeight: "900", color: "#ea580c", marginTop: "2px" }}>
-                        {multiplier} Servings of {product.name}
-                      </div>
-                    </div>
-                    <div style={{ backgroundColor: "#fef2f2", padding: "14px", borderRadius: "12px", border: "1px solid #fecaca" }}>
-                      <div style={{ fontSize: "11px", fontWeight: "800", color: "#991b1b", textTransform: "uppercase" }}>Total Ingredients Cost</div>
-                      <div style={{ fontSize: "20px", fontWeight: "900", color: "#dc2626", marginTop: "2px" }}>
-                        ₹{totalBatchCost.toFixed(2)}
-                      </div>
-                    </div>
-                    <div style={{ backgroundColor: "#eff6ff", padding: "14px", borderRadius: "12px", border: "1px solid #bfdbfe" }}>
-                      <div style={{ fontSize: "11px", fontWeight: "800", color: "#1e40af", textTransform: "uppercase" }}>Expected Sales Revenue</div>
-                      <div style={{ fontSize: "20px", fontWeight: "900", color: "#2563eb", marginTop: "2px" }}>
-                        ₹{totalBatchRevenue.toFixed(2)}
-                      </div>
-                    </div>
-                    <div style={{ backgroundColor: "#f0fdf4", padding: "14px", borderRadius: "12px", border: "1px solid #bbf7d0" }}>
-                      <div style={{ fontSize: "11px", fontWeight: "800", color: "#166534", textTransform: "uppercase" }}>Estimated Net Profit</div>
-                      <div style={{ fontSize: "20px", fontWeight: "900", color: "#16a34a", marginTop: "2px" }}>
-                        +₹{totalBatchProfit.toFixed(2)}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Bulk Ingredients Weight Breakdown Table */}
-                  <h3 style={{ margin: "0 0 10px 0", fontSize: "15px", fontWeight: "800", color: "#0f172a" }}>
-                    📦 Required Raw Materials for this Batch:
-                  </h3>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
-                    <thead>
-                      <tr style={{ backgroundColor: "#f8fafc", borderBottom: "1.5px solid #cbd5e1" }}>
-                        <th style={{ padding: "10px 14px", fontWeight: "800" }}>Raw Ingredient</th>
-                        <th style={{ padding: "10px 14px", fontWeight: "800" }}>Per Serving</th>
-                        <th style={{ padding: "10px 14px", fontWeight: "800", color: "#ea580c" }}>Total Batch Quantity</th>
-                        <th style={{ padding: "10px 14px", fontWeight: "800", textAlign: "right" }}>Total Ingredient Cost</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {recipe.ingredients.map((ing, idx) => {
-                        const totalQty = (Number(ing.quantity) || 0) * multiplier;
-                        const totalCost = (Number(ing.cost) || 0) * multiplier;
-
-                        // Display formatted unit (e.g. 1500 ml -> 1.5 L, 1500 g -> 1.5 kg)
-                        let displayFormatted = `${totalQty} ${ing.unit}`;
-                        if (ing.unit === "ml" && totalQty >= 1000) {
-                          displayFormatted = `${(totalQty / 1000).toFixed(2)} Litres (${totalQty} ml)`;
-                        } else if (ing.unit === "g" && totalQty >= 1000) {
-                          displayFormatted = `${(totalQty / 1000).toFixed(2)} Kilograms (${totalQty} g)`;
-                        }
-
-                        return (
-                          <tr key={idx} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={{ padding: "10px 14px", fontWeight: "800", color: "#0f172a" }}>{ing.name}</td>
-                            <td style={{ padding: "10px 14px", color: "#64748b" }}>{ing.quantity} {ing.unit}</td>
-                            <td style={{ padding: "10px 14px", fontWeight: "900", color: "#ea580c" }}>{displayFormatted}</td>
-                            <td style={{ padding: "10px 14px", textAlign: "right", fontWeight: "800", color: "#0f172a" }}>₹{totalCost.toFixed(2)}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              );
-            })()}
           </div>
         )}
       </div>

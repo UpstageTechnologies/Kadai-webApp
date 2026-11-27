@@ -957,6 +957,16 @@ export default function OnlineOrders({
                             🛵 ONLINE
                           </span>
                         )}
+                        {ord.terminalName && (
+                          <span style={{ ...styles.miniBadge, backgroundColor: "#f0fdf4", color: "#15803d", border: "1px solid #bbf7d0" }}>
+                            🖥️ {ord.terminalName}{ord.floorName ? ` • ${ord.floorName}` : ""}
+                          </span>
+                        )}
+                        {(ord.transactionStatus === "refunded" || ord.transactionStatus === "cancelled") && (
+                          <span style={{ ...styles.miniBadge, backgroundColor: "#fee2e2", color: "#dc2626" }}>
+                            {ord.transactionStatus.toUpperCase()}
+                          </span>
+                        )}
                       </div>
 
                       <div style={{ fontSize: "12px", color: "#64748b" }}>
