@@ -3,8 +3,10 @@ import { collection, onSnapshot } from "firebase/firestore";
 import { auth, db } from "../utils/firebase";
 import {
   adjustCustomerLoyaltyPoints,
+  buildMergedCustomerDirectory,
   buildWhatsAppReminderMessage,
   fetchCustomerLedger,
+  getOrderCustomerIdentity,
   isValidPhone10,
   normalizePhone10,
   openWhatsAppChat,
@@ -163,13 +165,25 @@ export default function CustomerManagement({
     return () => unsub();
   }, [currentUid]);
 
+  const mergedCustomers = useMemo(
+    () =>
+      buildMergedCustomerDirectory({
+        persistedCustomers: customers,
+        ordersList,
+        onlineOrdersList,
+      }),
+    [customers, ordersList, onlineOrdersList]
+  );
+
   const selectedCustomer = useMemo(
-    () => customers.find((c) => c.id === selectedId) || null,
-    [customers, selectedId]
+    () => mergedCustomers.find((c) => c.id === selectedId) || null,
+    [mergedCustomers, selectedId]
   );
 
   useEffect(() => {
-    if (!currentUid || !selectedCustomer?.phone) return undefined;
+    if (!currentUid || !isValidPhone10(selectedCustomer?.phone)) {
+      return undefined;
+    }
     let active = true;
     fetchCustomerLedger(currentUid, selectedCustomer.phone, 50)
       .then((items) => {
@@ -190,23 +204,23 @@ export default function CustomerManagement({
   ]);
 
   const kpis = useMemo(() => {
-    const totalCount = customers.length;
+    const totalCount = mergedCustomers.length;
     const nowDate = new Date(mountNow);
     const monthStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1).getTime();
-    const addedThisMonth = customers.filter((c) => {
+    const addedThisMonth = mergedCustomers.filter((c) => {
       const createdMs = toMillis(c.createdAt);
       return createdMs >= monthStart;
     }).length;
-    const totalRevenue = customers.reduce((s, c) => s + Number(c.totalSpent || 0), 0);
-    const totalDue = customers.reduce((s, c) => s + Number(c.creditBalance || 0), 0);
-    const totalPoints = customers.reduce((s, c) => s + Number(c.loyaltyPoints || 0), 0);
+    const totalRevenue = mergedCustomers.reduce((s, c) => s + Number(c.totalSpent || 0), 0);
+    const totalDue = mergedCustomers.reduce((s, c) => s + Number(c.creditBalance || 0), 0);
+    const totalPoints = mergedCustomers.reduce((s, c) => s + Number(c.loyaltyPoints || 0), 0);
     return { totalCount, addedThisMonth, totalRevenue, totalDue, totalPoints };
-  }, [customers, mountNow]);
+  }, [mergedCustomers, mountNow]);
 
   const filteredCustomers = useMemo(() => {
     const q = search.trim().toLowerCase();
     const thirtyDaysAgo = mountNow - 30 * 24 * 60 * 60 * 1000;
-    return customers.filter((c) => {
+    return mergedCustomers.filter((c) => {
       if (activeFilter === "due" && Number(c.creditBalance || 0) <= 0) return false;
       if (activeFilter === "vip" && !(Array.isArray(c.tags) && c.tags.includes("VIP"))) return false;
       if (activeFilter === "website" && c.source !== "website" && c.source !== "both") return false;
@@ -221,27 +235,37 @@ export default function CustomerManagement({
         String(c.gstin || "").toLowerCase().includes(q)
       );
     });
-  }, [customers, search, activeFilter, mountNow]);
+  }, [mergedCustomers, search, activeFilter, mountNow]);
 
   const customerPosBills = useMemo(() => {
     if (!selectedCustomer) return [];
-    const target = normalizePhone10(selectedCustomer.phone || selectedCustomer.id);
+    const targetPhone = normalizePhone10(selectedCustomer.phone || selectedCustomer.id);
+    const hasPhone = isValidPhone10(targetPhone);
     return (ordersList || [])
-      .filter((s) => normalizePhone10(s.customerPhone || s.customerId) === target)
-      .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+      .filter((s) => {
+        if (hasPhone) {
+          return normalizePhone10(s.customerPhone || s.customerId) === targetPhone;
+        }
+        return getOrderCustomerIdentity(s).key === selectedCustomer.id;
+      })
+      .sort((a, b) => toMillis(b.createdAtMs || b.createdAt) - toMillis(a.createdAtMs || a.createdAt));
   }, [ordersList, selectedCustomer]);
 
   const customerOnlineOrders = useMemo(() => {
     if (!selectedCustomer) return [];
     const targetPhone = normalizePhone10(selectedCustomer.phone || selectedCustomer.id);
+    const hasPhone = isValidPhone10(targetPhone);
     const targetUid = String(selectedCustomer.customerUid || "");
     return (onlineOrdersList || [])
       .filter((o) => {
         const oPhone = normalizePhone10(o.customerPhone || o.address?.phoneNumber);
         const oUid = String(o.customerUid || o.customerId || "");
-        return (targetPhone && oPhone === targetPhone) || (targetUid && oUid === targetUid);
+        if (hasPhone && oPhone === targetPhone) return true;
+        if (targetUid && oUid === targetUid) return true;
+        if (!hasPhone && getOrderCustomerIdentity(o).key === selectedCustomer.id) return true;
+        return false;
       })
-      .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+      .sort((a, b) => toMillis(b.createdAtMs || b.createdAt) - toMillis(a.createdAtMs || a.createdAt));
   }, [onlineOrdersList, selectedCustomer]);
 
   const handleAddCustomer = async (e) => {
@@ -481,7 +505,7 @@ export default function CustomerManagement({
               const av = getAvatarTheme(c.name || "C");
               const badge = getPrimaryBadge(c);
               const openProfile = () => {
-                setLedgerLoading(true);
+                setLedgerLoading(isValidPhone10(c.phone));
                 setSelectedId(c.id);
                 setDetailTab("pos");
               };
@@ -500,7 +524,11 @@ export default function CustomerManagement({
                       </div>
                       <div style={{ minWidth: 0 }}>
                         <div style={styles.custName}>{c.name || "Customer"}</div>
-                        <div style={styles.custPhone}>{formatPhoneDisplay(c.phone || c.id)}</div>
+                        <div style={styles.custPhone}>
+                          {isValidPhone10(c.phone)
+                            ? formatPhoneDisplay(c.phone)
+                            : `${Number(c.totalOrders || 0)} order${Number(c.totalOrders || 0) === 1 ? "" : "s"} • No mobile`}
+                        </div>
                       </div>
                     </div>
 
@@ -582,7 +610,9 @@ export default function CustomerManagement({
                     {selectedCustomer.name}
                   </h2>
                   <div style={{ fontSize: "12.5px", color: "#64748b", marginTop: "2px" }}>
-                    +91 {formatPhoneDisplay(selectedCustomer.phone)}
+                    {isValidPhone10(selectedCustomer.phone)
+                      ? `+91 ${formatPhoneDisplay(selectedCustomer.phone)}`
+                      : "Walk-in / Counter Customer (No mobile attached)"}
                     {selectedCustomer.gstin ? ` • GSTIN: ${selectedCustomer.gstin}` : ""}
                   </div>
                 </div>
@@ -594,40 +624,56 @@ export default function CustomerManagement({
 
             <div style={styles.drawerBody}>
               {/* Action Buttons */}
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "14px" }}>
-                <button
-                  type="button"
-                  style={styles.waBtn}
-                  onClick={() => {
-                    const msg =
-                      Number(selectedCustomer.creditBalance || 0) > 0
-                        ? buildWhatsAppReminderMessage({
-                            shopName,
-                            customerName: selectedCustomer.name,
-                            creditBalance: selectedCustomer.creditBalance,
-                            upiId: storeSettings?.upiId || "",
-                          })
-                        : `Hello ${selectedCustomer.name || "Customer"}! Thank you for shopping at *${shopName}*. You have *${Number(selectedCustomer.loyaltyPoints || 0)} Reward Points* ready to redeem! 🎁`;
-                    openWhatsAppChat(selectedCustomer.phone, msg);
+              {isValidPhone10(selectedCustomer.phone) ? (
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "14px" }}>
+                  <button
+                    type="button"
+                    style={styles.waBtn}
+                    onClick={() => {
+                      const msg =
+                        Number(selectedCustomer.creditBalance || 0) > 0
+                          ? buildWhatsAppReminderMessage({
+                              shopName,
+                              customerName: selectedCustomer.name,
+                              creditBalance: selectedCustomer.creditBalance,
+                              upiId: storeSettings?.upiId || "",
+                            })
+                          : `Hello ${selectedCustomer.name || "Customer"}! Thank you for shopping at *${shopName}*. You have *${Number(selectedCustomer.loyaltyPoints || 0)} Reward Points* ready to redeem! 🎁`;
+                      openWhatsAppChat(selectedCustomer.phone, msg);
+                    }}
+                  >
+                    📲 {Number(selectedCustomer.creditBalance || 0) > 0 ? "WhatsApp Due Reminder" : "WhatsApp"}
+                  </button>
+                  <button
+                    type="button"
+                    style={styles.outlineBtn}
+                    onClick={() => {
+                      setEditName(selectedCustomer.name || "");
+                      setEditLimit(String(selectedCustomer.creditLimit ?? 5000));
+                      setEditGstin(selectedCustomer.gstin || "");
+                      setEditNotes(selectedCustomer.notes || "");
+                      setEditTags(Array.isArray(selectedCustomer.tags) ? selectedCustomer.tags : []);
+                      setShowEditModal(true);
+                    }}
+                  >
+                    ✏️ Edit Profile
+                  </button>
+                </div>
+              ) : (
+                <div
+                  style={{
+                    backgroundColor: "#f8fafc",
+                    border: "1px solid #e2e8f0",
+                    borderRadius: "10px",
+                    padding: "10px 12px",
+                    fontSize: "12px",
+                    color: "#475569",
+                    marginBottom: "14px",
                   }}
                 >
-                  📲 {Number(selectedCustomer.creditBalance || 0) > 0 ? "WhatsApp Due Reminder" : "WhatsApp"}
-                </button>
-                <button
-                  type="button"
-                  style={styles.outlineBtn}
-                  onClick={() => {
-                    setEditName(selectedCustomer.name || "");
-                    setEditLimit(String(selectedCustomer.creditLimit ?? 5000));
-                    setEditGstin(selectedCustomer.gstin || "");
-                    setEditNotes(selectedCustomer.notes || "");
-                    setEditTags(Array.isArray(selectedCustomer.tags) ? selectedCustomer.tags : []);
-                    setShowEditModal(true);
-                  }}
-                >
-                  ✏️ Edit Profile
-                </button>
-              </div>
+                  Attach a 10-digit mobile number at checkout or via <b>+ Add Customer</b> to enable WhatsApp, Khata credit &amp; loyalty points.
+                </div>
+              )}
 
               {/* Khata & Loyalty Cards */}
               <div style={styles.balanceSplit}>
@@ -639,20 +685,22 @@ export default function CustomerManagement({
                   <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "10px" }}>
                     Credit Limit: ₹{Number(selectedCustomer.creditLimit ?? 5000).toLocaleString("en-IN")}
                   </div>
-                  <button
-                    type="button"
-                    style={{ ...styles.smallActionBtn, backgroundColor: "#b91c1c" }}
-                    onClick={() => {
-                      setPayAmount(
-                        Number(selectedCustomer.creditBalance || 0) > 0
-                          ? String(selectedCustomer.creditBalance)
-                          : ""
-                      );
-                      setShowPayModal(true);
-                    }}
-                  >
-                    + Record Payment
-                  </button>
+                  {isValidPhone10(selectedCustomer.phone) && (
+                    <button
+                      type="button"
+                      style={{ ...styles.smallActionBtn, backgroundColor: "#b91c1c" }}
+                      onClick={() => {
+                        setPayAmount(
+                          Number(selectedCustomer.creditBalance || 0) > 0
+                            ? String(selectedCustomer.creditBalance)
+                            : ""
+                        );
+                        setShowPayModal(true);
+                      }}
+                    >
+                      + Record Payment
+                    </button>
+                  )}
                 </div>
 
                 <div style={styles.balanceCard}>
@@ -663,13 +711,15 @@ export default function CustomerManagement({
                   <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "10px" }}>
                     {Number(selectedCustomer.totalOrders || 0)} orders • Last seen {formatDateShort(selectedCustomer.lastOrderAt || selectedCustomer.updatedAt)}
                   </div>
-                  <button
-                    type="button"
-                    style={{ ...styles.smallActionBtn, backgroundColor: "#4f46e5" }}
-                    onClick={() => setShowPtsModal(true)}
-                  >
-                    Adjust Points
-                  </button>
+                  {isValidPhone10(selectedCustomer.phone) && (
+                    <button
+                      type="button"
+                      style={{ ...styles.smallActionBtn, backgroundColor: "#4f46e5" }}
+                      onClick={() => setShowPtsModal(true)}
+                    >
+                      Adjust Points
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -694,7 +744,7 @@ export default function CustomerManagement({
                 {[
                   { id: "pos", label: `POS Bills (${customerPosBills.length})` },
                   { id: "online", label: `Online (${customerOnlineOrders.length})` },
-                  { id: "ledger", label: `Ledger (${ledgerItems.length})` },
+                  { id: "ledger", label: `Ledger (${isValidPhone10(selectedCustomer.phone) ? ledgerItems.length : 0})` },
                 ].map((tab) => (
                   <button
                     key={tab.id}
@@ -756,7 +806,9 @@ export default function CustomerManagement({
                   ))}
 
                 {detailTab === "ledger" &&
-                  (ledgerLoading ? (
+                  (!isValidPhone10(selectedCustomer.phone) ? (
+                    <div style={styles.emptySmall}>No Khata or Reward entries yet.</div>
+                  ) : ledgerLoading ? (
                     <div style={styles.emptySmall}>Loading ledger...</div>
                   ) : ledgerItems.length === 0 ? (
                     <div style={styles.emptySmall}>No Khata or Reward entries yet.</div>

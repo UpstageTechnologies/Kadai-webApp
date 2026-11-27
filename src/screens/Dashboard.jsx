@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc, setDoc, serverTimestamp, writeBatch } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { signOut } from "firebase/auth";
 import Profile from "./Profile";
@@ -18,11 +18,16 @@ import PosTerminalBar from "../components/PosTerminalBar";
 import RoomManagement from "./medical/RoomManagement";
 import LabManagement from "./medical/LabManagement";
 import CustomerManagement from "./CustomerManagement";
-import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
+import {
+  resolveUserSubscription,
+  resolveTerminalSubscription,
+  countProductsForTerminalLimit,
+  canAddInventoryItem,
+} from "../utils/subscriptionService";
 import { getDefaultPrintSettings, normalizePrintSettings, executePrint } from "../utils/printEngine";
 import { getOrderClassification, playNotificationSound, getNextDailyTokenNumber, getWhatsAppEBillUrl, notifyOwner } from "../utils/restaurantOrderService";
 import { subscribeWasteRecords, calculateWasteStats } from "../utils/wasteService";
-import { deductRecipeStock } from "../utils/recipeStockService";
+import { deductRecipeStock, evaluateRecipeIngredientAlerts } from "../utils/recipeStockService";
 import {
   INVENTORY_MODES,
   assignUnassignedProductsToTerminal,
@@ -30,17 +35,28 @@ import {
   filterProductsForCatalog,
   getAuthorizedTerminalsForStaff,
   getShopInventoryMode,
+  recordStandardSaleWithStock,
   recordTerminalSaleTransaction,
   setShopInventoryMode,
   subscribeFloors,
   subscribeTerminals,
 } from "../utils/terminalService";
 import {
+  calculateCartTotalsAndSnapshots,
+  calculateMultiTerminalProfitAndLoss,
+  resolveTerminalCatalog,
+  subscribeTerminalAssignments,
+  subscribeTerminalCategories,
+  subscribeTerminalInventory,
+} from "../utils/terminalProductService";
+import {
   DEFAULT_CRM_CONFIG,
+  buildMergedCustomerDirectory,
   calculateMaxRedeemable,
   isValidPhone10,
   mergeCrmConfig,
   normalizePhone10,
+  recordOrderCustomerFallback,
   recordPosSaleCustomerTransaction,
 } from "../utils/customerCrmService";
 
@@ -300,6 +316,14 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const [ownerNotifDropdownOpen, setOwnerNotifDropdownOpen] = useState(false);
   const ownerNotifBtnRef = useRef(null);
 
+  // Recipe Raw Material Stock Alerts (Restaurant Mode)
+  const [restaurantRecipes, setRestaurantRecipes] = useState([]);
+  const [restaurantRawMaterials, setRestaurantRawMaterials] = useState([]);
+  const [restaurantRawInventory, setRestaurantRawInventory] = useState([]);
+  const [recipeAlertToast, setRecipeAlertToast] = useState(null);
+  const [dismissedRecipeAlertKey, setDismissedRecipeAlertKey] = useState("");
+  const [recipeInitialSubTab, setRecipeInitialSubTab] = useState("recipes");
+
   // Modal States for Add & Edit Inventory
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -326,6 +350,12 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     return uid ? localStorage.getItem(`active_terminal_id_${uid}`) || "" : "";
   });
   const [activeSessionDoc, setActiveSessionDoc] = useState(null);
+  const [activeTerminalAssignments, setActiveTerminalAssignments] = useState([]);
+  const [activeTerminalCategories, setActiveTerminalCategories] = useState([]);
+  const [activeTerminalInventoryDocs, setActiveTerminalInventoryDocs] = useState([]);
+  const [showConsolidatedPnlModal, setShowConsolidatedPnlModal] = useState(false);
+  const [consolidatedPnlTimeframe, setConsolidatedPnlTimeframe] = useState("all");
+  const [terminalManagementInitialSubTab, setTerminalManagementInitialSubTab] = useState("overview");
   const [isSubmittingCheckout, setIsSubmittingCheckout] = useState(false);
   const checkoutIdempotencyRef = useRef("");
   const primarySeedAttemptedRef = useRef(false);
@@ -383,6 +413,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const handleSelectActiveTerminal = (term) => {
     const tId = term?.id || "";
     setActiveTerminalId(tId);
+    setSelectedCategory("All");
     if (currentUid) {
       if (tId) {
         localStorage.setItem(`active_terminal_id_${currentUid}`, tId);
@@ -962,6 +993,28 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       console.warn("Customer CRM listener notice:", err);
     });
 
+    // 11. Real-time Recipe & Raw Materials Stock Alerts (Restaurant Mode)
+    let unsubscribeRecipes = () => {};
+    let unsubscribeRawMats = () => {};
+    let unsubscribeRawInv = () => {};
+    if (isRestaurant) {
+      unsubscribeRecipes = onSnapshot(
+        collection(db, "users", currentUid, "recipes"),
+        (snap) => setRestaurantRecipes(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+        (err) => console.warn("Recipes alert listener notice:", err)
+      );
+      unsubscribeRawMats = onSnapshot(
+        collection(db, "users", currentUid, "raw_materials"),
+        (snap) => setRestaurantRawMaterials(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+        (err) => console.warn("Raw materials alert listener notice:", err)
+      );
+      unsubscribeRawInv = onSnapshot(
+        collection(db, "users", currentUid, "inventory"),
+        (snap) => setRestaurantRawInventory(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+        (err) => console.warn("Raw inventory alert listener notice:", err)
+      );
+    }
+
     return () => {
       window.removeEventListener("click", handleOutsideClick);
       window.removeEventListener("scroll", () => setProfileDropdownOpen(false), true);
@@ -979,6 +1032,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       unsubscribeWaste();
       unsubscribeFeedback();
       unsubscribeCrmCustomers();
+      unsubscribeRecipes();
+      unsubscribeRawMats();
+      unsubscribeRawInv();
     };
   }, [isRestaurant, appMode]);
 
@@ -1003,6 +1059,23 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       }
     );
     return () => unsub();
+  }, [activeTerminalObj?.id]);
+
+  // Real-time Terminal Catalog Assignments, Categories & Terminal Inventory for active POS terminal
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || localStorage.getItem("uid");
+    const termId = activeTerminalObj?.id;
+    if (!uid || !termId) {
+      return undefined;
+    }
+    const unsubA = subscribeTerminalAssignments(db, uid, termId, setActiveTerminalAssignments);
+    const unsubC = subscribeTerminalCategories(db, uid, termId, setActiveTerminalCategories);
+    const unsubI = subscribeTerminalInventory(db, uid, termId, setActiveTerminalInventoryDocs);
+    return () => {
+      unsubA();
+      unsubC();
+      unsubI();
+    };
   }, [activeTerminalObj?.id]);
 
   // Real-time Floors & POS Terminals Sync
@@ -1561,13 +1634,46 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
   const addToCurrentBill = async (product) => {
     if (!product) return;
-    const pId = String(product.id || product.barcode || "");
+    if (product.isActive === false || product.isAvailable === false) {
+      alert(`"${product.itemName || product.name || "Item"}" is currently inactive or unavailable on this terminal.`);
+      return;
+    }
+
+    const pId = String(product.productId || product.id || product.barcode || "");
     const pBarcode = product.barcode ? String(product.barcode) : "";
     const pName = product.itemName || product.name || "Item";
-    const pPrice = Number(product.salesPrice ?? product.price ?? 0);
+    const pPrice = Number(product.effectivePrice ?? product.salesPrice ?? product.price ?? 0);
     const pImg = product.image || product.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
     const pPurchasePrice = Number(product.purchasePrice || 0);
-    const pTax = Number(product.taxPercent || 0);
+    const pTax = Number(product.effectiveTaxPercent ?? product.taxPercent ?? 0);
+    const pDiscountType = product.effectiveDiscountType || product.discountType || "percent";
+    const pDiscountValue = Number(product.effectiveDiscountValue ?? product.discountValue ?? 0);
+    const pCollection =
+      product.productCollection ||
+      (isRestaurant ? "restaurant_menu" : isGlobalMode ? "global_inventory" : "inventory");
+
+    const isPreparedFood = isRestaurant || pCollection === "restaurant_menu";
+    const allowNeg = Boolean(rawUserData?.allowNegativeStock);
+    const trackedStock =
+      typeof product.effectiveStock === "number"
+        ? product.effectiveStock
+        : typeof product.quantity === "number"
+        ? product.quantity
+        : null;
+
+    if (!isPreparedFood && !allowNeg && trackedStock !== null) {
+      const existingInCart = currentBill.find((item) => {
+        const itemId = String(item.productId || item.id || item.barcode || "");
+        return pId && itemId === pId;
+      });
+      const nextCartQty = (Number(existingInCart?.qty) || 0) + 1;
+      if (trackedStock <= 0 || nextCartQty > trackedStock) {
+        alert(
+          `Insufficient stock for "${pName}" (Available: ${trackedStock} ${product.unit || "pcs"}).`
+        );
+        return;
+      }
+    }
 
     let updatedCart;
     setCurrentBill(prevBill => {
@@ -1587,15 +1693,29 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         const newItem = {
           ...product,
           id: pId || String(new Date().getTime()),
+          productId: pId || String(new Date().getTime()),
+          productCollection: pCollection,
+          productSource:
+            product.productSource ||
+            (product.terminalId && product.terminalId !== "all" ? "independent" : "shared"),
+          stockMode:
+            product.stockMode ||
+            (product.productSource === "independent" ? "independent" : "shared"),
           barcode: pBarcode || pId,
           name: pName,
           itemName: pName,
           price: pPrice,
           salesPrice: pPrice,
+          effectivePrice: pPrice,
           image: pImg,
           imageUrl: pImg,
           purchasePrice: pPurchasePrice,
+          discountType: pDiscountType,
+          discountValue: pDiscountValue,
+          effectiveDiscountType: pDiscountType,
+          effectiveDiscountValue: pDiscountValue,
           taxPercent: pTax,
+          effectiveTaxPercent: pTax,
           qty: 1
         };
         updatedCart = [...prevBill, newItem];
@@ -2013,19 +2133,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       const bDate = now.toLocaleDateString("en-GB");
       const nextTokenNo = activeTableOrderInfo?.tokenNumber || getNextDailyTokenNumber({ ordersList, kitchenOrders, uid: currentUid });
       
-      const sanitizedBillItems = currentBill.map((i) => ({
-        id: String(i.id || i.barcode || ""),
-        barcode: String(i.barcode || i.id || ""),
-        name: String(i.name || i.itemName || "Item"),
-        itemName: String(i.name || i.itemName || "Item"),
-        price: Number(i.salesPrice || i.price || 0),
-        salesPrice: Number(i.salesPrice || i.price || 0),
-        purchasePrice: Number(i.purchasePrice || 0),
-        qty: Math.max(1, Number(i.qty) || 1),
-        portion: String(i.portion || "Standard"),
-        notes: String(i.notes || ""),
-        image: String(i.image || i.imageUrl || ""),
-        imageUrl: String(i.image || i.imageUrl || ""),
+      const defaultColName = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
+      const sanitizedBillItems = cartPricing.itemSnapshots.map((snap) => ({
+        ...snap,
+        productCollection: snap.productCollection || defaultColName,
       }));
 
       const saleOrderType = activeTableOrderId
@@ -2058,6 +2169,25 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
           staffName: localStorage.getItem("staff_name") || userProfile.name || "Owner",
           shopName: userProfile.storeName || "My Store",
         });
+      } else if (currentUid) {
+        try {
+          await recordOrderCustomerFallback({
+            shopId: currentUid,
+            order: {
+              customerName:
+                customerName.trim() ||
+                (activeTableOrderId && activeTableOrderInfo?.isTable
+                  ? activeTableOrderInfo.tableNo
+                  : "Walk-in Customer"),
+              customerPhone: customerPhone.trim() || "",
+              totalAmount: netPayable,
+            },
+            source: "pos",
+            billNo: bNo,
+          });
+        } catch (crmFallbackErr) {
+          console.warn("Walk-in/named customer CRM record notice:", crmFallbackErr);
+        }
       }
 
       const saleRecord = {
@@ -2067,6 +2197,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         tokenNo: nextTokenNo,
         billDate: bDate,
         items: sanitizedBillItems,
+        subtotal: cartPricing.subtotal,
+        discountTotal: cartPricing.discountTotal,
+        taxTotal: cartPricing.taxTotal,
         grossTotal: totalAmt,
         total: netPayable,
         totalAmount: netPayable,
@@ -2102,7 +2235,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       };
 
       if (currentUid) {
-        // 1. Save sale atomically against active terminal session if open, else standard sales collection
+        // 1. Save sale + deduct stock atomically against active terminal session or counter sales
         if (activeTerminalObj && resolvedActiveSession) {
           await recordTerminalSaleTransaction(db, {
             shopId: currentUid,
@@ -2113,14 +2246,31 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             saleDocId: idempotencyKey,
             saleRecord,
             idempotencyKey,
+            defaultProductCollection: defaultColName,
+            allowNegativeStock: Boolean(rawUserData?.allowNegativeStock),
           });
         } else {
-          await setDoc(doc(db, "users", currentUid, "sales", idempotencyKey), saleRecord);
+          await recordStandardSaleWithStock(db, {
+            shopId: currentUid,
+            saleDocId: idempotencyKey,
+            saleRecord,
+            defaultProductCollection: defaultColName,
+            allowNegativeStock: Boolean(rawUserData?.allowNegativeStock),
+          });
         }
 
         // Deduct raw material recipe ingredients from stock in real-time
         try {
-          await deductRecipeStock(currentUid, sanitizedBillItems, { branchId: activeBranchId || "main_branch" });
+          const recipeDeductionResult = await deductRecipeStock(currentUid, sanitizedBillItems, { branchId: activeBranchId || "main_branch" });
+          const emptyIngs = recipeDeductionResult?.outOfStockIngredients || [];
+          const lowIngs = recipeDeductionResult?.lowStockIngredients || [];
+          if (emptyIngs.length > 0 || lowIngs.length > 0) {
+            setRecipeAlertToast({
+              outOfStock: emptyIngs,
+              lowStock: lowIngs,
+              createdAtMs: Date.now(),
+            });
+          }
         } catch (stockErr) {
           console.warn("Recipe stock deduction notice:", stockErr);
         }
@@ -2466,22 +2616,36 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   };
 
   const openAddModal = (forcedTerminal = null) => {
-    if (!canAddInventoryItem(products.length, userSubscription.plan, userSubscription.isExpired)) {
-      const limit = userSubscription.limits.inventoryLimit;
-      const msg = userSubscription.isExpired
-        ? "Your subscription has expired. Please renew your plan to add new inventory items."
-        : `Your ${userSubscription.plan} plan limit of ${limit} items has been reached. Please upgrade to Pro for unlimited items.`;
-      if (window.confirm(`${msg}\n\nWould you like to upgrade your subscription now?`)) {
-        setActiveTab("subscription");
-      }
-      return;
-    }
     const targetTerm =
       (forcedTerminal && forcedTerminal.id ? forcedTerminal : null) ||
       (activeTab === "inventory" && inventoryTerminalFilter !== "all"
         ? terminalsList.find((t) => t.id === inventoryTerminalFilter)
         : null) ||
       (activeTab === "sales" && activeTerminalObj ? activeTerminalObj : null);
+
+    const effectiveSub = resolveTerminalSubscription(rawUserData, targetTerm);
+    const scopedProductCount = countProductsForTerminalLimit(products, {
+      terminalId: targetTerm?.id || null,
+      shopInventoryMode,
+      primaryTerminalId: primaryTerminalObj?.id || null,
+      assignments:
+        targetTerm?.id && targetTerm.id === activeTerminalObj?.id
+          ? activeTerminalAssignments
+          : null,
+    });
+
+    if (!canAddInventoryItem(scopedProductCount, effectiveSub.plan, effectiveSub.isExpired)) {
+      const limit = effectiveSub.limits.inventoryLimit;
+      const msg = effectiveSub.isExpired
+        ? "Your subscription has expired. Please renew your plan to add new inventory items."
+        : targetTerm
+        ? `Terminal "${targetTerm.name}" reached your ${effectiveSub.plan} plan limit of ${limit} items per terminal. You can still add items to other terminals or upgrade to Pro for unlimited items.`
+        : `Your ${effectiveSub.plan} plan limit of ${limit} items has been reached. Please upgrade to Pro for unlimited items.`;
+      if (window.confirm(`${msg}\n\nWould you like to upgrade your subscription now?`)) {
+        setActiveTab("subscription");
+      }
+      return;
+    }
 
     setIsEditing(false);
     setEditId(null);
@@ -2624,18 +2788,31 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
       if (!currentUid) return;
 
-      if (!isEditing && !canAddInventoryItem(products.length, userSubscription.plan, userSubscription.isExpired)) {
-        const limit = userSubscription.limits.inventoryLimit;
+      const chosenTerminal = terminalsList.find((t) => t.id === productTerminalId);
+      const effectiveSub = resolveTerminalSubscription(rawUserData, chosenTerminal);
+      const scopedProductCount = countProductsForTerminalLimit(products, {
+        terminalId: chosenTerminal?.id || null,
+        shopInventoryMode,
+        primaryTerminalId: primaryTerminalObj?.id || null,
+        assignments:
+          chosenTerminal?.id && chosenTerminal.id === activeTerminalObj?.id
+            ? activeTerminalAssignments
+            : null,
+      });
+
+      if (!isEditing && !canAddInventoryItem(scopedProductCount, effectiveSub.plan, effectiveSub.isExpired)) {
+        const limit = effectiveSub.limits.inventoryLimit;
         alert(
-          userSubscription.isExpired
+          effectiveSub.isExpired
             ? "Your subscription has expired. Please renew to add new items."
-            : `Your ${userSubscription.plan} plan limit (${limit} items) has been reached. Upgrade to Pro for unlimited items.`
+            : chosenTerminal
+            ? `Terminal "${chosenTerminal.name}" reached your ${effectiveSub.plan} plan limit (${limit} items per terminal). You can add items to other terminals or upgrade to Pro.`
+            : `Your ${effectiveSub.plan} plan limit (${limit} items) has been reached. Upgrade to Pro for unlimited items.`
         );
         return;
       }
 
       const targetCol = isRestaurant ? "restaurant_menu" : (isGlobalMode ? "global_inventory" : "inventory");
-      const chosenTerminal = terminalsList.find((t) => t.id === productTerminalId);
       const resolvedFloorId = chosenTerminal?.floorId || productFloorId || "all";
       const chosenFloor = floorsList.find((f) => f.id === resolvedFloorId);
       const productData = {
@@ -2644,7 +2821,7 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         category: category.trim() || (isRestaurant ? "Main Course" : "General"),
         salesPrice: Number(price) || 0,
         price: Number(price) || 0,
-        quantity: isNaN(Number(qty)) ? 100 : Number(qty),
+        quantity: String(qty).trim() === "" || isNaN(Number(qty)) ? 100 : Number(qty),
         isAvailable: true,
         brand: brand.trim() || (isRestaurant ? "" : isGlobalMode ? "Global" : "Local"),
         image: image || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400",
@@ -2653,6 +2830,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         inventoryMode: isGlobalMode ? "global" : "local",
         branchId: activeBranchId || "main_branch",
         branchName: activeBranchName || "Main Branch",
+        productSource: chosenTerminal ? "independent" : "shared",
+        isTerminalExclusive: Boolean(chosenTerminal),
+        stockMode: chosenTerminal ? "independent" : "shared",
         terminalId: chosenTerminal ? chosenTerminal.id : "all",
         terminalName: chosenTerminal ? chosenTerminal.name : "All Terminals",
         terminalCode: chosenTerminal ? chosenTerminal.code : "",
@@ -2666,6 +2846,61 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
       if (isEditing && editId) {
         await updateDoc(doc(db, "users", currentUid, targetCol, editId), productData);
         setPopupModal({ show: true, message: `${itemNoun} updated successfully! ✅` });
+      } else if (chosenTerminal) {
+        const batch = writeBatch(db);
+        const prodRef = doc(collection(db, "users", currentUid, targetCol));
+        const assignmentId = `ind_${prodRef.id}`;
+        const assignRef = doc(
+          db,
+          "users",
+          currentUid,
+          "terminals",
+          chosenTerminal.id,
+          "products",
+          assignmentId
+        );
+        const invRef = doc(
+          db,
+          "users",
+          currentUid,
+          "terminals",
+          chosenTerminal.id,
+          "inventory",
+          prodRef.id
+        );
+        batch.set(prodRef, { ...productData, id: prodRef.id, shopId: currentUid, createdAt: serverTimestamp() });
+        batch.set(assignRef, {
+          id: assignmentId,
+          shopId: currentUid,
+          terminalId: chosenTerminal.id,
+          productId: prodRef.id,
+          productCollection: targetCol,
+          productSource: "independent",
+          categoryName: productData.category,
+          sellingPriceOverride: null,
+          discountOverride: null,
+          taxOverride: null,
+          stockMode: "independent",
+          isAvailable: true,
+          isActive: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        batch.set(invRef, {
+          id: prodRef.id,
+          productId: prodRef.id,
+          shopId: currentUid,
+          terminalId: chosenTerminal.id,
+          stockMode: "independent",
+          stockQuantity: productData.quantity,
+          lowStockAlert: 5,
+          unit: "pcs",
+          updatedByStaffId: "OWNER",
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        await batch.commit();
+        setPopupModal({ show: true, message: `${itemNoun} added to ${chosenTerminal.name} successfully! 🚀` });
       } else {
         await addDoc(collection(db, "users", currentUid, targetCol), { ...productData, createdAt: serverTimestamp() });
         setPopupModal({ show: true, message: `${itemNoun} added successfully! 🚀` });
@@ -2693,7 +2928,17 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     }
   };
 
-  const totalBillAmount = currentBill.reduce((sum, item) => sum + ((item.salesPrice || item.price || 0) * item.qty), 0);
+  const cartPricing = useMemo(
+    () =>
+      calculateCartTotalsAndSnapshots(currentBill, {
+        shopId: currentUid,
+        terminal: activeTerminalObj,
+        staffId: isStaff ? staffId : "OWNER",
+      }),
+    [currentBill, currentUid, activeTerminalObj, isStaff, staffId]
+  );
+
+  const totalBillAmount = cartPricing.netTotal;
   const totalBillItemsCount = currentBill.reduce((sum, item) => sum + item.qty, 0);
 
   const normalizedCheckoutPhone = normalizePhone10(customerPhone);
@@ -2701,6 +2946,35 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
     if (normalizedCheckoutPhone.length !== 10) return null;
     return crmCustomers.find((c) => normalizePhone10(c.phone || c.id) === normalizedCheckoutPhone) || null;
   }, [crmCustomers, normalizedCheckoutPhone]);
+
+  const mergedCustomersCount = useMemo(
+    () =>
+      buildMergedCustomerDirectory({
+        persistedCustomers: crmCustomers,
+        ordersList,
+        onlineOrdersList,
+      }).length,
+    [crmCustomers, ordersList, onlineOrdersList]
+  );
+
+  const recipeStockAlerts = useMemo(() => {
+    if (!isRestaurant) return [];
+    return evaluateRecipeIngredientAlerts({
+      recipes: restaurantRecipes,
+      rawMaterials: restaurantRawMaterials,
+      inventoryItems: restaurantRawInventory,
+    });
+  }, [isRestaurant, restaurantRecipes, restaurantRawMaterials, restaurantRawInventory]);
+
+  const outOfStockRecipeAlerts = useMemo(
+    () => recipeStockAlerts.filter((a) => a.isOutOfStock),
+    [recipeStockAlerts]
+  );
+
+  const recipeAlertSignature = useMemo(
+    () => outOfStockRecipeAlerts.map((a) => `${a.id}:${a.stockQuantity}`).join("|"),
+    [outOfStockRecipeAlerts]
+  );
 
   const loyaltyRedeemInfo = useMemo(() => {
     if (!matchedCheckoutCustomer) return { maxPoints: 0, maxDiscount: 0 };
@@ -2711,19 +2985,43 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
   const appliedLoyaltyDiscount = redeemLoyaltyPoints && matchedCheckoutCustomer ? loyaltyRedeemInfo.maxDiscount : 0;
   const netCheckoutTotal = Math.max(0, Number((totalBillAmount - appliedLoyaltyDiscount).toFixed(2)));
 
-  const terminalScopedProducts = filterProductsForCatalog(products, {
-    inventoryMode: shopInventoryMode,
-    terminalId: activeTerminalObj?.id || null,
-    floorId: activeTerminalObj?.floorId || null,
-    primaryTerminalId: primaryTerminalObj?.id || null,
-  });
+  const terminalScopedProducts = useMemo(() => {
+    if (!activeTerminalObj) return products;
+    return resolveTerminalCatalog({
+      terminal: activeTerminalObj,
+      shopProducts: products,
+      terminalAssignments: activeTerminalAssignments,
+      terminalCategories: activeTerminalCategories,
+      terminalInventoryDocs: activeTerminalInventoryDocs,
+      shopInventoryMode,
+      primaryTerminalId: primaryTerminalObj?.id || null,
+      includeInactive: false,
+    });
+  }, [
+    activeTerminalObj,
+    products,
+    activeTerminalAssignments,
+    activeTerminalCategories,
+    activeTerminalInventoryDocs,
+    shopInventoryMode,
+    primaryTerminalObj?.id,
+  ]);
 
   const scopedCategories = useMemo(() => {
     const defaultCategory = isRestaurant ? "Main Course" : "General";
+    const termCatNames = activeTerminalObj
+      ? activeTerminalCategories.filter((c) => c.isActive !== false).map((c) => c.name).filter(Boolean)
+      : [];
     const pool = activeTerminalObj ? terminalScopedProducts : products;
-    const unique = ["All", ...new Set(pool.map((item) => item.category || defaultCategory).filter(Boolean))];
+    const unique = [
+      "All",
+      ...new Set([
+        ...termCatNames,
+        ...pool.map((item) => item.category || defaultCategory).filter(Boolean),
+      ]),
+    ];
     return unique;
-  }, [activeTerminalObj, terminalScopedProducts, products, isRestaurant]);
+  }, [activeTerminalObj, activeTerminalCategories, terminalScopedProducts, products, isRestaurant]);
 
   const terminalHeldOrders = useMemo(() => {
     if (!activeTerminalObj?.id) return heldOrders;
@@ -3058,8 +3356,8 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             >
               <span style={{ fontSize: "14px" }}>👥</span>
               <span>Customers</span>
-              {crmCustomers.length > 0 && (
-                <span style={styles.navBadgeGray}>{crmCustomers.length}</span>
+              {mergedCustomersCount > 0 && (
+                <span style={styles.navBadgeGray}>{mergedCustomersCount}</span>
               )}
             </button>
           )}
@@ -3067,7 +3365,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
           {isRestaurant && !isPharmacist && (
             <button
               type="button"
-              onClick={() => setActiveTab("recipes")}
+              onClick={() => {
+                setRecipeInitialSubTab("recipes");
+                setActiveTab("recipes");
+              }}
               style={{
                 ...styles.navTabBtn,
                 ...(activeTab === "recipes" ? styles.navTabBtnActive : {})
@@ -3076,6 +3377,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             >
               <span style={{ fontSize: "14px" }}>🥘</span>
               <span>Recipes</span>
+              {recipeStockAlerts.length > 0 && (
+                <span style={styles.navBadgeRed} title={`${recipeStockAlerts.length} recipe stock alert(s)`}>
+                  {recipeStockAlerts.length}
+                </span>
+              )}
             </button>
           )}
         </nav>
@@ -3144,21 +3450,30 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             >
               <span style={{ fontSize: "14px" }}>🔔</span>
               <span>Alerts</span>
-              {ownerNotifications.filter((n) => !n.read).length > 0 && (
-                <span
-                  style={{
-                    backgroundColor: "#ef4444",
-                    color: "#ffffff",
-                    fontSize: "10px",
-                    fontWeight: "900",
-                    padding: "1px 6px",
-                    borderRadius: "10px",
-                    marginLeft: "2px"
-                  }}
-                >
-                  {ownerNotifications.filter((n) => !n.read).length}
-                </span>
-              )}
+              {(() => {
+                const unreadNotifs = ownerNotifications.filter((n) => !n.read);
+                const unreadRecipeIds = new Set(
+                  unreadNotifs.filter((n) => n.type === "recipe_stock_alert").map((n) => String(n.ingredientId || ""))
+                );
+                const extraRecipeAlertsCount = recipeStockAlerts.filter((a) => !unreadRecipeIds.has(String(a.id || ""))).length;
+                const totalBadge = unreadNotifs.length + extraRecipeAlertsCount;
+                if (totalBadge <= 0) return null;
+                return (
+                  <span
+                    style={{
+                      backgroundColor: "#ef4444",
+                      color: "#ffffff",
+                      fontSize: "10px",
+                      fontWeight: "900",
+                      padding: "1px 6px",
+                      borderRadius: "10px",
+                      marginLeft: "2px"
+                    }}
+                  >
+                    {totalBadge}
+                  </span>
+                );
+              })()}
             </button>
 
             {/* Owner Notifications Dropdown Panel */}
@@ -3236,6 +3551,57 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
 
                 {/* Notifications List */}
                 <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+                  {/* Live Recipe Ingredient Empty / Low Stock Alerts */}
+                  {isRestaurant && recipeStockAlerts.length > 0 && (
+                    <div
+                      style={{
+                        padding: "10px 12px",
+                        borderRadius: "10px",
+                        backgroundColor: outOfStockRecipeAlerts.length > 0 ? "#fef2f2" : "#fff7ed",
+                        border: `1.5px solid ${outOfStockRecipeAlerts.length > 0 ? "#fecaca" : "#fed7aa"}`,
+                        marginBottom: "8px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                        <span style={{ fontWeight: "800", fontSize: "12.5px", color: outOfStockRecipeAlerts.length > 0 ? "#b91c1c" : "#c2410c" }}>
+                          {outOfStockRecipeAlerts.length > 0 ? "🚨 Recipe Stock Empty!" : "⚠️ Recipe Stock Low"} ({recipeStockAlerts.length})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOwnerNotifDropdownOpen(false);
+                            setRecipeInitialSubTab("raw_materials");
+                            setActiveTab("recipes");
+                          }}
+                          style={{
+                            backgroundColor: outOfStockRecipeAlerts.length > 0 ? "#dc2626" : "#ea580c",
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: "6px",
+                            padding: "3px 8px",
+                            fontSize: "10.5px",
+                            fontWeight: "800",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Restock →
+                        </button>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                        {recipeStockAlerts.slice(0, 5).map((al) => (
+                          <div key={al.id || al.name} style={{ fontSize: "11px", color: "#334155", display: "flex", justifyContent: "space-between", gap: "6px" }}>
+                            <span>
+                              <b>{al.name}</b> ({al.dishes.slice(0, 2).join(", ")}{al.dishes.length > 2 ? ` +${al.dishes.length - 2}` : ""})
+                            </span>
+                            <span style={{ fontWeight: "800", color: al.isOutOfStock ? "#dc2626" : "#ea580c", whiteSpace: "nowrap" }}>
+                              {al.stockQuantity} {al.unit}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {ownerNotifications.length === 0 ? (
                     <div style={{ textAlign: "center", padding: "30px 16px", color: "#94a3b8" }}>
                       <div style={{ fontSize: "32px", marginBottom: "6px" }}>🎉</div>
@@ -3243,19 +3609,52 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                       <div style={{ fontSize: "11px" }}>New counter sales and online orders will appear here instantly.</div>
                     </div>
                   ) : (
-                    ownerNotifications.map((n) => (
+                    ownerNotifications.map((n) => {
+                      const isRecipeAlert = n.type === "recipe_stock_alert";
+                      const isEmptyAlert = isRecipeAlert && n.severity === "out_of_stock";
+                      const bgColor = isEmptyAlert
+                        ? "#fef2f2"
+                        : isRecipeAlert
+                        ? "#fffbeb"
+                        : n.type === "online_order"
+                        ? "#f5f3ff"
+                        : "#fff7ed";
+                      const borderColor = isEmptyAlert
+                        ? "#fecaca"
+                        : isRecipeAlert
+                        ? "#fde68a"
+                        : n.type === "online_order"
+                        ? "#ddd6fe"
+                        : "#fed7aa";
+                      const titleColor = isEmptyAlert
+                        ? "#b91c1c"
+                        : isRecipeAlert
+                        ? "#b45309"
+                        : n.type === "online_order"
+                        ? "#6d28d9"
+                        : "#c2410c";
+
+                      return (
                       <div
                         key={n.id}
                         style={{
                           padding: "10px 12px",
                           borderRadius: "10px",
-                          backgroundColor: n.type === "online_order" ? "#f5f3ff" : "#fff7ed",
-                          border: `1px solid ${n.type === "online_order" ? "#ddd6fe" : "#fed7aa"}`,
-                          marginBottom: "6px"
+                          backgroundColor: bgColor,
+                          border: `1px solid ${borderColor}`,
+                          marginBottom: "6px",
+                          cursor: isRecipeAlert ? "pointer" : "default",
+                        }}
+                        onClick={() => {
+                          if (isRecipeAlert) {
+                            setOwnerNotifDropdownOpen(false);
+                            setRecipeInitialSubTab("raw_materials");
+                            setActiveTab("recipes");
+                          }
                         }}
                       >
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                          <span style={{ fontWeight: "800", fontSize: "12.5px", color: n.type === "online_order" ? "#6d28d9" : "#c2410c" }}>
+                          <span style={{ fontWeight: "800", fontSize: "12.5px", color: titleColor }}>
                             {n.title}
                           </span>
                           <span style={{ fontSize: "10px", color: "#64748b" }}>
@@ -3266,7 +3665,8 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                           {n.body}
                         </div>
                       </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -4027,9 +4427,29 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
               </div>
 
               <div style={styles.posBillFooter}>
+                {(cartPricing.discountTotal > 0 || cartPricing.taxTotal > 0) && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "3px", marginBottom: "6px", fontSize: "12px", color: "#475569" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>Subtotal</span>
+                      <span>₹{cartPricing.subtotal.toFixed(2)}</span>
+                    </div>
+                    {cartPricing.discountTotal > 0 && (
+                      <div style={{ display: "flex", justifyContent: "space-between", color: "#15803d" }}>
+                        <span>Item Discounts</span>
+                        <span>-₹{cartPricing.discountTotal.toFixed(2)}</span>
+                      </div>
+                    )}
+                    {cartPricing.taxTotal > 0 && (
+                      <div style={{ display: "flex", justifyContent: "space-between", color: "#0369a1" }}>
+                        <span>Tax / GST</span>
+                        <span>+₹{cartPricing.taxTotal.toFixed(2)}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div style={styles.posTotalRow}>
                   <span>Total / மொத்தம்:</span>
-                  <span style={styles.posTotalPrice}>₹{totalBillAmount}.00</span>
+                  <span style={styles.posTotalPrice}>₹{Number(totalBillAmount || 0).toFixed(2)}</span>
                 </div>
                 {isRestaurant && (
                   <button 
@@ -4425,6 +4845,30 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     </div>
                   </div>
 
+                  {!isStaff && terminalsList.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowConsolidatedPnlModal(true)}
+                      style={{
+                        flexShrink: 0,
+                        padding: "7px 12px",
+                        borderRadius: "10px",
+                        border: "1.5px solid #4338ca",
+                        backgroundColor: "#eef2ff",
+                        color: "#3730a3",
+                        fontSize: "12px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                        marginRight: "8px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "5px",
+                      }}
+                      title="View combined Sales & Profit/Loss across all terminals"
+                    >
+                      📊 All Terminals P&amp;L
+                    </button>
+                  )}
                   <div style={{ ...styles.statsTimeframePill, flexShrink: 0 }}>
                     <button
                       type="button"
@@ -4566,24 +5010,110 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                     : `Available Products (${filteredProducts.length})`}
                 </h2>
                 {activeTerminalObj && !isStaff && (
-                  <button
-                    type="button"
-                    onClick={() => openAddModal(activeTerminalObj)}
-                    style={{
-                      padding: "6px 12px",
-                      borderRadius: "8px",
-                      border: "1.5px solid #2563eb",
-                      backgroundColor: "#eff6ff",
-                      color: "#1d4ed8",
-                      fontSize: "12px",
-                      fontWeight: "800",
-                      cursor: "pointer",
-                    }}
-                  >
-                    + Add {isRestaurant ? "Food" : "Item"} to {activeTerminalObj.name}
-                  </button>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("terminals")}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: "8px",
+                        border: "1.5px solid #0d9488",
+                        backgroundColor: "#f0fdfa",
+                        color: "#0f766e",
+                        fontSize: "12px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                      }}
+                    >
+                      🛍️ Terminal Catalog &amp; Shared Products
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openAddModal(activeTerminalObj)}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: "8px",
+                        border: "1.5px solid #2563eb",
+                        backgroundColor: "#eff6ff",
+                        color: "#1d4ed8",
+                        fontSize: "12px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                      }}
+                    >
+                      + Add {isRestaurant ? "Food" : "Item"} to {activeTerminalObj.name}
+                    </button>
+                  </div>
                 )}
               </div>
+
+              {isRestaurant && outOfStockRecipeAlerts.length > 0 && dismissedRecipeAlertKey !== recipeAlertSignature && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                    padding: "8px 12px",
+                    marginBottom: "8px",
+                    borderRadius: "10px",
+                    backgroundColor: "#fef2f2",
+                    border: "1.5px solid #fecaca",
+                    color: "#991b1b",
+                    fontSize: "12px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, minWidth: 0 }}>
+                    <span style={{ fontSize: "15px" }}>🚨</span>
+                    <span>
+                      <strong>Recipe Stock Empty:</strong>{" "}
+                      {outOfStockRecipeAlerts
+                        .slice(0, 3)
+                        .map((a) => `${a.name} (${a.stockQuantity} ${a.unit})`)
+                        .join(", ")}
+                      {outOfStockRecipeAlerts.length > 3 ? ` +${outOfStockRecipeAlerts.length - 3} more` : ""}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecipeInitialSubTab("raw_materials");
+                        setActiveTab("recipes");
+                      }}
+                      style={{
+                        backgroundColor: "#dc2626",
+                        color: "#ffffff",
+                        border: "none",
+                        borderRadius: "7px",
+                        padding: "4px 10px",
+                        fontSize: "11px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Restock →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDismissedRecipeAlertKey(recipeAlertSignature)}
+                      style={{
+                        background: "transparent",
+                        border: "none",
+                        color: "#b91c1c",
+                        fontSize: "14px",
+                        fontWeight: "800",
+                        cursor: "pointer",
+                        padding: "0 4px",
+                      }}
+                      title="Dismiss banner"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {loading ? (
                 <div style={styles.centerBox}>{isRestaurant ? "Loading menu items..." : "Loading products..."}</div>
@@ -4620,7 +5150,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                   {filteredProducts.map((item) => {
                     const itemName = item.itemName || item.name || "Unnamed Item";
                     const priceVal = item.salesPrice || item.price || 0;
-                    const stock = item.quantity !== undefined ? item.quantity : (item.isAvailable !== false ? "In Stock" : "Out of Stock");
+                    const stock = isRestaurant
+                      ? (item.isAvailable !== false ? "Available" : "Unavailable")
+                      : (item.quantity !== undefined ? item.quantity : (item.isAvailable !== false ? "In Stock" : "Out of Stock"));
                     const imageVal = item.image || item.imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400";
                     
                     const existingBillItem = currentBill.find(b => (b.id && b.id === item.id) || (b.barcode && b.barcode === item.barcode));
@@ -4747,6 +5279,12 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
             userProfile={userProfile}
             rawUserData={rawUserData}
             ordersList={ordersList}
+            wasteRecords={wasteRecords}
+            shopProducts={products}
+            productCollection={isRestaurant ? "restaurant_menu" : isGlobalMode ? "global_inventory" : "inventory"}
+            primaryTerminalId={primaryTerminalObj?.id || null}
+            allowNegativeStock={Boolean(rawUserData?.allowNegativeStock)}
+            initialSubTab={terminalManagementInitialSubTab}
             onSelectTerminalForPos={(term) => {
               handleSelectActiveTerminal(term);
               setActiveTab("sales");
@@ -4858,8 +5396,10 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         {/* RECIPE MANAGEMENT & FOOD COSTING TAB */}
         {activeTab === "recipes" && (
           <RecipeManagement
+            key={recipeInitialSubTab}
             products={products}
             userProfile={userProfile}
+            initialSubTab={recipeInitialSubTab}
             onBack={() => setActiveTab("sales")}
           />
         )}
@@ -5131,7 +5671,9 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                         onError={(e) => { e.target.onerror = null; e.target.src = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400"; }}
                       />
                       <span style={styles.stockBadge}>
-                        {typeof item.quantity === "number" ? `Stock: ${item.quantity}` : (item.isAvailable !== false ? "In Stock" : "Unavailable")}
+                        {isRestaurant
+                          ? (item.isAvailable !== false ? "Available" : "Unavailable")
+                          : (typeof item.quantity === "number" ? `Stock: ${item.quantity}` : (item.isAvailable !== false ? "In Stock" : "Unavailable"))}
                       </span>
                     </div>
                     <div style={styles.productDetails}>
@@ -5192,24 +5734,49 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
                         );
                       })()}
 
-                      <div style={{ display: "flex", gap: "8px", marginTop: "10px", flexWrap: "wrap" }}>
-                        <button onClick={(e) => { e.stopPropagation(); openEditModal(item); }} style={styles.editCardBtn}>✏️ Edit</button>
-                        {isRestaurant && (
-                          <button
-                            type="button"
-                            onClick={(e) => { e.stopPropagation(); setActiveTab("recipes"); }}
-                            style={{
-                              ...styles.editCardBtn,
-                              backgroundColor: "#fff7ed",
-                              color: "#c2410c",
-                              border: "1px solid #fed7aa",
-                            }}
-                            title="Configure Recipe & Ingredients Costing"
-                          >
-                            🥘 Recipe
-                          </button>
-                        )}
-                        <button onClick={(e) => { e.stopPropagation(); handleDeleteProduct(item.id); }} style={styles.deleteCardBtn}>🗑️ Delete</button>
+                      <div style={{ display: "flex", gap: "6px", marginTop: "10px", flexWrap: "nowrap", alignItems: "stretch" }}>
+                        {(() => {
+                          const centerBtnStyle = {
+                            ...styles.editCardBtn,
+                            flex: 1,
+                            minWidth: 0,
+                            padding: "6px 4px",
+                            backgroundColor: "#fff7ed",
+                            color: "#c2410c",
+                            border: "1px solid #fed7aa",
+                            boxSizing: "border-box",
+                          };
+                          return (
+                            <>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); openEditModal(item); }}
+                                style={centerBtnStyle}
+                              >
+                                ✏️ Edit
+                              </button>
+                              {isRestaurant && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setRecipeInitialSubTab("recipes");
+                                    setActiveTab("recipes");
+                                  }}
+                                  style={centerBtnStyle}
+                                  title="Configure Recipe & Ingredients Costing"
+                                >
+                                  🥘 Recipe
+                                </button>
+                              )}
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleDeleteProduct(item.id); }}
+                                style={centerBtnStyle}
+                              >
+                                🗑️ Delete
+                              </button>
+                            </>
+                          );
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -6737,6 +7304,80 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
         </div>
       )}
 
+      {/* REAL-TIME RECIPE STOCK EMPTY / LOW ALERT TOAST */}
+      {recipeAlertToast && (recipeAlertToast.outOfStock?.length > 0 || recipeAlertToast.lowStock?.length > 0) && (
+        <div
+          style={{
+            position: "fixed",
+            top: (counterToast ? 60 : 0) + (onlineOrderToast ? 60 : 0) + 16 + "px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 999999,
+            backgroundColor: recipeAlertToast.outOfStock?.length > 0 ? "#b91c1c" : "#c2410c",
+            color: "#ffffff",
+            padding: "12px 18px",
+            borderRadius: "14px",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            fontWeight: "800",
+            fontSize: "13px",
+            maxWidth: "92vw",
+            boxSizing: "border-box",
+          }}
+        >
+          <span style={{ fontSize: "20px" }}>{recipeAlertToast.outOfStock?.length > 0 ? "🚨" : "⚠️"}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div>
+              {recipeAlertToast.outOfStock?.length > 0
+                ? `Recipe Stock Empty: ${recipeAlertToast.outOfStock.map((i) => `${i.name} (0 ${i.unit})`).join(", ")}`
+                : `Recipe Stock Low: ${recipeAlertToast.lowStock.map((i) => `${i.name} (${i.newStock} ${i.unit})`).join(", ")}`}
+            </div>
+            <div style={{ fontSize: "11px", opacity: 0.9, fontWeight: "500", marginTop: "2px" }}>
+              Restock raw ingredients in Recipes → Raw Materials Store
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setRecipeAlertToast(null);
+              setRecipeInitialSubTab("raw_materials");
+              setActiveTab("recipes");
+            }}
+            style={{
+              backgroundColor: "#ffffff",
+              color: recipeAlertToast.outOfStock?.length > 0 ? "#b91c1c" : "#c2410c",
+              border: "none",
+              padding: "6px 12px",
+              borderRadius: "8px",
+              fontWeight: "800",
+              fontSize: "12px",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Restock →
+          </button>
+          <button
+            type="button"
+            onClick={() => setRecipeAlertToast(null)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#fee2e2",
+              cursor: "pointer",
+              fontSize: "18px",
+              fontWeight: "800",
+              padding: "0 4px",
+            }}
+            title="Dismiss alert"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* POPUP MODAL */}
       {popupModal.show && (
         <div style={styles.modalOverlay}>
@@ -7193,11 +7834,11 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
               />
               <input 
                 type="number" 
-                placeholder={isRestaurant ? "Available Stock / Portions (e.g. 100)" : "Quantity / Stock"} 
+                placeholder={isRestaurant ? "Daily Prep Target (Optional — Always Available)" : "Quantity / Stock"} 
                 value={qty} 
                 onChange={e => setQty(e.target.value)} 
                 style={styles.modalInput} 
-                required 
+                required={!isRestaurant}
               />
               <input 
                 type="text" 
@@ -7483,6 +8124,222 @@ export default function Dashboard({ initialTab = "sales", pharmacistMode = false
           </div>
         </div>
       )}
+
+      {/* CONSOLIDATED ALL-TERMINALS SALES & PROFIT / LOSS MODAL */}
+      {showConsolidatedPnlModal && (() => {
+        const pnl = calculateMultiTerminalProfitAndLoss({
+          terminals: terminalsList,
+          salesList: ordersList,
+          wasteRecords,
+          shopProducts: products,
+          timeframe: consolidatedPnlTimeframe,
+        });
+        const fmt = (val) =>
+          `₹${Number(val || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+        return (
+          <div style={styles.modalOverlay} onClick={() => setShowConsolidatedPnlModal(false)}>
+            <div
+              style={{
+                ...styles.modalBox,
+                maxWidth: "860px",
+                width: "96vw",
+                maxHeight: "90vh",
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+                padding: 0,
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div
+                style={{
+                  padding: "16px 20px",
+                  borderBottom: "1px solid #e2e8f0",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "10px",
+                  backgroundColor: "#f8fafc",
+                }}
+              >
+                <div>
+                  <h3 style={{ margin: 0, fontSize: "18px", fontWeight: "900", color: "#0f172a" }}>
+                    📊 All Terminals Combined Sales &amp; Profit / Loss (P&amp;L)
+                  </h3>
+                  <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#64748b" }}>
+                    Consolidated revenue, item cost (COGS), waste/spoilage loss &amp; net profit across all terminals
+                  </p>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  {[
+                    { id: "today", label: "Today" },
+                    { id: "week", label: "7 Days" },
+                    { id: "month", label: "Month" },
+                    { id: "all", label: "All Time" },
+                  ].map((tf) => (
+                    <button
+                      key={tf.id}
+                      type="button"
+                      onClick={() => setConsolidatedPnlTimeframe(tf.id)}
+                      style={{
+                        padding: "6px 11px",
+                        borderRadius: "8px",
+                        border: "1px solid #cbd5e1",
+                        backgroundColor: consolidatedPnlTimeframe === tf.id ? "#0f172a" : "#ffffff",
+                        color: consolidatedPnlTimeframe === tf.id ? "#ffffff" : "#334155",
+                        fontSize: "12px",
+                        fontWeight: "700",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {tf.label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setShowConsolidatedPnlModal(false)}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      fontSize: "18px",
+                      fontWeight: "800",
+                      color: "#64748b",
+                      cursor: "pointer",
+                      padding: "4px 6px",
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ padding: "18px 20px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "14px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "10px" }}>
+                  <div style={{ backgroundColor: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "12px", padding: "12px" }}>
+                    <div style={{ fontSize: "11px", fontWeight: "700", color: "#15803d", textTransform: "uppercase" }}>Combined Sales</div>
+                    <div style={{ fontSize: "20px", fontWeight: "900", color: "#15803d", marginTop: "4px" }}>{fmt(pnl.totals.totalSales)}</div>
+                    <div style={{ fontSize: "11px", color: "#166534" }}>{pnl.totals.totalOrders} bills • {pnl.totals.totalItemsSold} items</div>
+                  </div>
+                  <div style={{ backgroundColor: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "12px", padding: "12px" }}>
+                    <div style={{ fontSize: "11px", fontWeight: "700", color: "#64748b", textTransform: "uppercase" }}>COGS / Item Cost</div>
+                    <div style={{ fontSize: "20px", fontWeight: "900", color: "#0f172a", marginTop: "4px" }}>{fmt(pnl.totals.totalCogs)}</div>
+                    <div style={{ fontSize: "11px", color: "#64748b" }}>Tax: {fmt(pnl.totals.totalTax)} • Disc: {fmt(pnl.totals.totalDiscount)}</div>
+                  </div>
+                  <div style={{ backgroundColor: "#fff1f2", border: "1px solid #fecdd3", borderRadius: "12px", padding: "12px" }}>
+                    <div style={{ fontSize: "11px", fontWeight: "700", color: "#be123c", textTransform: "uppercase" }}>Waste / Damage Loss</div>
+                    <div style={{ fontSize: "20px", fontWeight: "900", color: "#dc2626", marginTop: "4px" }}>{fmt(pnl.totals.totalWasteLoss)}</div>
+                    <div style={{ fontSize: "11px", color: "#9f1239" }}>Refund/Cancel: {fmt(pnl.totals.refundedTotal + pnl.totals.cancelledTotal)}</div>
+                  </div>
+                  <div
+                    style={{
+                      backgroundColor: pnl.totals.isNetProfit ? "#ecfdf5" : "#fef2f2",
+                      border: `1.5px solid ${pnl.totals.isNetProfit ? "#86efac" : "#fca5a5"}`,
+                      borderRadius: "12px",
+                      padding: "12px",
+                    }}
+                  >
+                    <div style={{ fontSize: "11px", fontWeight: "800", color: pnl.totals.isNetProfit ? "#047857" : "#b91c1c", textTransform: "uppercase" }}>
+                      Net {pnl.totals.isNetProfit ? "Profit" : "Loss"}
+                    </div>
+                    <div style={{ fontSize: "20px", fontWeight: "900", color: pnl.totals.isNetProfit ? "#059669" : "#dc2626", marginTop: "4px" }}>
+                      {pnl.totals.isNetProfit ? "+" : ""}
+                      {fmt(pnl.totals.netProfitLoss)}
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#334155" }}>Margin: <strong>{pnl.totals.profitMarginPercent}%</strong></div>
+                  </div>
+                </div>
+
+                <div style={{ border: "1px solid #e2e8f0", borderRadius: "12px", overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12.5px" }}>
+                    <thead>
+                      <tr style={{ backgroundColor: "#f8fafc", borderBottom: "1px solid #e2e8f0", textAlign: "left" }}>
+                        <th style={{ padding: "10px 12px" }}>Terminal</th>
+                        <th style={{ padding: "10px 12px" }}>Bills</th>
+                        <th style={{ padding: "10px 12px" }}>Sales</th>
+                        <th style={{ padding: "10px 12px" }}>COGS</th>
+                        <th style={{ padding: "10px 12px" }}>Waste Loss</th>
+                        <th style={{ padding: "10px 12px" }}>Net Profit / Loss</th>
+                        <th style={{ padding: "10px 12px" }}>Margin</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pnl.byTerminal.map((row) => (
+                        <tr key={row.terminalId} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                          <td style={{ padding: "10px 12px" }}>
+                            <strong>{row.terminalName}</strong>{" "}
+                            <span style={{ fontSize: "10.5px", fontWeight: "800", backgroundColor: "#eef2ff", color: "#3730a3", padding: "2px 6px", borderRadius: "6px" }}>
+                              {row.terminalCode}
+                            </span>
+                          </td>
+                          <td style={{ padding: "10px 12px" }}>{row.ordersCount}</td>
+                          <td style={{ padding: "10px 12px", fontWeight: "800" }}>{fmt(row.grossSales)}</td>
+                          <td style={{ padding: "10px 12px" }}>{fmt(row.cogs)}</td>
+                          <td style={{ padding: "10px 12px", color: row.wasteLoss > 0 ? "#dc2626" : "#64748b" }}>{fmt(row.wasteLoss)}</td>
+                          <td style={{ padding: "10px 12px", fontWeight: "900", color: row.netProfitLoss >= 0 ? "#15803d" : "#dc2626" }}>
+                            {row.netProfitLoss >= 0 ? "+" : ""}
+                            {fmt(row.netProfitLoss)}
+                          </td>
+                          <td style={{ padding: "10px 12px" }}>{row.marginPercent}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  padding: "12px 20px",
+                  borderTop: "1px solid #e2e8f0",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  backgroundColor: "#f8fafc",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowConsolidatedPnlModal(false);
+                    setTerminalManagementInitialSubTab("product_overview");
+                    setActiveTab("terminals");
+                  }}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: "9px",
+                    border: "1px solid #4338ca",
+                    backgroundColor: "#eef2ff",
+                    color: "#3730a3",
+                    fontSize: "12.5px",
+                    fontWeight: "800",
+                    cursor: "pointer",
+                  }}
+                >
+                  📈 Open Full Multi-Terminal Dashboard →
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowConsolidatedPnlModal(false)}
+                  style={{
+                    padding: "8px 16px",
+                    borderRadius: "9px",
+                    border: "none",
+                    backgroundColor: "#0f172a",
+                    color: "#ffffff",
+                    fontSize: "12.5px",
+                    fontWeight: "700",
+                    cursor: "pointer",
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* SPEED DIAL CONFIGURATION MODAL */}
       {isConfiguringSpeedDial && (

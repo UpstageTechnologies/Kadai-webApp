@@ -1,5 +1,5 @@
-import { collection, getDocs, doc, updateDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "./firebase";
+import { collection, getDocs, doc, updateDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { db } from "./firebase.js";
 
 /**
  * Formats a raw material stock quantity with human-friendly packet + sub-unit breakdown.
@@ -354,28 +354,58 @@ export async function deductRecipeStock(uid, orderedItems, options = {}) {
 
     // Apply deductions to raw_materials in Firestore
     const updates = [];
+    const outOfStockIngredients = [];
+    const lowStockIngredients = [];
+
     for (const [rawId, info] of Object.entries(deductions)) {
       const raw = rawMap[rawId];
       if (!raw) continue;
 
       const currentStock = Number(raw.stockQuantity || 0);
       const newStock = Math.max(0, Number((currentStock - info.deductBaseUnits).toFixed(4)));
+      const minAlert = Number(raw.minAlertQuantity || 0);
+      const unitLabel = raw.unit || "pcs";
+      const uniqueDishes = [...new Set(info.dishNames.map((d) => String(d).replace(/\s*\(\d+\)$/, "").trim()).filter(Boolean))];
 
       const prevTotalUsedSub = Number(raw.totalUsedSubUnits || 0);
       const newTotalUsedSub = Number((prevTotalUsedSub + info.deductSubUnits).toFixed(2));
 
-      const p = updateDoc(doc(db, "users", uid, "raw_materials", rawId), {
-        stockQuantity: newStock,
-        totalUsedSubUnits: newTotalUsedSub,
-        lastDeductedAmount: info.deductBaseUnits,
-        lastDeductedSubUnits: `${info.deductSubUnits} ${info.subUnit}`,
-        lastDeductedDish: info.dishNames.join(", "),
-        packQuantity: info.packCapacity || raw.packQuantity || null,
-        packUnit: info.packUnit || raw.packUnit || null,
-        lastDeductedAt: Date.now(),
-        updatedAtMs: Date.now(),
-      }).catch(() => {});
-      updates.push(p);
+      if (!raw.isInventory) {
+        const p = updateDoc(doc(db, "users", uid, "raw_materials", rawId), {
+          stockQuantity: newStock,
+          totalUsedSubUnits: newTotalUsedSub,
+          lastDeductedAmount: info.deductBaseUnits,
+          lastDeductedSubUnits: `${info.deductSubUnits} ${info.subUnit}`,
+          lastDeductedDish: info.dishNames.join(", "),
+          packQuantity: info.packCapacity || raw.packQuantity || null,
+          packUnit: info.packUnit || raw.packUnit || null,
+          lastDeductedAt: Date.now(),
+          updatedAtMs: Date.now(),
+        }).catch(() => {});
+        updates.push(p);
+      }
+
+      if (newStock <= 0) {
+        outOfStockIngredients.push({
+          id: rawId,
+          name: raw.name || "Ingredient",
+          unit: unitLabel,
+          previousStock: currentStock,
+          newStock: 0,
+          minAlertQuantity: minAlert,
+          dishes: uniqueDishes,
+        });
+      } else if (minAlert > 0 && newStock <= minAlert) {
+        lowStockIngredients.push({
+          id: rawId,
+          name: raw.name || "Ingredient",
+          unit: unitLabel,
+          previousStock: currentStock,
+          newStock,
+          minAlertQuantity: minAlert,
+          dishes: uniqueDishes,
+        });
+      }
 
       console.log(
         `[recipeStockService] Deducted ${info.deductSubUnits} ${info.subUnit} (${info.deductBaseUnits} ${raw.unit}) from "${raw.name}". Stock: ${currentStock} -> ${newStock}`
@@ -415,14 +445,195 @@ export async function deductRecipeStock(uid, orderedItems, options = {}) {
       console.warn("[recipeStockService] inventory deduction notice:", invErr);
     }
 
+    // Dispatch persistent & desktop alerts for empty or low-stock recipe ingredients
+    const allAlertIngredients = [
+      ...outOfStockIngredients.map((item) => ({ ...item, severity: "out_of_stock" })),
+      ...lowStockIngredients.map((item) => ({ ...item, severity: "low_stock" })),
+    ];
+
+    for (const alertItem of allAlertIngredients) {
+      const isEmpty = alertItem.severity === "out_of_stock";
+      const dishSummary = alertItem.dishes.length > 0 ? alertItem.dishes.join(", ") : "Configured recipes";
+      const title = isEmpty
+        ? `🚨 Recipe Stock Empty: ${alertItem.name}`
+        : `⚠️ Recipe Stock Low: ${alertItem.name}`;
+      const body = isEmpty
+        ? `0 ${alertItem.unit} remaining! Needed for: ${dishSummary}. Please restock.`
+        : `${alertItem.newStock} ${alertItem.unit} left (Min: ${alertItem.minAlertQuantity}) • Used in: ${dishSummary}`;
+
+      updates.push(
+        setDoc(doc(db, "users", uid, "owner_notifications", `recipe_alert_${alertItem.id}`), {
+          type: "recipe_stock_alert",
+          severity: alertItem.severity,
+          ingredientId: alertItem.id,
+          ingredientName: alertItem.name,
+          remainingStock: alertItem.newStock,
+          unit: alertItem.unit,
+          minAlertQuantity: alertItem.minAlertQuantity,
+          dishes: alertItem.dishes,
+          title,
+          body,
+          data: {
+            ingredientId: alertItem.id,
+            ingredientName: alertItem.name,
+            remainingStock: alertItem.newStock,
+            unit: alertItem.unit,
+            dishes: alertItem.dishes,
+          },
+          read: false,
+          resolved: false,
+          createdAt: serverTimestamp(),
+          createdAtMs: Date.now(),
+          updatedAtMs: Date.now(),
+        }).catch((err) => {
+          console.warn("[recipeStockService] alert write notice:", err);
+        })
+      );
+
+      try {
+        if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
+          new Notification(title, {
+            body,
+            tag: `recipe_alert_${alertItem.id}`,
+            renotify: true,
+          });
+        }
+      } catch (notifErr) {
+        console.warn("[recipeStockService] desktop notification notice:", notifErr);
+      }
+    }
+
     await Promise.all(updates);
     return {
       success: true,
       deductionsCount: Object.keys(deductions).length,
       details: deductedItemsLog,
+      outOfStockIngredients,
+      lowStockIngredients,
     };
   } catch (err) {
     console.error("[recipeStockService] Failed to deduct recipe stock:", err);
     return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Evaluates all configured recipes against current raw materials & inventory stock
+ * to return ingredients that are empty (<= 0) or below minimum alert threshold.
+ */
+export function evaluateRecipeIngredientAlerts({
+  recipes = [],
+  rawMaterials = [],
+  inventoryItems = [],
+} = {}) {
+  const byId = new Map();
+  const byName = new Map();
+
+  const registerItem = (item, fromInventory = false) => {
+    if (!item) return;
+    const id = String(item.id || "");
+    const name = String(item.itemName || item.name || "").trim();
+    const keyName = name.toLowerCase();
+    const stockQuantity = Number(
+      fromInventory
+        ? (item.quantity ?? item.stockQuantity ?? 0)
+        : (item.stockQuantity ?? item.quantity ?? 0)
+    );
+    const minAlertQuantity = Number(item.minAlertQuantity ?? 0);
+    const unit = item.unit || item.unitType || "pcs";
+
+    const normalized = {
+      id,
+      name: name || "Ingredient",
+      stockQuantity: Number.isFinite(stockQuantity) ? stockQuantity : 0,
+      minAlertQuantity: Number.isFinite(minAlertQuantity) ? minAlertQuantity : 0,
+      unit,
+      fromInventory,
+    };
+
+    if (id && (!fromInventory || !byId.has(id))) {
+      byId.set(id, normalized);
+    }
+    if (keyName && (!fromInventory || !byName.has(keyName))) {
+      byName.set(keyName, normalized);
+    }
+  };
+
+  (rawMaterials || []).forEach((r) => registerItem(r, false));
+  (inventoryItems || []).forEach((inv) => registerItem(inv, true));
+
+  const alertMap = new Map();
+
+  (recipes || []).forEach((recipe) => {
+    const ingredients = Array.isArray(recipe?.ingredients) ? recipe.ingredients : [];
+    if (ingredients.length === 0) return;
+    const dishName = String(recipe.productName || recipe.name || "Menu Item").trim();
+
+    ingredients.forEach((ing) => {
+      const ingId = String(ing.rawMaterialId || "");
+      const ingNameClean = String(ing.name || "").toLowerCase().trim();
+      const ingSimple = ingNameClean.replace(/[^\w\s]/g, "");
+
+      let raw = (ingId && byId.get(ingId)) || (ingNameClean && byName.get(ingNameClean)) || null;
+      if (!raw && ingNameClean) {
+        for (const candidate of byId.values()) {
+          const rName = candidate.name.toLowerCase().trim();
+          const rClean = rName.replace(/[^\w\s]/g, "");
+          if (
+            rName === ingNameClean ||
+            rClean === ingSimple ||
+            (ingNameClean.length > 3 && (rName.includes(ingNameClean) || ingNameClean.includes(rName)))
+          ) {
+            raw = candidate;
+            break;
+          }
+        }
+      }
+
+      if (!raw) return;
+
+      const isOutOfStock = raw.stockQuantity <= 0;
+      const isLowStock = !isOutOfStock && raw.minAlertQuantity > 0 && raw.stockQuantity <= raw.minAlertQuantity;
+      if (!isOutOfStock && !isLowStock) return;
+
+      const alertKey = raw.id || raw.name.toLowerCase();
+      if (!alertMap.has(alertKey)) {
+        alertMap.set(alertKey, {
+          id: raw.id,
+          name: raw.name,
+          stockQuantity: raw.stockQuantity,
+          minAlertQuantity: raw.minAlertQuantity,
+          unit: raw.unit,
+          isOutOfStock,
+          isLowStock,
+          dishes: [],
+        });
+      }
+      const entry = alertMap.get(alertKey);
+      if (dishName && !entry.dishes.includes(dishName)) {
+        entry.dishes.push(dishName);
+      }
+    });
+  });
+
+  return Array.from(alertMap.values()).sort((a, b) => {
+    if (a.isOutOfStock !== b.isOutOfStock) return a.isOutOfStock ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+/**
+ * Marks a recipe stock alert notification as resolved/read after restocking.
+ */
+export async function markRecipeStockAlertResolved(uid, ingredientId) {
+  if (!uid || !ingredientId) return;
+  try {
+    await updateDoc(doc(db, "users", uid, "owner_notifications", `recipe_alert_${ingredientId}`), {
+      read: true,
+      resolved: true,
+      resolvedAtMs: Date.now(),
+    });
+  } catch (err) {
+    console.warn("[recipeStockService] resolve alert notice:", err);
   }
 }

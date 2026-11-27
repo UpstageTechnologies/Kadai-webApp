@@ -10,7 +10,7 @@ import {
   serverTimestamp,
   updateDoc,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import { db } from "./firebase.js";
 
 export const DEFAULT_CRM_CONFIG = {
   loyaltyEnabled: true,
@@ -404,4 +404,275 @@ export const openWhatsAppChat = (rawPhone, message) => {
   }
   const url = `https://wa.me/91${phone10}?text=${encodeURIComponent(message || "")}`;
   window.open(url, "_blank", "noopener,noreferrer");
+};
+
+export const WALKIN_CUSTOMER_ID = "walkin_counter";
+
+const GENERIC_WALKIN_NAMES = new Set([
+  "",
+  "walk-in customer",
+  "walk in customer",
+  "walk-in",
+  "walk in",
+  "dine-in / walk-in",
+  "counter",
+  "counter walk-in",
+  "n/a",
+  "takeaway",
+  "parcel customer",
+  "customer",
+  "guest",
+]);
+
+const toMillisSafe = (val) => {
+  if (!val) return 0;
+  if (typeof val === "number") return val;
+  if (typeof val?.toDate === "function") return val.toDate().getTime();
+  if (typeof val?.seconds === "number") return val.seconds * 1000;
+  const parsed = new Date(val).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
+};
+
+export const getOrderCustomerIdentity = (order = {}) => {
+  const rawPhone =
+    order.customerPhone ||
+    order.customerMobile ||
+    order.phone ||
+    order.customerId ||
+    order.address?.phoneNumber ||
+    "";
+  const phone10 = normalizePhone10(rawPhone);
+  const rawName = String(order.customerName || "").trim();
+  const cleanLower = rawName.toLowerCase();
+  const isGeneric = GENERIC_WALKIN_NAMES.has(cleanLower);
+  const customerUid = String(order.customerUid || "").trim();
+
+  if (phone10.length === 10) {
+    return {
+      key: phone10,
+      isPhoneCustomer: true,
+      phone: phone10,
+      name: !isGeneric && rawName ? rawName : "Customer",
+      customerUid,
+    };
+  }
+
+  if (customerUid) {
+    return {
+      key: `online_${customerUid}`,
+      isPhoneCustomer: false,
+      phone: "",
+      name: !isGeneric && rawName ? rawName : "Online Customer",
+      customerUid,
+    };
+  }
+
+  if (!isGeneric && rawName) {
+    const slug = cleanLower.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+    if (slug) {
+      return {
+        key: `name_${slug}`,
+        isPhoneCustomer: false,
+        phone: "",
+        name: rawName,
+        customerUid: "",
+      };
+    }
+  }
+
+  return {
+    key: WALKIN_CUSTOMER_ID,
+    isPhoneCustomer: false,
+    phone: "",
+    name: "Walk-in Customer",
+    customerUid: "",
+  };
+};
+
+export const recordOrderCustomerFallback = async ({
+  shopId,
+  order = {},
+  source = "pos",
+  billNo = "",
+}) => {
+  if (!shopId) return null;
+  const identity = getOrderCustomerIdentity(order);
+  const payable = Math.max(0, Number(order.totalAmount ?? order.total ?? 0) || 0);
+  const customerRef = doc(db, "users", shopId, "customers", identity.key);
+
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(customerRef);
+    const existing = snap.exists() ? snap.data() || {} : {};
+    const nextOrders = Number(existing.totalOrders || 0) + 1;
+    const isOnline = source === "website";
+    const nextPosOrders = Number(existing.posOrders || 0) + (isOnline ? 0 : 1);
+    const nextOnlineOrders = Number(existing.onlineOrders || 0) + (isOnline ? 1 : 0);
+    const nextSpent = Number((Number(existing.totalSpent || 0) + payable).toFixed(2));
+    const nextSource =
+      existing.source && existing.source !== source
+        ? "both"
+        : existing.source || source || "pos";
+
+    const docPayload = {
+      id: identity.key,
+      phone: identity.phone || existing.phone || "",
+      phoneE164: identity.phone ? formatPhoneE164(identity.phone) : existing.phoneE164 || "",
+      name:
+        identity.name && identity.name !== "Walk-in Customer"
+          ? identity.name
+          : existing.name || identity.name || "Walk-in Customer",
+      email: String(order.customerEmail || existing.email || "").trim(),
+      customerUid: identity.customerUid || existing.customerUid || "",
+      source: nextSource,
+      tags: Array.isArray(existing.tags) ? existing.tags : [],
+      notes: String(existing.notes || ""),
+      defaultAddress: String(order.deliveryAddress || existing.defaultAddress || ""),
+      gstin: String(existing.gstin || ""),
+      creditLimit: Number(existing.creditLimit ?? DEFAULT_CRM_CONFIG.defaultCreditLimit),
+      creditBalance: Number(existing.creditBalance || 0),
+      loyaltyPoints: Number(existing.loyaltyPoints || 0),
+      totalOrders: nextOrders,
+      posOrders: nextPosOrders,
+      onlineOrders: nextOnlineOrders,
+      totalSpent: nextSpent,
+      isWalkinOrNamed: !identity.isPhoneCustomer,
+      lastOrderAt: serverTimestamp(),
+      lastBillNo: billNo || existing.lastBillNo || "",
+      updatedAt: serverTimestamp(),
+      createdAt: existing.createdAt || serverTimestamp(),
+    };
+
+    tx.set(customerRef, docPayload, { merge: true });
+    return docPayload;
+  });
+};
+
+export const buildMergedCustomerDirectory = ({
+  persistedCustomers = [],
+  ordersList = [],
+  onlineOrdersList = [],
+} = {}) => {
+  const derivedMap = new Map();
+  const seenOnlineOrderIds = new Set();
+
+  const addOrderToDerived = (order, isOnline) => {
+    const identity = getOrderCustomerIdentity(order);
+    const amount = Math.max(0, Number(order.totalAmount ?? order.total ?? 0) || 0);
+    const orderMs = toMillisSafe(order.createdAtMs || order.createdAt || order.billedAtMs);
+    const isCredit =
+      String(order.paymentMode || order.paymentMethod || "").toUpperCase() === "CREDIT" ||
+      String(order.paymentStatus || "").toUpperCase() === "CREDIT_DUE";
+
+    const prev = derivedMap.get(identity.key);
+    if (!prev) {
+      derivedMap.set(identity.key, {
+        id: identity.key,
+        phone: identity.phone,
+        name: identity.name,
+        customerUid: identity.customerUid,
+        source: isOnline ? "website" : "pos",
+        tags: isCredit ? ["Credit"] : [],
+        creditLimit: DEFAULT_CRM_CONFIG.defaultCreditLimit,
+        creditBalance: isCredit ? amount : 0,
+        loyaltyPoints: 0,
+        totalOrders: 1,
+        posOrders: isOnline ? 0 : 1,
+        onlineOrders: isOnline ? 1 : 0,
+        totalSpent: Number(amount.toFixed(2)),
+        lastOrderAt: orderMs || Date.now(),
+        createdAt: orderMs || Date.now(),
+        updatedAt: orderMs || Date.now(),
+        isDerived: true,
+      });
+    } else {
+      prev.totalOrders += 1;
+      if (isOnline) prev.onlineOrders += 1;
+      else prev.posOrders += 1;
+      prev.totalSpent = Number((prev.totalSpent + amount).toFixed(2));
+      if (isCredit) {
+        prev.creditBalance = Number((prev.creditBalance + amount).toFixed(2));
+      }
+      if (prev.source !== (isOnline ? "website" : "pos")) {
+        prev.source = "both";
+      }
+      if (identity.name && identity.name !== "Walk-in Customer" && identity.name !== "Customer") {
+        prev.name = identity.name;
+      }
+      if (identity.customerUid && !prev.customerUid) {
+        prev.customerUid = identity.customerUid;
+      }
+      if (orderMs) {
+        if (!prev.lastOrderAt || orderMs > prev.lastOrderAt) {
+          prev.lastOrderAt = orderMs;
+          prev.updatedAt = orderMs;
+        }
+        if (!prev.createdAt || orderMs < prev.createdAt) {
+          prev.createdAt = orderMs;
+        }
+      }
+    }
+  };
+
+  (ordersList || []).forEach((o) => {
+    if (!o) return;
+    if (
+      o.transactionStatus === "cancelled" ||
+      String(o.status || "").toLowerCase() === "cancelled" ||
+      o.type === "refund"
+    ) {
+      return;
+    }
+    if (o.onlineOrderId) {
+      seenOnlineOrderIds.add(String(o.onlineOrderId));
+    }
+    const isOnlineSale = String(o.orderType || "").toUpperCase() === "ONLINE";
+    addOrderToDerived(o, isOnlineSale);
+  });
+
+  (onlineOrdersList || []).forEach((o) => {
+    if (!o) return;
+    const docId = String(o.id || o.orderDocId || "");
+    if (docId && seenOnlineOrderIds.has(docId)) return;
+    const statusLower = String(o.status || "").toLowerCase().trim();
+    if (statusLower === "rejected" || statusLower === "cancelled") return;
+    const custNameLower = String(o.customerName || "").toLowerCase().trim();
+    if (custNameLower.includes("walk-in") || o.isWalkIn === true) return;
+    addOrderToDerived(o, true);
+  });
+
+  const mergedById = new Map();
+
+  (persistedCustomers || []).forEach((c) => {
+    if (!c) return;
+    const key = String(c.id || normalizePhone10(c.phone) || "");
+    if (!key) return;
+    const derived = derivedMap.get(key);
+    if (derived) {
+      mergedById.set(key, {
+        ...c,
+        id: key,
+        totalOrders: Math.max(Number(c.totalOrders || 0), derived.totalOrders),
+        posOrders: Math.max(Number(c.posOrders || 0), derived.posOrders),
+        onlineOrders: Math.max(Number(c.onlineOrders || 0), derived.onlineOrders),
+        totalSpent: Math.max(Number(c.totalSpent || 0), derived.totalSpent),
+        lastOrderAt: c.lastOrderAt || derived.lastOrderAt,
+        createdAt: c.createdAt || derived.createdAt,
+        updatedAt: c.updatedAt || derived.updatedAt,
+      });
+    } else {
+      mergedById.set(key, { ...c, id: key });
+    }
+  });
+
+  derivedMap.forEach((derived, key) => {
+    if (!mergedById.has(key)) {
+      mergedById.set(key, derived);
+    }
+  });
+
+  return Array.from(mergedById.values()).sort(
+    (a, b) =>
+      toMillisSafe(b.lastOrderAt || b.updatedAt || b.createdAt) -
+      toMillisSafe(a.lastOrderAt || a.updatedAt || a.createdAt)
+  );
 };

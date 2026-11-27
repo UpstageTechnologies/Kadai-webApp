@@ -1411,6 +1411,10 @@ export async function recordTerminalSaleTransaction(
     const stockUpdates = [];
     const nowMs = Date.now();
     for (const plan of stockReadPlans) {
+      // Prepared restaurant menu items are cooked on demand and always available;
+      // their raw material stock is tracked separately by recipeStockService.
+      if (plan.productCollection === "restaurant_menu") continue;
+
       const masterExists = plan.masterSnap?.exists();
       const termInvExists = plan.termInvSnap?.exists();
 
@@ -1629,6 +1633,10 @@ export async function recordStandardSaleWithStock(
 
     const stockUpdates = [];
     for (const plan of reads) {
+      // Prepared restaurant menu items are cooked on demand and always available;
+      // their raw material stock is tracked separately by recipeStockService.
+      if (plan.productCollection === "restaurant_menu") continue;
+
       if (plan.masterSnap.exists() && typeof plan.masterSnap.data().quantity === "number") {
         const prevQty = Number(plan.masterSnap.data().quantity);
         const nextQty = Number((prevQty - plan.qty).toFixed(4));

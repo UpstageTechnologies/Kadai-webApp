@@ -10,6 +10,7 @@ import {
 } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
 import { getGroceryImage } from "../utils/groceryImages";
+import { markRecipeStockAlertResolved } from "../utils/recipeStockService";
 
 // Helper to parse net quantity from item names (e.g., "Milk 500ml", "Coffee 100g", "Oil 1L")
 export function parsePackSizeFromName(name) {
@@ -156,11 +157,11 @@ const STARTER_RAW_MATERIALS = [
   { name: "Burger Takeaway Box", category: "Packaging", unit: "pcs", costPerUnit: 4.0, stockQuantity: 100, minAlertQuantity: 20 },
 ];
 
-export default function RecipeManagement({ products = [], onBack, userProfile = {} }) {
+export default function RecipeManagement({ products = [], onBack, userProfile = {}, initialSubTab = "recipes" }) {
   const currentUid = auth.currentUser?.uid || localStorage.getItem("uid");
 
   // Navigation tab inside Recipe screen
-  const [activeTab, setActiveTab] = useState("recipes"); // "recipes" | "raw_materials"
+  const [activeTab, setActiveTab] = useState(initialSubTab || "recipes"); // "recipes" | "raw_materials"
 
   // Data states
   const [recipes, setRecipes] = useState([]);
@@ -700,6 +701,9 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
 
       if (editingRawItem?.id) {
         await updateDoc(doc(db, "users", currentUid, "raw_materials", editingRawItem.id), payload);
+        if (payload.stockQuantity > 0 && payload.stockQuantity > payload.minAlertQuantity) {
+          await markRecipeStockAlertResolved(currentUid, editingRawItem.id);
+        }
       } else {
         const newRef = doc(collection(db, "users", currentUid, "raw_materials"));
         await setDoc(newRef, {
@@ -752,6 +756,9 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
         updates.costPerUnit = parseFloat(restockCost);
       }
       await updateDoc(doc(db, "users", currentUid, "raw_materials", restockItem.id), updates);
+      if (newStock > 0 && newStock > Number(restockItem.minAlertQuantity || 0)) {
+        await markRecipeStockAlertResolved(currentUid, restockItem.id);
+      }
       setRestockItem(null);
       setRestockAmount("");
       setRestockCost("");
@@ -957,12 +964,15 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
           </div>
         </div>
 
-        {/* Low Stock Alert Banner */}
-        {lowStockMaterials.length > 0 && (
+        {/* Low / Empty Stock Alert Banner */}
+        {lowStockMaterials.length > 0 && (() => {
+          const emptyItems = lowStockMaterials.filter((m) => (Number(m.stockQuantity) || 0) <= 0);
+          const hasEmpty = emptyItems.length > 0;
+          return (
           <div
             style={{
-              backgroundColor: "#fff7ed",
-              border: "1.5px solid #fed7aa",
+              backgroundColor: hasEmpty ? "#fef2f2" : "#fff7ed",
+              border: `1.5px solid ${hasEmpty ? "#fecaca" : "#fed7aa"}`,
               borderRadius: "12px",
               padding: "10px 16px",
               marginTop: "16px",
@@ -973,13 +983,15 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <span style={{ fontSize: "20px" }}>{hasEmpty ? "🚨" : "⚠️"}</span>
               <div>
-                <span style={{ fontWeight: "800", color: "#c2410c", fontSize: "13px" }}>
-                  {lowStockMaterials.length} Raw Ingredient{lowStockMaterials.length > 1 ? "s" : ""} Low on Stock!
+                <span style={{ fontWeight: "800", color: hasEmpty ? "#b91c1c" : "#c2410c", fontSize: "13px" }}>
+                  {hasEmpty
+                    ? `${emptyItems.length} Recipe Ingredient${emptyItems.length > 1 ? "s" : ""} Empty (Out of Stock)!`
+                    : `${lowStockMaterials.length} Raw Ingredient${lowStockMaterials.length > 1 ? "s" : ""} Low on Stock!`}
                 </span>
-                <span style={{ fontSize: "12px", color: "#9a3412", marginLeft: "8px" }}>
-                  {lowStockMaterials.map((m) => `${m.name} (${m.stockQuantity} ${m.unit})`).join(", ")}
+                <span style={{ fontSize: "12px", color: hasEmpty ? "#991b1b" : "#9a3412", marginLeft: "8px" }}>
+                  {lowStockMaterials.map((m) => `${m.name} (${Number(m.stockQuantity) || 0} ${m.unit})`).join(", ")}
                 </span>
               </div>
             </div>
@@ -987,7 +999,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
               type="button"
               onClick={() => setActiveTab("raw_materials")}
               style={{
-                backgroundColor: "#ea580c",
+                backgroundColor: hasEmpty ? "#dc2626" : "#ea580c",
                 color: "#fff",
                 border: "none",
                 padding: "6px 14px",
@@ -995,12 +1007,14 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                 fontWeight: "800",
                 fontSize: "12px",
                 cursor: "pointer",
+                whiteSpace: "nowrap",
               }}
             >
               Restock Now →
             </button>
           </div>
-        )}
+          );
+        })()}
 
         {/* Navigation Tabs */}
         <div style={{ display: "flex", gap: "8px", marginTop: "18px", borderBottom: "1.5px solid #e2e8f0", paddingBottom: "10px" }}>
@@ -1188,7 +1202,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                                 ₹{price}
                               </span>
                             </div>
-                            <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "4px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "4px", flexWrap: "wrap" }}>
                               <span style={{ fontSize: "11px", backgroundColor: "#f1f5f9", color: "#475569", padding: "2px 7px", borderRadius: "6px", fontWeight: "700" }}>
                                 {product.category || "General"}
                               </span>
@@ -1201,6 +1215,19 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                                   ⚠️ No Recipe Configured
                                 </span>
                               )}
+                              {hasRecipe && (() => {
+                                const missingIngs = (recipe.ingredients || []).filter((ing) => {
+                                  const raw = combinedRawMaterials.find((r) => r.id === ing.rawMaterialId) ||
+                                    combinedRawMaterials.find((r) => (r.name || "").toLowerCase().trim() === (ing.name || "").toLowerCase().trim());
+                                  return raw && (Number(raw.stockQuantity) || 0) <= 0;
+                                });
+                                if (missingIngs.length === 0) return null;
+                                return (
+                                  <span style={{ fontSize: "11px", backgroundColor: "#fee2e2", color: "#b91c1c", padding: "2px 7px", borderRadius: "6px", fontWeight: "800", border: "1px solid #fecaca" }}>
+                                    🚨 Empty Stock: {missingIngs.map((i) => i.name).join(", ")}
+                                  </span>
+                                );
+                              })()}
                             </div>
                           </div>
                         </div>
@@ -1419,7 +1446,7 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                               </div>
                             ) : null}
                           </td>
-                          <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: "900", color: isLow ? "#ea580c" : "#16a34a" }}>
+                          <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: "900", color: stock <= 0 ? "#dc2626" : isLow ? "#ea580c" : "#16a34a" }}>
                             {stock} {item.unit}
                           </td>
                           <td style={{ padding: "12px 16px", textAlign: "center" }}>
@@ -1428,11 +1455,11 @@ export default function RecipeManagement({ products = [], onBack, userProfile = 
                               fontWeight: "800",
                               padding: "2px 8px",
                               borderRadius: "6px",
-                              backgroundColor: isLow ? "#fff7ed" : "#dcfce7",
-                              color: isLow ? "#c2410c" : "#15803d",
-                              border: isLow ? "1px solid #fed7aa" : "1px solid #86efac",
+                              backgroundColor: stock <= 0 ? "#fee2e2" : isLow ? "#fff7ed" : "#dcfce7",
+                              color: stock <= 0 ? "#b91c1c" : isLow ? "#c2410c" : "#15803d",
+                              border: stock <= 0 ? "1px solid #fecaca" : isLow ? "1px solid #fed7aa" : "1px solid #86efac",
                             }}>
-                              {isLow ? `⚠️ Low (Min: ${min})` : "✓ In Stock"}
+                              {stock <= 0 ? "🚨 Out of Stock" : isLow ? `⚠️ Low (Min: ${min})` : "✓ In Stock"}
                             </span>
                           </td>
                           <td style={{ padding: "12px 16px", textAlign: "right" }}>

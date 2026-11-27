@@ -12,7 +12,7 @@ import {
   where,
   writeBatch,
 } from "firebase/firestore";
-import { INVENTORY_MODES, toMillis } from "./terminalService";
+import { INVENTORY_MODES, toMillis } from "./terminalService.js";
 
 export const PRODUCT_SOURCES = {
   INDEPENDENT: "independent",
@@ -681,6 +681,208 @@ export function buildOwnerProductOverview({
     lowStockCount: lowStockAlerts.length,
     terminalStats,
     lowStockAlerts,
+  };
+}
+
+/**
+ * Calculates Consolidated Sales & Profit/Loss (P&L) across ALL terminals in one unified report.
+ * Accounts for Gross Sales, Discounts, Tax/GST, COGS (Purchase/Making Cost), Waste Loss, and Net Profit/Loss.
+ */
+export function calculateMultiTerminalProfitAndLoss({
+  terminals = [],
+  salesList = [],
+  wasteRecords = [],
+  shopProducts = [],
+  timeframe = "all", // "today" | "week" | "month" | "all" | "custom"
+  startDate = "",
+  endDate = "",
+} = {}) {
+  const productMap = new Map();
+  shopProducts.forEach((p) => {
+    if (p?.id) productMap.set(String(p.id), p);
+  });
+
+  const now = new Date();
+  let startMs = 0;
+  let endMs = Number.MAX_SAFE_INTEGER;
+  if (timeframe === "today") {
+    startMs = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+    endMs = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999).getTime();
+  } else if (timeframe === "week") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 6);
+    startMs = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+    endMs = now.getTime();
+  } else if (timeframe === "month") {
+    startMs = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0).getTime();
+    endMs = now.getTime();
+  } else if (timeframe === "custom") {
+    const bounds = getTimeBoundsForFilter(startDate, endDate);
+    startMs = bounds.startMs;
+    endMs = bounds.endMs;
+  }
+
+  const buckets = new Map();
+  const makeBucket = (id, meta = {}) => ({
+    terminalId: id,
+    terminalName: meta.name || "Legacy / Counter",
+    terminalCode: meta.code || "COUNTER",
+    floorName: meta.floorName || "Main Floor",
+    ordersCount: 0,
+    itemsSold: 0,
+    grossSales: 0,
+    discountTotal: 0,
+    taxTotal: 0,
+    cogs: 0,
+    grossProfit: 0,
+    wasteLoss: 0,
+    netProfitLoss: 0,
+    marginPercent: 0,
+    cashSales: 0,
+    upiSales: 0,
+    cardSales: 0,
+    creditSales: 0,
+  });
+
+  terminals.forEach((t) => {
+    buckets.set(
+      t.id,
+      makeBucket(t.id, { name: t.name, code: t.code, floorName: t.floorName })
+    );
+  });
+
+  let refundedTotal = 0;
+  let cancelledTotal = 0;
+
+  salesList.forEach((sale) => {
+    const ms = toMillis(sale.createdAtMs || sale.createdAt);
+    if (ms < startMs || ms > endMs) return;
+
+    const status = String(sale.transactionStatus || sale.status || "").toLowerCase();
+    const saleTotal = Number(sale.totalAmount ?? sale.total ?? 0);
+    if (status === "cancelled") {
+      cancelledTotal += saleTotal;
+      return;
+    }
+    if (status === "refunded") {
+      refundedTotal += saleTotal;
+      return;
+    }
+
+    const tId = sale.terminalId && buckets.has(sale.terminalId)
+      ? sale.terminalId
+      : sale.terminalId || "legacy_counter";
+    if (!buckets.has(tId)) {
+      buckets.set(
+        tId,
+        makeBucket(tId, {
+          name: sale.terminalName || "Standard Counter",
+          code: sale.terminalCode || "MAIN",
+          floorName: sale.floorName || "Main Floor",
+        })
+      );
+    }
+
+    const b = buckets.get(tId);
+    const tax = Number(sale.taxTotal || 0);
+    const disc = Number(sale.discountTotal || 0) + Number(sale.loyaltyDiscount || 0);
+
+    let saleCogs = 0;
+    let itemsQty = 0;
+    const items = Array.isArray(sale.items) ? sale.items : [];
+    items.forEach((it) => {
+      const q = Math.max(1, Number(it.qty ?? it.quantity ?? 1) || 1);
+      itemsQty += q;
+      const master = productMap.get(String(it.productId || it.id || ""));
+      const unitCost = Number(
+        it.purchasePrice || master?.purchasePrice || master?.makingCost || 0
+      );
+      if (unitCost > 0) saleCogs += unitCost * q;
+    });
+
+    const netRevenueExTax = Math.max(0, saleTotal - tax);
+    const saleGrossProfit = netRevenueExTax - saleCogs;
+
+    b.ordersCount += 1;
+    b.itemsSold += itemsQty;
+    b.grossSales += saleTotal;
+    b.discountTotal += disc;
+    b.taxTotal += tax;
+    b.cogs += saleCogs;
+    b.grossProfit += saleGrossProfit;
+
+    const pay = String(sale.paymentMethod || sale.paymentMode || "Cash").toLowerCase();
+    if (pay.includes("upi") || pay.includes("qr")) b.upiSales += saleTotal;
+    else if (pay.includes("card")) b.cardSales += saleTotal;
+    else if (pay.includes("credit") || pay.includes("khata")) b.creditSales += saleTotal;
+    else b.cashSales += saleTotal;
+  });
+
+  // Factor Waste / Spoilage expenses into terminal or shop-wide loss
+  let unallocatedWasteLoss = 0;
+  wasteRecords.forEach((w) => {
+    const ms = toMillis(w.createdAtMs || w.createdAt || w.date);
+    if (ms && (ms < startMs || ms > endMs)) return;
+    const loss = Number(w.totalLoss ?? w.lossAmount ?? w.cost ?? 0);
+    if (loss <= 0) return;
+    if (w.terminalId && buckets.has(w.terminalId)) {
+      buckets.get(w.terminalId).wasteLoss += loss;
+    } else {
+      unallocatedWasteLoss += loss;
+    }
+  });
+
+  const byTerminal = Array.from(buckets.values()).map((b) => {
+    const netProfitLoss = b.grossProfit - b.wasteLoss;
+    const marginPercent = b.grossSales > 0 ? (netProfitLoss / b.grossSales) * 100 : 0;
+    return {
+      ...b,
+      grossSales: round2(b.grossSales),
+      discountTotal: round2(b.discountTotal),
+      taxTotal: round2(b.taxTotal),
+      cogs: round2(b.cogs),
+      grossProfit: round2(b.grossProfit),
+      wasteLoss: round2(b.wasteLoss),
+      netProfitLoss: round2(netProfitLoss),
+      marginPercent: round2(marginPercent),
+      cashSales: round2(b.cashSales),
+      upiSales: round2(b.upiSales),
+      cardSales: round2(b.cardSales),
+      creditSales: round2(b.creditSales),
+    };
+  });
+
+  const totalSales = round2(byTerminal.reduce((s, t) => s + t.grossSales, 0));
+  const totalOrders = byTerminal.reduce((s, t) => s + t.ordersCount, 0);
+  const totalItemsSold = byTerminal.reduce((s, t) => s + t.itemsSold, 0);
+  const totalCogs = round2(byTerminal.reduce((s, t) => s + t.cogs, 0));
+  const totalGrossProfit = round2(byTerminal.reduce((s, t) => s + t.grossProfit, 0));
+  const totalTax = round2(byTerminal.reduce((s, t) => s + t.taxTotal, 0));
+  const totalDiscount = round2(byTerminal.reduce((s, t) => s + t.discountTotal, 0));
+  const totalWasteLoss = round2(
+    byTerminal.reduce((s, t) => s + t.wasteLoss, 0) + unallocatedWasteLoss
+  );
+  const netProfitLoss = round2(totalGrossProfit - totalWasteLoss);
+  const profitMarginPercent = totalSales > 0 ? round2((netProfitLoss / totalSales) * 100) : 0;
+
+  return {
+    totals: {
+      totalSales,
+      totalOrders,
+      totalItemsSold,
+      totalCogs,
+      totalGrossProfit,
+      totalTax,
+      totalDiscount,
+      totalWasteLoss,
+      unallocatedWasteLoss: round2(unallocatedWasteLoss),
+      refundedTotal: round2(refundedTotal),
+      cancelledTotal: round2(cancelledTotal),
+      netProfitLoss,
+      profitMarginPercent,
+      isNetProfit: netProfitLoss >= 0,
+    },
+    byTerminal,
   };
 }
 
@@ -1541,10 +1743,8 @@ export async function adjustTerminalProductStock(
           )
         : Number(masterSnap.exists() ? masterSnap.data().quantity ?? 0 : 0);
 
-    let nextQty = prevQty;
-    if (mode === "set") nextQty = qtyNum;
-    else if (mode === "subtract") nextQty = prevQty - qtyNum;
-    else nextQty = prevQty + qtyNum;
+    const nextQty =
+      mode === "set" ? qtyNum : mode === "subtract" ? prevQty - qtyNum : prevQty + qtyNum;
 
     if (!allowNegativeStock && nextQty < 0) {
       throw new Error(

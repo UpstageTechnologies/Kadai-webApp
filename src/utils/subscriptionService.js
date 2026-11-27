@@ -228,6 +228,88 @@ export const getAuthoritativeTimestamp = (userData = {}, currentTimestamp = Date
 };
 
 /**
+ * Resolves effective subscription for a specific terminal.
+ * Uses terminal-level plan override if configured, otherwise inherits the shop owner's active plan.
+ */
+export const resolveTerminalSubscription = (
+  userData = {},
+  terminalData = null,
+  currentTimestamp = Date.now()
+) => {
+  const shopSub = resolveUserSubscription(userData, currentTimestamp);
+  if (
+    terminalData &&
+    (terminalData.subscriptionPlan || terminalData.userPlan || terminalData.plan)
+  ) {
+    return resolveUserSubscription(
+      {
+        ...userData,
+        userPlan: terminalData.userPlan || terminalData.subscriptionPlan || terminalData.plan,
+        subscriptionExpiry: terminalData.subscriptionExpiry ?? userData?.subscriptionExpiry,
+        subscriptionActive: terminalData.subscriptionActive ?? userData?.subscriptionActive,
+      },
+      currentTimestamp
+    );
+  }
+  return shopSub;
+};
+
+/**
+ * Counts how many products belong to a specific terminal for enforcing per-terminal plan limits.
+ * When shop has multiple terminals, each terminal independently gets the full plan item limit
+ * (e.g., Basic plan = 10 items in Terminal 1 AND 10 items in Terminal 2).
+ */
+export const countProductsForTerminalLimit = (
+  products = [],
+  {
+    terminalId = null,
+    shopInventoryMode = "shared",
+    primaryTerminalId = null,
+    assignments = null,
+  } = {}
+) => {
+  const list = Array.isArray(products) ? products : [];
+  if (!terminalId || terminalId === "all") {
+    return list.length;
+  }
+
+  const countedIds = new Set();
+
+  if (Array.isArray(assignments)) {
+    assignments.forEach((a) => {
+      if (a && (!a.terminalId || a.terminalId === terminalId) && (a.productId || a.id)) {
+        countedIds.add(String(a.productId || a.id));
+      }
+    });
+  }
+
+  const isPrimary = Boolean(primaryTerminalId) && terminalId === primaryTerminalId;
+
+  list.forEach((p) => {
+    const pId = String(p?.id || "");
+    if (!pId || countedIds.has(pId)) return;
+
+    if (p.terminalId === terminalId) {
+      countedIds.add(pId);
+      return;
+    }
+
+    // Legacy unassigned products only count against primary terminal in terminal_wise mode,
+    // or all items matching floor/shared mode
+    const isUnassigned = !p.terminalId || p.terminalId === "all";
+    if (isUnassigned && !p.isTerminalExclusive && p.productSource !== "independent") {
+      if (shopInventoryMode === "terminal_wise") {
+        if (isPrimary) countedIds.add(pId);
+      } else if (shopInventoryMode === "shared") {
+        countedIds.add(pId);
+      }
+    }
+  });
+
+  return countedIds.size;
+};
+
+/**
  * Full Subscription Status Resolver for a User.
  * Accepts user document data from Firestore or local session.
  */

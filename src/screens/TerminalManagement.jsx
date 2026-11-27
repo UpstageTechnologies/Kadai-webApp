@@ -30,11 +30,19 @@ import {
   toggleTerminalStatus,
 } from "../utils/terminalService";
 import SessionClosingReportModal from "../components/SessionClosingReportModal";
+import TerminalProductManagement from "../components/TerminalProductManagement";
+import TerminalProductOverview from "../components/TerminalProductOverview";
 
 export default function TerminalManagement({
   userProfile = {},
   rawUserData = null,
   ordersList = [],
+  wasteRecords = [],
+  shopProducts = [],
+  productCollection = "inventory",
+  primaryTerminalId = null,
+  allowNegativeStock = false,
+  initialSubTab = "overview",
   onSelectTerminalForPos,
   onBack,
 }) {
@@ -46,7 +54,8 @@ export default function TerminalManagement({
     ? localStorage.getItem("staff_name") || "Staff"
     : userProfile?.name || "Store Owner";
 
-  const [subTab, setSubTab] = useState("overview"); // "overview" | "sessions" | "reports"
+  const [subTab, setSubTab] = useState(initialSubTab || "overview"); // "overview" | "products" | "product_overview" | "sessions" | "reports"
+  const [selectedProdTerminalId, setSelectedProdTerminalId] = useState("");
   const [loading, setLoading] = useState(() => Boolean(shopId));
   const [floors, setFloors] = useState([]);
   const [terminals, setTerminals] = useState([]);
@@ -947,6 +956,26 @@ export default function TerminalManagement({
         </button>
         <button
           type="button"
+          onClick={() => setSubTab("products")}
+          style={{
+            ...styles.subTabBtn,
+            ...(subTab === "products" ? styles.subTabBtnActive : {}),
+          }}
+        >
+          🛍️ Terminal Products &amp; Stock
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubTab("product_overview")}
+          style={{
+            ...styles.subTabBtn,
+            ...(subTab === "product_overview" ? styles.subTabBtnActive : {}),
+          }}
+        >
+          📈 Product &amp; Sales Overview
+        </button>
+        <button
+          type="button"
           onClick={() => setSubTab("sessions")}
           style={{
             ...styles.subTabBtn,
@@ -1354,6 +1383,16 @@ export default function TerminalManagement({
                                   )}
                                   <button
                                     type="button"
+                                    onClick={() => {
+                                      setSelectedProdTerminalId(term.id);
+                                      setSubTab("products");
+                                    }}
+                                    style={{ ...styles.actionBtn, backgroundColor: "#f0fdf4", color: "#15803d", borderColor: "#bbf7d0" }}
+                                  >
+                                    📦 Products
+                                  </button>
+                                  <button
+                                    type="button"
                                     onClick={() => openEditTerminalModal(term)}
                                     style={styles.actionBtn}
                                   >
@@ -1386,6 +1425,56 @@ export default function TerminalManagement({
             })
           )}
         </div>
+      )}
+
+      {/* ================================================================= */}
+      {/* TAB 1B: TERMINAL PRODUCT & CATEGORY MANAGEMENT (BOTH MODELS)       */}
+      {/* ================================================================= */}
+      {subTab === "products" && (
+        <TerminalProductManagement
+          shopId={shopId}
+          rawUserData={rawUserData}
+          terminals={terminals}
+          shopProducts={shopProducts}
+          productCollection={productCollection}
+          shopInventoryMode={inventoryMode}
+          primaryTerminalId={
+            primaryTerminalId ||
+            terminals.find((t) => t.isPrimary === true || t.id === "terminal_1")?.id ||
+            terminals[0]?.id ||
+            null
+          }
+          salesList={ordersList}
+          allTransactions={allTransactions}
+          selectedTerminalId={selectedProdTerminalId}
+          onSelectTerminalId={setSelectedProdTerminalId}
+          onShowToast={showToast}
+          allowNegativeStock={allowNegativeStock}
+        />
+      )}
+
+      {/* ================================================================= */}
+      {/* TAB 1C: OWNER CONSOLIDATED PRODUCT & SALES OVERVIEW               */}
+      {/* ================================================================= */}
+      {subTab === "product_overview" && (
+        <TerminalProductOverview
+          shopId={shopId}
+          terminals={terminals}
+          shopProducts={shopProducts}
+          salesList={ordersList}
+          wasteRecords={wasteRecords}
+          shopInventoryMode={inventoryMode}
+          primaryTerminalId={
+            primaryTerminalId ||
+            terminals.find((t) => t.isPrimary === true || t.id === "terminal_1")?.id ||
+            terminals[0]?.id ||
+            null
+          }
+          onOpenTerminalProducts={(tId) => {
+            setSelectedProdTerminalId(tId);
+            setSubTab("products");
+          }}
+        />
       )}
 
       {/* ================================================================= */}

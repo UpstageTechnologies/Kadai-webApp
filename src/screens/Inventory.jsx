@@ -1,7 +1,11 @@
 import { useState, useEffect, useMemo } from "react";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../utils/firebase";
-import { resolveUserSubscription, canAddInventoryItem } from "../utils/subscriptionService";
+import {
+  canAddInventoryItem,
+  countProductsForTerminalLimit,
+  resolveTerminalSubscription,
+} from "../utils/subscriptionService";
 import { logWasteRecord, WASTE_REASONS } from "../utils/wasteService";
 import {
   INVENTORY_MODES,
@@ -388,13 +392,21 @@ export default function Inventory() {
         // Update existing item
         await updateDoc(doc(db, "users", currentUid, colName, currentItemId), productData);
       } else {
-        // Add new item - verify subscription limit
+        // Add new item - verify subscription limit per terminal independently
         const uDoc = await getDoc(doc(db, "users", currentUid));
-        const sub = resolveUserSubscription(uDoc.exists() ? uDoc.data() : {});
-        if (!canAddInventoryItem(items.length, sub.plan, sub.isExpired)) {
+        const uData = uDoc.exists() ? uDoc.data() : {};
+        const sub = resolveTerminalSubscription(uData, chosenTerminal);
+        const scopedCount = countProductsForTerminalLimit(items, {
+          terminalId: chosenTerminal?.id || null,
+          shopInventoryMode: shopInvMode,
+          primaryTerminalId,
+        });
+        if (!canAddInventoryItem(scopedCount, sub.plan, sub.isExpired)) {
           alert(
             sub.isExpired
               ? "Your subscription has expired. Please renew your plan to add new inventory items."
+              : chosenTerminal
+              ? `Terminal "${chosenTerminal.name}" reached your ${sub.plan} plan limit (${sub.limits.inventoryLimit} items per terminal). You can add items to other terminals or upgrade to Pro.`
               : `Your ${sub.plan} plan limit (${sub.limits.inventoryLimit} items) has been reached. Please upgrade to Pro for unlimited items.`
           );
           return;

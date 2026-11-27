@@ -12,6 +12,7 @@ import {
 } from "firebase/firestore";
 import { auth } from "./firebase";
 import { deductRecipeStock } from "./recipeStockService";
+import { recordOrderCustomerFallback } from "./customerCrmService";
 
 export const asArray = (value) => (Array.isArray(value) ? value : []);
 export const asText = (value) => (value == null ? "" : String(value));
@@ -395,6 +396,21 @@ export async function updateOnlineOrderStatus({
           onlineOrderId: orderId,
           createdAt: serverTimestamp(),
         });
+      }
+
+      // Ensure online customer appears in Customer Management CRM directory
+      try {
+        await recordOrderCustomerFallback({
+          shopId: sellerUid,
+          order: {
+            ...order,
+            totalAmount: localTotal + globalTotal || computeOrderTotal(order, sellerUid),
+          },
+          source: "website",
+          billNo: bNo,
+        });
+      } catch (crmErr) {
+        console.warn("Online order customer CRM notice:", crmErr?.message);
       }
     } catch (invErr) {
       console.warn("Notice updating inventory / sales on delivery:", invErr?.message);

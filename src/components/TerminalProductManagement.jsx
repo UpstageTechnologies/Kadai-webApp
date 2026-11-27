@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { db } from "../utils/firebase";
 import { formatCurrency, formatDateTime } from "../utils/terminalService";
 import {
+  canAddInventoryItem,
+  resolveTerminalSubscription,
+} from "../utils/subscriptionService";
+import {
   DEFAULT_PRODUCT_IMAGE,
   DISCOUNT_TYPES,
   PRODUCT_SOURCES,
@@ -60,6 +64,7 @@ const EMPTY_PRODUCT_FORM = {
 
 export default function TerminalProductManagement({
   shopId,
+  rawUserData = null,
   terminals = [],
   shopProducts = [],
   productCollection = "inventory",
@@ -278,8 +283,29 @@ export default function TerminalProductManagement({
       });
   }, [shopProducts, assignSearch]);
 
+  const activeTerminalSub = useMemo(
+    () =>
+      rawUserData
+        ? resolveTerminalSubscription(rawUserData, activeTerminal)
+        : { plan: "Pro", isExpired: false, limits: { inventoryLimit: -1 } },
+    [rawUserData, activeTerminal]
+  );
+
   // Handlers
   const openAddIndependentModal = () => {
+    if (
+      rawUserData &&
+      !canAddInventoryItem(resolvedCatalog.length, activeTerminalSub.plan, activeTerminalSub.isExpired)
+    ) {
+      const limit = activeTerminalSub.limits.inventoryLimit;
+      notify(
+        activeTerminalSub.isExpired
+          ? "Your subscription has expired. Please renew your plan to add items."
+          : `Terminal "${activeTerminal?.name}" reached your ${activeTerminalSub.plan} plan limit (${limit} items per terminal). You can add items to other terminals or upgrade your plan.`,
+        "error"
+      );
+      return;
+    }
     setEditingIndProduct(null);
     const defaultCat = terminalCategories[0];
     setCustomCategoryInput(false);
@@ -362,6 +388,16 @@ export default function TerminalProductManagement({
         });
         notify(`Updated "${productForm.name}" in ${activeTerminal.name}`);
       } else {
+        if (
+          rawUserData &&
+          !canAddInventoryItem(resolvedCatalog.length, activeTerminalSub.plan, activeTerminalSub.isExpired)
+        ) {
+          throw new Error(
+            activeTerminalSub.isExpired
+              ? "Your subscription has expired."
+              : `Terminal "${activeTerminal.name}" reached your ${activeTerminalSub.plan} plan limit (${activeTerminalSub.limits.inventoryLimit} items per terminal).`
+          );
+        }
         await createIndependentTerminalProduct(db, {
           shopId,
           terminal: activeTerminal,
@@ -683,8 +719,13 @@ export default function TerminalProductManagement({
               <span style={styles.miniSub}>🏢 {activeTerminal.floorName || "Floor"}</span>
             </div>
             <div style={styles.miniStat}>
-              <span style={styles.miniLabel}>Products</span>
-              <span style={styles.miniValue}>{stats.productCount}</span>
+              <span style={styles.miniLabel}>Products ({activeTerminalSub.plan} Plan)</span>
+              <span style={styles.miniValue}>
+                {stats.productCount}
+                {activeTerminalSub.limits.inventoryLimit > 0
+                  ? ` / ${activeTerminalSub.limits.inventoryLimit}`
+                  : ""}
+              </span>
               <span style={styles.miniSub}>
                 {stats.independentCount} Indep • {stats.sharedCount} Shared
               </span>
@@ -946,7 +987,7 @@ export default function TerminalProductManagement({
                       onClick={() => handleRemoveOrDelete(item)}
                       style={{ ...styles.cardBtn, color: "#dc2626", borderColor: "#fecaca" }}
                     >
-                      {isShared ? "Unlink" : "🗑️"}
+                      {isInd ? "🗑️" : "Unlink"}
                     </button>
                   </div>
                 </div>
